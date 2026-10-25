@@ -110,8 +110,12 @@ class CredentialStore:
             return None
         return record
 
-    def save(self, provider, value, scope='', refresh=None, expires_in=None):
-        """写入凭据。scope 与过期时间只作记录，判断可用性要看真实接口返回。"""
+    def save(self, provider, value, scope='', refresh=None, expires_in=None, client_id=None):
+        """写入凭据。scope 与过期时间只作记录，判断可用性要看真实接口返回。
+
+        client_id 记的是这次授权所用的 OAuth 客户端。续期时必须用同一个客户端，
+        换客户端会拿刷新令牌去换一个它不认识的授权关系，必然失败。
+        """
         if provider not in PROVIDERS:
             raise ValueError('未知的授权提供方')
         value = (value or '').strip()
@@ -125,6 +129,7 @@ class CredentialStore:
             'saved_at': now,
             'expires_at': (now + int(expires_in)) if expires_in else None,
             'refresh': refresh or None,
+            'client_id': client_id or None,
             'fingerprint': fingerprint(value),
         }
         self._write(data)

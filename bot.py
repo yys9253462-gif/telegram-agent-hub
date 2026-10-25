@@ -507,89 +507,112 @@ def credentials():
         return CredentialStore(CREDENTIALS)
 
 
-# Cloudflare 的 OAuth 访问令牌默认一天左右过期。设备码流程申请了 offline_access，
-# 换回来的响应里带刷新令牌，用它就能在到期前自动续期，不必每次重新授权。
-CLOUDFLARE_RENEW_AHEAD = 1800      # 提前半小时续期，留出失败重试的余量
-CLOUDFLARE_RENEW_INTERVAL = 300    # 每五分钟查一次到期时间
-CLOUDFLARE_RENEW_LOCK = threading.Lock()
-CLOUDFLARE_RENEW_WARNED = {'at': 0.0, 'reason': ''}
+# 两个平台的访问令牌都会过期：Cloudflare 约一天，GitHub App 用户令牌 8 小时。
+# 设备码流程都申请了离线访问权限，换回来的响应里带刷新令牌，
+# 用它就能在到期前自动续期，不必每次重新授权。
+CREDENTIAL_RENEW_AHEAD = 1800      # 提前半小时续期，留出失败重试的余量
+CREDENTIAL_RENEW_INTERVAL = 300    # 每五分钟查一次到期时间
+CREDENTIAL_RENEW_LOCK = threading.Lock()
+CREDENTIAL_RENEW_WARNED = {}
 
 
-def cloudflare_renewal_needed(store=None, now=None):
+def renew_client_id(provider, record=None):
+    """续期必须用当初授权时的那个客户端。换一个客户端等于拿刷新令牌去换陌生授权。"""
+    record = record or {}
+    stored = record.get('client_id')
+    if stored:
+        return stored
+    return GITHUB_CLIENT_ID if provider == 'github' else CLOUDFLARE_CLIENT_ID
+
+
+def renew_provider_token(provider, client_id, refresh_token):
+    """按提供方调用各自的续期接口，返回官方令牌响应。"""
+    if provider == 'cloudflare':
+        return cloudflare_auth.refresh(client_id, refresh_token)
+    if provider == 'github':
+        return github_auth.renew(client_id, refresh_token,
+                                 os.environ.get('GITHUB_CLIENT_SECRET') or None)
+    raise ValueError('未知的提供方：' + str(provider))
+
+
+def renewal_needed(provider, store=None, now=None):
     """返回 (记录, 是否需要续期)。没有记录或不知道到期时间都不需要续。"""
     store = store or credentials()
-    record = store.get('cloudflare')
+    record = store.get(provider)
     if not record:
         return None, False
     expires_at = record.get('expires_at')
     if not expires_at:
         return record, False
     moment = int(now if now is not None else time.time())
-    return record, int(expires_at) - moment <= CLOUDFLARE_RENEW_AHEAD
+    return record, int(expires_at) - moment <= CREDENTIAL_RENEW_AHEAD
 
 
-def renew_cloudflare_token(force=False, store=None):
+def renew_credential(provider, force=False, store=None):
     """用刷新令牌换一枚新的访问令牌，成功返回新令牌，失败返回 None。
 
-    必须串行：Cloudflare 的刷新令牌是一次性的，同时刷新两次会互相作废。
+    必须串行：两家的刷新令牌都是一次性的，同时刷新两次会互相作废。
     拿锁后要重新读一次记录 —— 等锁期间可能别的线程已经续过了，
     再用旧的刷新令牌换会把刚拿到的新令牌也顶掉。
     """
     store = store or credentials()
-    record, needed = cloudflare_renewal_needed(store)
+    record, needed = renewal_needed(provider, store)
     if not record:
         return None
     if not force and not needed:
         return None
     if not record.get('refresh'):
         return None
-    with CLOUDFLARE_RENEW_LOCK:
-        record = store.get('cloudflare') or record
+    with CREDENTIAL_RENEW_LOCK:
+        record = store.get(provider) or record
         if not record.get('refresh'):
             return None
-        if not force and cloudflare_renewal_needed(store)[1] is False:
+        if not force and not renewal_needed(provider, store)[1]:
             return record.get('value')
         try:
-            body = cloudflare_auth.refresh(CLOUDFLARE_CLIENT_ID, record['refresh'])
+            body = renew_provider_token(provider, renew_client_id(provider, record),
+                                        record['refresh'])
         except Exception:
             return None
         value = body.get('access_token')
         if not value:
             return None
-        store.update_refresh('cloudflare', value, body.get('refresh_token'),
+        store.update_refresh(provider, value, body.get('refresh_token'),
                              body.get('expires_in'))
         return value
 
 
-def cloudflare_renew_worker():
+def credential_renew_worker():
     """后台续期。到期前静默换新令牌，失败才提醒机主重新授权。"""
     while True:
-        time.sleep(CLOUDFLARE_RENEW_INTERVAL)
-        try:
-            record, needed = cloudflare_renewal_needed()
-            if not record or not needed:
-                continue
-            if not record.get('refresh'):
-                # 没有刷新令牌就没有自动续期能力，到期后只能重新授权。
-                # 这类情况每小时提醒一次，不要刷屏。
-                reason = 'no_refresh'
-            else:
-                reason = '' if renew_cloudflare_token() else 'failed'
-            if not reason:
-                CLOUDFLARE_RENEW_WARNED.update({'at': time.time(), 'reason': ''})
-                notify(OWNER, 'Cloudflare 令牌已自动续期，到期时间已顺延，无需重新授权。')
-                continue
-            last = CLOUDFLARE_RENEW_WARNED.get('at') or 0
-            if time.time() - last < 3600:
-                continue
-            CLOUDFLARE_RENEW_WARNED.update({'at': time.time(), 'reason': reason})
-            if reason == 'no_refresh':
-                notify(OWNER, 'Cloudflare 令牌即将到期，且没有可用于自动续期的刷新令牌，'
-                              '到期后请重新发一次「授权Cloudflare」。')
-            else:
-                notify(OWNER, 'Cloudflare 令牌自动续期失败，请重新发一次「授权Cloudflare」。')
-        except Exception:
-            pass
+        time.sleep(CREDENTIAL_RENEW_INTERVAL)
+        for provider in ('github', 'cloudflare'):
+            try:
+                record, needed = renewal_needed(provider)
+                if not record or not needed:
+                    continue
+                label = PROVIDERS[provider]['label']
+                if not record.get('refresh'):
+                    # 没有刷新令牌就没有自动续期能力，到期后只能重新授权。
+                    # 这类情况每小时提醒一次，不要刷屏。
+                    reason = 'no_refresh'
+                else:
+                    reason = '' if renew_credential(provider) else 'failed'
+                if not reason:
+                    CREDENTIAL_RENEW_WARNED[provider] = {'at': time.time(), 'reason': ''}
+                    notify(OWNER, label + ' 令牌已自动续期，到期时间已顺延，无需重新授权。')
+                    continue
+                last = (CREDENTIAL_RENEW_WARNED.get(provider) or {}).get('at') or 0
+                if time.time() - last < 3600:
+                    continue
+                CREDENTIAL_RENEW_WARNED[provider] = {'at': time.time(), 'reason': reason}
+                if reason == 'no_refresh':
+                    notify(OWNER, label + ' 令牌即将到期，且没有可用于自动续期的刷新令牌，'
+                                  '到期后请重新发一次「授权' + label + '」。')
+                else:
+                    notify(OWNER, label + ' 令牌自动续期失败，请重新发一次「授权' + label + '」。')
+            except Exception:
+                pass
 
 
 def authorized_providers():
@@ -611,7 +634,8 @@ def credential_environment(base=None):
     """
     environment = {**os.environ} if base is None else {**base}
     # 令牌临近过期时先续期再注入，否则任务拿到的是一枚马上就要 401 的令牌。
-    renew_cloudflare_token()
+    renew_credential('github')
+    renew_credential('cloudflare')
     overrides = credentials().environment()
     for spec in PROVIDERS.values():
         if spec['env'] not in overrides:
@@ -641,6 +665,9 @@ def auth_status_text():
             detail.append('剩余 ' + (str(max(0, remain // 60)) + ' 分钟' if remain > 0 else '已过期'))
         if name == 'cloudflare' and summary.get('authorized'):
             record = store.get('cloudflare') or {}
+            detail.append('到期前自动续期' if record.get('refresh') else '无刷新令牌，需重新授权')
+        if name == 'github' and summary.get('authorized'):
+            record = store.get('github') or {}
             detail.append('到期前自动续期' if record.get('refresh') else '无刷新令牌，需重新授权')
         lines.append('，'.join(detail))
     active = DEVICE_FLOW.get('provider')
@@ -729,17 +756,30 @@ def github_poll_worker(chat, snapshot):
     try:
         credentials().save('github', token, scope=scope,
                            refresh=body.get('refresh_token'),
-                           expires_in=body.get('expires_in'))
+                           expires_in=body.get('expires_in'),
+                           client_id=snapshot.get('client_id') or GITHUB_CLIENT_ID)
     except ValueError as exc:
         # 令牌形态不符合预期：可能是 GitHub 换了前缀。宁可拒绝保存也不存进一个
         # 后面所有注入都会用的可疑值。
         notify(chat, 'GitHub 返回的令牌形态无法识别，未保存：' + str(exc))
         return
     DEVICE_FLOW.update({'provider': '', 'device_code': '', 'user_code': '', 'thread': None})
+    expire_note = ''
+    if body.get('expires_in'):
+        if body.get('refresh_token'):
+            expire_note = ('\n这是 GitHub App 用户令牌，约 '
+                           + str(max(1, int(body['expires_in']) // 3600))
+                           + ' 小时后过期，到期前会自动续期，不需要重新授权'
+                           + '（刷新令牌最长可用 6 个月，到期后需重新授权一次）。')
+        else:
+            expire_note = ('\n注意：这是 GitHub App 用户令牌，约 '
+                           + str(max(1, int(body['expires_in']) // 3600)) + ' 小时后过期，'
+                           + '但本次没有拿到刷新令牌，过期后需要重新发「授权GitHub」。')
     notify(chat, 'GitHub 授权成功，账号：' + (who['login'] or '（未返回）')
                   + '\n范围：' + (scope or '未返回')
                   + '\n凭据已写入本机，仅在新任务启动时以 GH_TOKEN 注入执行器。'
-                  '\n查询状态：「授权状态」；撤销：「撤销GitHub」。')
+                  + expire_note
+                  + '\n查询状态：「授权状态」；撤销：「撤销GitHub」。')
 
 
 def start_cloudflare_device_flow(chat):
@@ -833,7 +873,8 @@ def cloudflare_poll_worker(chat, snapshot):
     try:
         credentials().save('cloudflare', token, scope=scope,
                            refresh=body.get('refresh_token'),
-                           expires_in=body.get('expires_in'))
+                           expires_in=body.get('expires_in'),
+                           client_id=snapshot.get('client_id') or CLOUDFLARE_CLIENT_ID)
     except ValueError as exc:
         notify(chat, 'Cloudflare 返回的令牌形态无法识别，未保存：' + str(exc))
         return
@@ -3152,7 +3193,7 @@ def main():
     CONTROL = TaskController(WORK)
     startup_update_watch()
     # 凭据续期：Cloudflare 的访问令牌一天左右过期，到期前自动换新。
-    threading.Thread(target=cloudflare_renew_worker, daemon=True,
+    threading.Thread(target=credential_renew_worker, daemon=True,
                      name='credential-renew').start()
     CONTROL.start_workers()
     def shutdown(signum, frame):

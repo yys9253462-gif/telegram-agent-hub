@@ -959,7 +959,7 @@ class CloudflareRenewalTest(unittest.TestCase):
         body = {'access_token': 'cfut_' + 'Ne' * 20, 'refresh_token': 'next-refresh',
                 'expires_in': 86400}
         with patch('bot.cloudflare_auth.refresh', return_value=body) as refresh:
-            value = bot.renew_cloudflare_token()
+            value = bot.renew_credential('cloudflare')
         self.assertTrue(refresh.called)
         self.assertEqual(value, body['access_token'])
         record = store.get('cloudflare')
@@ -970,19 +970,19 @@ class CloudflareRenewalTest(unittest.TestCase):
     def test_fresh_token_is_left_alone(self):
         store = self.save(86400)
         with patch('bot.cloudflare_auth.refresh', side_effect=AssertionError('不该刷新')):
-            self.assertIsNone(bot.renew_cloudflare_token())
+            self.assertIsNone(bot.renew_credential('cloudflare'))
         self.assertEqual(store.get('cloudflare')['value'], FAKE_CF)
 
     def test_missing_refresh_token_cannot_renew(self):
         store = self.save(600, refresh=None)
         with patch('bot.cloudflare_auth.refresh', side_effect=AssertionError('不该刷新')):
-            self.assertIsNone(bot.renew_cloudflare_token())
+            self.assertIsNone(bot.renew_credential('cloudflare'))
         self.assertEqual(store.get('cloudflare')['value'], FAKE_CF)
 
     def test_failed_refresh_keeps_old_token(self):
         store = self.save(600)
         with patch('bot.cloudflare_auth.refresh', side_effect=cloudflare_auth.CloudflareError('已失效')):
-            self.assertIsNone(bot.renew_cloudflare_token())
+            self.assertIsNone(bot.renew_credential('cloudflare'))
         self.assertEqual(store.get('cloudflare')['value'], FAKE_CF)
 
     def test_environment_uses_renewed_token(self):
@@ -996,6 +996,58 @@ class CloudflareRenewalTest(unittest.TestCase):
         self.save(600, refresh='r1')
         text = bot.auth_status_text()
         self.assertIn('自动续期', text)
+
+
+class GitHubRenewalTest(unittest.TestCase):
+    """GitHub App 用户令牌 8 小时过期，必须能自动续期。"""
+
+    def setUp(self):
+        self.temp = Path(tempfile.mkdtemp(prefix='gh-renew-'))
+        self.addCleanup(shutil.rmtree, self.temp, True)
+        self.original = bot.CREDENTIALS
+        bot.CREDENTIALS = self.temp / 'credentials.json'
+        self.addCleanup(setattr, bot, 'CREDENTIALS', self.original)
+
+    def save(self, expires_in, refresh='ghr_refresh'):
+        store = credentials.CredentialStore(bot.CREDENTIALS)
+        store.save('github', FAKE_GH, scope='', refresh=refresh, expires_in=expires_in,
+                   client_id='Iv1.testclient')
+        return store
+
+    def test_renewal_uses_official_refresh_grant(self):
+        store = self.save(600)
+        body = {'access_token': 'ghu_' + 'Ab' * 15, 'refresh_token': 'ghr_next',
+                'expires_in': 28800}
+        with patch('bot.github_auth.renew', return_value=body) as renew:
+            value = bot.renew_credential('github')
+        self.assertTrue(renew.called)
+        # 必须用当初授权的客户端，换客户端换不到令牌。
+        self.assertEqual(renew.call_args.args[0], 'Iv1.testclient')
+        self.assertEqual(renew.call_args.args[1], 'ghr_refresh')
+        self.assertEqual(value, body['access_token'])
+        record = store.get('github')
+        self.assertEqual(record['value'], body['access_token'])
+        self.assertEqual(record['refresh'], 'ghr_next')
+
+    def test_refresh_grant_needs_no_client_secret_for_device_flow(self):
+        """设备码流程拿到的令牌续期时不需要 client_secret。"""
+        self.save(600)
+        with patch('bot.github_auth.renew', return_value={'access_token': 'ghu_' + 'Cd' * 15,
+                                                           'expires_in': 28800}) as renew:
+            bot.renew_credential('github', force=True)
+        self.assertIsNone(renew.call_args.args[2])
+
+    def test_expired_github_token_is_renewed_before_injection(self):
+        self.save(300)
+        body = {'access_token': 'ghu_' + 'Ef' * 15, 'refresh_token': 'ghr_next',
+                'expires_in': 28800}
+        with patch('bot.github_auth.renew', return_value=body):
+            environment = bot.credential_environment({})
+        self.assertEqual(environment.get('GH_TOKEN'), body['access_token'])
+
+    def test_status_shows_renewal_capability(self):
+        self.save(600)
+        self.assertIn('自动续期', bot.auth_status_text())
 
 
 class SensitiveFileTest(unittest.TestCase):

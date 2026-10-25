@@ -116,6 +116,25 @@ def poll(client_id, device_code, interval=5, expires_in=900, sleep=time.sleep, t
     raise DeviceFlowError('设备码已过期，请重新发起授权。')
 
 
+def renew(client_id, refresh_token, client_secret=None, timeout=20):
+    """用刷新令牌换一枚新的访问令牌。
+
+    GitHub App 的用户令牌默认 8 小时过期，刷新令牌最长 6 个月。
+    官方说明：设备码流程拿到的令牌，续期时不需要 client_secret。
+
+    ⚠ 刷新令牌是一次性的：用掉之后旧的刷新令牌和旧的访问令牌都作废，
+    所以响应里返回的新刷新令牌必须立刻存下来，否则下一次续期就无从下手。
+    """
+    payload = {'client_id': client_id, 'refresh_token': refresh_token,
+               'grant_type': 'refresh_token'}
+    if client_secret:
+        payload['client_secret'] = client_secret
+    body = _request(TOKEN_URL, payload, timeout=timeout)
+    if not body.get('access_token'):
+        raise DeviceFlowError(describe(body))
+    return body
+
+
 def whoami(token, timeout=15):
     """用令牌查一次当前账号，用来确认令牌真的有效、并记下登录的是谁。
 
