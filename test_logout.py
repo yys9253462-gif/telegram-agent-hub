@@ -294,7 +294,29 @@ class ChannelAfterLogoutTest(unittest.TestCase):
             self.press('退出账号')
         markup = bot.api.call_args.args[1]['reply_markup']['inline_keyboard']
         labels = [button['text'] for row in markup for button in row]
-        self.assertEqual(labels, ['退出Codex账号'], labels)
+        self.assertEqual(labels, ['退出Codex账号（a@b.c）'], labels)
+
+    def test_button_carries_the_identity(self):
+        """按钮上要带身份：只写「退出X账号」，点的那一刻还得往上翻才想得起退的是谁。"""
+        with patch.object(bot, 'account_authorized', return_value=(True, '已登录。')), \
+             patch.object(bot, 'subscription_identity', return_value={
+                 'email': '', 'name': '李静', 'plan': '', 'plan_label': '某教育公益版'}):
+            self.press('退出账号')
+        markup = bot.api.call_args.args[1]['reply_markup']['inline_keyboard']
+        labels = [button['text'] for row in markup for button in row]
+        self.assertTrue(any('李静' in label for label in labels),
+                        '按钮上没有身份：' + str(labels))
+
+    def test_button_has_no_silly_suffix_when_only_status_known(self):
+        """只有一个「已登录」状态时，别渲染成「退出X账号（已登录）」。"""
+        with patch.object(bot, 'account_authorized', return_value=(True, '已登录。')), \
+             patch.object(bot, 'subscription_identity', return_value={
+                 'email': '', 'name': '', 'plan': '', 'plan_label': '已登录'}):
+            self.press('退出账号')
+        markup = bot.api.call_args.args[1]['reply_markup']['inline_keyboard']
+        labels = [button['text'] for row in markup for button in row]
+        self.assertTrue(all('已登录' not in label for label in labels),
+                        '按钮上出现了状态词：' + str(labels))
 
     def test_menu_without_any_login_explains_itself(self):
         with patch.object(bot, 'account_authorized', return_value=(False, '尚未登录。')), \
