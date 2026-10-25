@@ -5,6 +5,8 @@
 为无头程序提供的路径 —— 只要 client_id（无 secret），不需要回调地址，
 也不需要公网可达。整个流程只有三步：申请码 → 机主在别处输码 → 轮询换令牌。
 """
+import base64
+import binascii
 import datetime
 import json
 import time
@@ -847,6 +849,123 @@ def usage_line(item, now=None):
 def usage_leaking_engine(provider):
     """用量读取只对这三个执行器有意义。"""
     return provider in ('claude', 'codex', 'codebuddy')
+
+
+# ==== 订阅账号身份 与 账号模式可选模型 ====
+#
+# 渠道切换要能列出「所有登录的订阅账号」，就必须知道每个执行器背后
+# 到底是哪个账号、什么套餐。这里只取身份与套餐这类非敏感字段：
+# 令牌、refresh_token、id_token 原文一律不出这个模块。
+
+CODEX_PLAN_LABELS = {
+    'free': '免费版',
+    'plus': 'Plus',
+    'pro': 'Pro',
+    'team': 'Team',
+    'business': 'Business',
+    'enterprise': 'Enterprise',
+    'edu': 'Edu',
+}
+# Claude 的 --model 接受别名，比写死版本号稳：官方换版本时别名照样有效。
+CLAUDE_ACCOUNT_MODELS = (
+    ('default', '默认'),
+    ('opus', 'Opus'),
+    ('sonnet', 'Sonnet'),
+    ('haiku', 'Haiku'),
+)
+# Codex 账号模式真实可用的模型（2026-10-26 在真实 Plus 账号上逐个实测）。
+# 判定依据：返回 "Stream must be set to true" 说明模型存在；
+# 返回 "not supported when using Codex with a ChatGPT account" 才是不可用。
+# 结论：Plus 只能用 gpt-6* 与 gpt-5.6-* 系列；
+# gpt-5.5 / gpt-5.4 / gpt-5.2 / gpt-5.6 / gpt-5.1 / gpt-5.1-codex* / o3 都被拒。
+CODEX_ACCOUNT_MODELS = (
+    ('gpt-6-sol', 'GPT-6 Sol'),
+    ('gpt-6-luna', 'GPT-6 Luna'),
+    ('gpt-6-astra', 'GPT-6 Astra'),
+    ('gpt-6.1-sol', 'GPT-6.1 Sol'),
+    ('gpt-5.6-sol', 'GPT-5.6 Sol'),
+    ('gpt-5.6-terra', 'GPT-5.6 Terra'),
+    ('gpt-5.6-luna', 'GPT-5.6 Luna'),
+)
+CLAUDE_ACCOUNT_MODEL_IDS = {item[0] for item in CLAUDE_ACCOUNT_MODELS}
+CODEX_ACCOUNT_MODEL_IDS = {item[0] for item in CODEX_ACCOUNT_MODELS}
+
+
+def codex_jwt_claims(token):
+    """解出 JWT 的载荷，只为了拿 email 与套餐；解不出来返回空字典。
+
+    不验签：本机读自己 CLI 写的令牌，用途只是显示身份。
+    任何异常都吞掉 —— 一个格式坏掉的令牌不该让「查看进度」整页报错。
+    """
+    if not isinstance(token, str) or token.count('.') != 2:
+        return {}
+    payload = token.split('.')[1]
+    payload += '=' * (-len(payload) % 4)
+    try:
+        data = json.loads(base64.urlsafe_b64decode(payload))
+    except (ValueError, TypeError, binascii.Error):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def codex_identity(auth):
+    """从 ~/.codex/auth.json 的内容里取身份与套餐。"""
+    if not isinstance(auth, dict) or auth.get('auth_mode') != 'chatgpt':
+        return None
+    tokens = auth.get('tokens')
+    if not isinstance(tokens, dict):
+        return None
+    claims = codex_jwt_claims(tokens.get('id_token'))
+    auth_info = claims.get('https://api.openai.com/auth')
+    plan = ''
+    if isinstance(auth_info, dict):
+        plan = str(auth_info.get('chatgpt_plan_type') or '')
+    return {'email': str(claims.get('email') or ''),
+            'plan': plan,
+            'plan_label': CODEX_PLAN_LABELS.get(plan, plan or '未知套餐')}
+
+
+def claude_identity(text):
+    """从 `claude auth status --text` 的输出里取邮箱与套餐。
+
+    官方输出在不同版本里措辞会变，所以按「哪一行像邮箱」兜底，
+    拿不到就返回空值，由调用方显示成「已登录（身份未显示）」。
+    """
+    clean = LOGIN_ANSI.sub('', text or '')
+    lowered = clean.lower()
+    if 'not logged in' in lowered:
+        return None
+    email = ''
+    found = re.search(r'[\w.+-]+@[\w-]+\.[\w.-]+', clean)
+    if found:
+        email = found.group(0)
+    plan = ''
+    for word, label in (('max', 'Max'), ('pro', 'Pro'), ('team', 'Team'),
+                        ('enterprise', 'Enterprise'), ('free', '免费版')):
+        if re.search(r'\b' + word + r'\b', lowered):
+            plan = label
+            break
+    return {'email': email, 'plan': plan.lower(), 'plan_label': plan or '订阅账号'}
+
+
+def account_identity_label(identity, fallback='已登录'):
+    """身份的可读标签：优先「邮箱 · 套餐」，都没拿到才退回一句状态。"""
+    if not identity:
+        return fallback
+    parts = [identity.get('email') or '', identity.get('plan_label') or '']
+    parts = [part for part in parts if part]
+    return ' · '.join(parts) if parts else fallback
+
+
+def account_models(provider):
+    """账号模式下该执行器可选的真实模型；没有清单就返回空元组。"""
+    if provider == 'claude':
+        return CLAUDE_ACCOUNT_MODELS
+    if provider == 'codex':
+        return CODEX_ACCOUNT_MODELS
+    # CodeBuddy 账号模式的模型以它自己的目录为准（models.json），
+    # 这里不硬编码，交给调用方走 catalog()，避免写死一份会过期的清单。
+    return ()
 
 
 class UsageReporter:

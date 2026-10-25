@@ -75,7 +75,7 @@ MENU_GROUPS = {
     '设置': {
         '任务与模型': ['模型', '选择智能体'],
         '会话与文件': ['新建会话', '会话列表'],
-        '账号登录': ['登录Claude', '登录CodeBuddy', '登录Codex', '账号状态', '渠道切换'],
+        '账号登录': ['登录Claude', '登录CodeBuddy', '登录Codex', '账号状态', '渠道切换', '账号模型'],
         '版本更新': ['检查版本', '更新机器人'],
     },
     '更多': {
@@ -561,6 +561,86 @@ def usage_credential(provider):
     if provider == 'codex':
         return codex_account_token()
     return None
+
+
+def read_text_safely(path):
+    try:
+        return Path(path).read_text()
+    except (OSError, ValueError):
+        return ''
+
+
+def subscription_identity(engine):
+    """取该执行器的订阅身份（邮箱、套餐）。读不到返回 None。
+
+    只取非敏感字段。令牌、refresh_token、id_token 原文都不会离开
+    github_auth，这里拿到的永远只有 email 与套餐名。
+    """
+    if engine == 'codex':
+        raw = read_text_safely(CODEX_AUTH)
+        try:
+            return github_auth.codex_identity(json.loads(raw) if raw else None)
+        except ValueError:
+            return None
+    if engine == 'claude':
+        # claude auth status --text 是官方入口；失败时再看一眼凭据文件在不在，
+        # 在的话至少能说「已登录」而不是「未登录」。
+        try:
+            result = subprocess.run([claude_binary(), 'auth', 'status', '--text'],
+                                    capture_output=True, text=True, timeout=20,
+                                    env=login_environment())
+            output = (result.stdout or '') + (result.stderr or '')
+        except (OSError, subprocess.SubprocessError):
+            output = ''
+        identity = github_auth.claude_identity(output)
+        if identity:
+            return identity
+        return {'email': '', 'plan': '', 'plan_label': '订阅账号'} if claude_oauth_token() else None
+    if engine == 'codebuddy':
+        # CodeBuddy 没有身份查询命令，也没有稳定的凭据文件位置。
+        # 只能确认「已登录」，不编造邮箱。
+        ok, _ = account_authorized('codebuddy')
+        return {'email': '', 'plan': '', 'plan_label': '已登录'} if ok else None
+    return None
+
+
+def account_model_options(engine):
+    """账号模式下该执行器可选模型，返回 [(id, 显示名)]。
+
+    CodeBuddy 用官方目录（catalog），其余用实测过的清单。
+    """
+    fixed = github_auth.account_models(engine)
+    if fixed:
+        return list(fixed)
+    if engine == 'codebuddy':
+        try:
+            return [(item['id'], item['id']) for item in catalog() if item.get('id')]
+        except Exception:
+            return []
+    return []
+
+
+def account_model_state_path(engine):
+    return WORK / ('account-model-' + engine + '.json')
+
+
+def account_model(engine=None):
+    """账号模式下当前选的模型；没选过返回空串（表示用官方默认）。"""
+    engine = engine or current_engine()
+    try:
+        data = json.loads(account_model_state_path(engine).read_text())
+    except (OSError, ValueError):
+        return ''
+    value = data.get('model') if isinstance(data, dict) else None
+    return value if isinstance(value, str) else ''
+
+
+def set_account_model(engine, model):
+    """记住账号模式的模型选择。空串表示回到官方默认。"""
+    valid = {item[0] for item in account_model_options(engine)}
+    if model and model not in valid:
+        raise MediaError('这个模型不在账号模式可用清单里。')
+    atomic_json(account_model_state_path(engine), {'model': model})
 
 
 USAGE = UsageReporter(credential=usage_credential)
@@ -1835,6 +1915,10 @@ def engine_command(engine, text, instructions, chat, environment):
                     '--sandbox', 'danger-full-access', '--cd', str(WORK)]
         if account:
             command += ['-c', 'model_provider="openai"', '-c', 'forced_login_method="chatgpt"']
+            # 账号模式不能用 auto（官方 400：Auto model selection is unavailable），
+            # 所以必须显式给一个；没选过就不加 --model，让 CLI 用它自己的默认值。
+            if account_model(engine):
+                command += ['--model', account_model(engine)]
         elif current_model():
             command += ['--model', current_model()]
         if session_id():
@@ -1849,6 +1933,8 @@ def engine_command(engine, text, instructions, chat, environment):
                 '--append-system-prompt', instructions]
     if engine == 'codebuddy' and not account:
         command.extend(['--model', current_model()])
+    if engine == 'codebuddy' and account and account_model(engine):
+        command.extend(['--model', account_model(engine)])
     if session_id():
         command.extend(['--resume', session_id()])
     if environment.pop('_IMAGE_SERVER', None):
@@ -3105,19 +3191,40 @@ class TaskController:
         elif text == '渠道切换':
             engine = current_engine()
             label = engine_spec(engine)['label']
-            send_options(chat, label + ' 当前渠道：' + channel_label(engine)
-                              + '\n\n接口密钥：使用已配置的网关与密钥。\n'
-                              + label + ' 账号：使用官方登录态与默认模型。',
-                         [('使用接口密钥', '使用接口密钥 ' + engine),
-                          ('使用' + label + '账号', '使用账号 ' + engine)])
+            identity = subscription_identity(engine)
+            lines = [label + ' 当前渠道：' + channel_label(engine)]
+            if auth_channel(engine) == 'account':
+                lines.append('账号模式模型：' + (account_model(engine) or '官方默认'))
+            lines.append('')
+            lines.append('接口密钥：使用已配置的网关与密钥。')
+            options = [('使用接口密钥', '使用接口密钥 ' + engine)]
+            if identity:
+                # 已登录就把真实身份摆出来，避免「账号」两字之下不知道用的是谁。
+                lines.append(label + ' 账号：' + github_auth.account_identity_label(identity)
+                             + '（官方登录态）')
+                options.append(('使用' + label + '账号', '使用账号 ' + engine))
+            else:
+                lines.append(label + ' 账号：未登录，先「登录' + label + '账号」。')
+            others = [name for name in enabled_engines() if name != engine]
+            if others:
+                # 这里只列，不切换执行器：切执行器有专门入口，
+                # 在本页混进切执行器的按钮，会把「换渠道」和「换执行器」两件事搅在一起。
+                lines.append('')
+                lines.append('其他执行器（到「切换执行器」里切）：'
+                             + '、'.join(ENGINES[name]['label'] for name in others))
+            send_options(chat, '\n'.join(lines), options)
         elif (text in ('使用接口密钥', '使用Claude账号', '使用CodeBuddy账号', '使用Codex账号')
               or text.startswith(('使用接口密钥 ', '使用账号 '))):
+            # 跨执行器切换时，文本里带引擎名；直接点「使用Claude账号」这类旧按钮时按标签反查。
+            # 两者都认不出来就明确报错，不要在这里抛 StopIteration 糊掉。
+            engine = ''
             if text.startswith(('使用接口密钥 ', '使用账号 ')):
                 engine = text.partition(' ')[2]
             elif text == '使用接口密钥':
                 engine = current_engine()
             else:
-                engine = next(name for name, spec in ENGINES.items() if text == '使用' + spec['label'] + '账号')
+                engine = next((name for name, spec in ENGINES.items()
+                               if text == '使用' + spec['label'] + '账号'), '')
             if engine not in ENGINES:
                 raise MediaError('未知执行器。')
             account = text.startswith('使用账号 ') or text.endswith('账号')
@@ -3126,7 +3233,49 @@ class TaskController:
                 if not ok:
                     raise MediaError('还没有确认' + engine_spec(engine)['label'] + '账号登录，请先发送“登录' + engine_spec(engine)['label'] + '”。')
             set_auth_channel('account' if account else 'gateway', engine)
-            send(chat, engine_spec(engine)['label'] + ' 已切换到：' + channel_label(engine) + '\n仅影响该执行器的新任务。')
+            label = engine_spec(engine)['label']
+            if account:
+                extra = ('\n账号模式模型：' + (account_model(engine) or '官方默认')
+                         + '\n可发送“账号模型”选择具体模型。')
+            else:
+                extra = '\n已回到接口密钥渠道，模型沿用“模型设置”里的网关模型。'
+            send(chat, label + ' 已切换到：' + channel_label(engine) + extra + '\n仅影响该执行器的新任务。')
+            if engine != current_engine():
+                # 不自动改当前执行器：切渠道只改「用哪个身份」，
+                # 顺手把执行器也换掉，等于替用户做了另一件事。
+                switches = engine_spec(engine)
+                send_options(chat, '当前执行器仍是 ' + engine_spec(current_engine())['label']
+                                   + '。要换到 ' + label + ' 执行任务，点下面这个。',
+                             [(switches['button'], switches['button'])])
+        elif text == '账号模型':
+            engine = current_engine()
+            label = engine_spec(engine)['label']
+            if auth_channel(engine) != 'account':
+                raise MediaError('当前走接口密钥渠道，没有账号模型可选。先发送“渠道切换”切到账号。')
+            models = account_model_options(engine)
+            if not models:
+                raise MediaError(label + ' 账号模式暂无可选模型清单。')
+            current = account_model(engine)
+            lines = [label + ' 账号模式模型\n当前：' + (current or '官方默认'),
+                     '账号模式与接口密钥模式各用各的模型，互不影响。',
+                     '官方对账号模式有可用范围限制，清单之外的模型会被直接拒绝。']
+            options = [('账号模型 默认', '账号模型 默认')]
+            options.extend((name + (' ·当前' if mid == current else ''), '账号模型 ' + mid)
+                           for mid, name in models)
+            send_options(chat, '\n'.join(lines), options)
+        elif text.startswith('账号模型 '):
+            engine = current_engine()
+            choice = text.partition(' ')[2].strip()
+            model = '' if choice in ('默认', 'default') else choice
+            set_account_model(engine, model)
+            if auth_channel(engine) != 'account':
+                # 记下来但不生效最容易让人以为设错了，这里说清什么时候才用得上。
+                send(chat, engine_spec(engine)['label'] + ' 账号模式模型已记为：' + (model or '官方默认')
+                     + '\n但当前走接口密钥渠道，这次选择要等切到账号模式才生效。')
+                return
+            label = engine_spec(engine)['label']
+            send(chat, label + ' 账号模式模型已设为：' + (model or '官方默认')
+                 + '\n仅影响该执行器的新任务。')
         elif text == '授权GitHub':
             send_rich(chat, start_github_device_flow(chat))
         elif text == '授权Cloudflare':
