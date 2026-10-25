@@ -64,8 +64,11 @@ class ConcurrencyTests(unittest.TestCase):
         with patch.object(self.b, 'send_options') as options:
             self.c.handle_text(1, '当前任务')
         self.assertTrue(all(task['id'] in options.call_args.args[1] for task in tasks))
-        self.assertEqual([command for label, command in options.call_args.args[2]],
-                         ['停止任务 ' + task['id'] for task in tasks])
+        # 选项既可能是 (label, command) 元组，也可能是纯命令字符串（如「刷新用量」），
+        # 两种写法都要取到命令本身，否则加一个纯字符串按钮就会让解析炸掉。
+        commands = [item[1] if isinstance(item, tuple) else item
+                    for item in options.call_args.args[2]]
+        self.assertEqual(commands[:len(tasks)], ['停止任务 ' + task['id'] for task in tasks])
         response = self.c.stop()
         self.assertIn('停止任务 ID', response)
         self.assertTrue(all(task['id'] in response for task in tasks))

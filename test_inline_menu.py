@@ -168,8 +168,14 @@ class InlineMenuTests(unittest.TestCase):
                 self.controller.handle_text(123, command)
                 stop.assert_not_called()
             buttons = self.buttons()
+            # 「查看进度」多带一个「刷新用量」按钮（用量是附加信息，随时可手动重取）；
+            # 「停止」只列停止项，不该混进刷新按钮。两个命令的差异要显式断言，
+            # 否则以后往其中一个加按钮会悄悄改变另一个的行为。
+            expected = ['停止任务 one', '停止任务 two']
+            if command == '当前任务':
+                expected.append('刷新用量')
             self.assertEqual([bot.ACTION_UI[button['callback_data'][3:]]['command'] for button in buttons],
-                             ['停止任务 one', '停止任务 two'])
+                             expected)
             with patch.object(self.controller, 'stop', return_value='已停止') as stop:
                 bot.handle_update(self.update(buttons[1]['callback_data'], 10 if command == '当前任务' else 11))
                 stop.assert_called_once_with('two')

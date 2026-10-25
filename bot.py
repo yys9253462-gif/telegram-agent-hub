@@ -24,7 +24,7 @@ from pathlib import Path
 # 这样模块内引用 os.environ 时拿到的已经是本进程的环境。
 import cloudflare_auth
 import github_auth
-from github_auth import LoginManager
+from github_auth import LoginManager, UsageReporter, usage_footer, usage_line, usage_merge
 from credentials import PROVIDERS, CredentialStore, fingerprint, looks_like
 
 # 导入模块不读取认证信息、不创建目录、不启动网络请求。
@@ -507,6 +507,58 @@ def credentials():
         return CredentialStore(CREDENTIALS)
 
 
+# Claude 的 OAuth 令牌由 CLI 自己写在 ~/.claude/.credentials.json 的 claudeAiOauth 下，
+# 不经过我们的 credentials.json。只读不写：刷新令牌由 CLI 自己维护，
+# 外部去刷新会打断它的轮换状态。
+CLAUDE_CREDENTIALS = Path(os.environ.get('CLAUDE_CREDENTIALS')
+                          or os.path.join(os.path.expanduser('~'), '.claude', '.credentials.json'))
+
+
+def claude_oauth_token(path=None):
+    """取 Claude CLI 当前的 OAuth 访问令牌；没有就返回 None。"""
+    path = Path(path) if path else CLAUDE_CREDENTIALS
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    block = data.get('claudeAiOauth') if isinstance(data, dict) else None
+    if not isinstance(block, dict):
+        return None
+    token = block.get('accessToken')
+    return token if isinstance(token, str) and token.strip() else None
+
+
+def usage_credential(provider):
+    """用量读取用的凭证回调：Claude 走 CLI 自己的文件，其余暂无可查通道。"""
+    if provider == 'claude':
+        token = claude_oauth_token()
+        return {'value': token} if token else None
+    return None
+
+
+USAGE = UsageReporter(credential=usage_credential)
+
+
+def usage_footer_for(engine=None, force=False):
+    """账号模式下给出「用量：…」这一行；接口密钥模式或读不到时返回空串。
+
+    返回空串而不是报错：用量是附加信息，读不到不能拖垮一轮已经成功的结果。
+    """
+    engine = engine or current_engine()
+    if auth_channel(engine) != 'account':
+        return ''
+    try:
+        state = USAGE.snapshot(engine, force=force)
+    except Exception:
+        return ''
+    if not state:
+        return ''
+    try:
+        return usage_footer(state)
+    except Exception:
+        return ''
+
+
 # 两个平台的访问令牌都会过期：Cloudflare 约一天，GitHub App 用户令牌 8 小时。
 # 设备码流程都申请了离线访问权限，换回来的响应里带刷新令牌，
 # 用它就能在到期前自动续期，不必每次重新授权。
@@ -645,6 +697,46 @@ def credential_environment(base=None):
             environment.pop(alias, None)
     environment.update(overrides)
     return environment
+
+
+def usage_overview_text():
+    """已启用执行器的套餐用量总览，供「查看进度」使用。
+
+    只列真正启用、且当前走账号渠道的执行器：接口密钥渠道没有套餐窗口，
+    列出来只会让人困惑「为什么没有数字」。
+    """
+    names = enabled_engines()
+    if not names:
+        return '套餐用量：没有启用的执行器。'
+    lines = ['套餐用量（5小时与7天窗口）']
+    for name in names:
+        label = engine_spec(name)['label']
+        if auth_channel(name) != 'account':
+            lines.append(label + '：当前走接口密钥，无套餐窗口。')
+            continue
+        try:
+            state = USAGE.snapshot(name)
+        except Exception:
+            state = None
+        if not state:
+            lines.append(label + '：暂不支持读取。')
+            continue
+        if not state.get('ok'):
+            lines.append(label + '：' + (state.get('error') or '读取失败'))
+            continue
+        readings = usage_merge(state.get('windows'))
+        if not readings:
+            lines.append(label + '：暂无窗口数据。')
+            continue
+        parts = [usage_line(item) for item in readings]
+        parts = [part for part in parts if part]
+        lines.append(label + '：' + '；'.join(parts))
+        updated = state.get('at')
+        if updated:
+            lines.append('　刷新于 ' + time.strftime('%H:%M:%S', time.localtime(updated)))
+    if len(lines) == 1:
+        lines.append('暂无账号模式执行器。先「账号登录」再用「使用账号」。')
+    return '\n'.join(lines)
 
 
 def auth_status_text():
@@ -1963,6 +2055,11 @@ def run_stream(chat, text):
             task['result'] = redact(answer[:24000])
             task['execution_error'] = crashed
         answer = redact(answer[:24000])
+        # 账号渠道才追加用量：接口密钥渠道按量计费，没有「套餐窗口」这个概念，
+        # 硬塞一行剩余百分比只会误导。放在正文之后单独一行，不与回复内容混淆。
+        footer = usage_footer_for(engine)
+        if footer:
+            answer = answer + '\n\n' + footer
         pieces = split_message(answer)
         head = pieces[0] if pieces else answer
         if time.monotonic() < update_after:
@@ -2812,10 +2909,20 @@ class TaskController:
                 stops = [('停止 ' + task_id[:8], '停止任务 ' + task_id) for task_id, state in self.running.items()
                          if state['task']['chat'] == chat]
             title = current + '\n排队：' + str(count) + '\n新任务设置：' + current_model() + ' / ' + self.target + ' / ' + strategy_name() + '\n运行和排队任务保留各自设置。实时系统资源请选择“服务器状态”。'
+            title += '\n\n' + usage_overview_text()
             if stops:
-                send_options(chat, title, stops)
+                send_options(chat, title, stops + ['刷新用量'])
             else:
-                send(chat, title)
+                send_options(chat, title, ['刷新用量'])
+        elif text == '刷新用量':
+            # 强制绕过缓存重取一次，机主点了刷新就是想看当下真实数字。
+            for name in enabled_engines():
+                if auth_channel(name) == 'account':
+                    try:
+                        USAGE.snapshot(name, force=True)
+                    except Exception:
+                        pass
+            send(chat, usage_overview_text())
         elif text == '停止':
             with self.lock:
                 stops = [('停止 ' + task_id[:8], '停止任务 ' + task_id) for task_id, state in self.running.items()
