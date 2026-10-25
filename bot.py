@@ -1460,7 +1460,7 @@ def run_stream(chat, text):
                 content = state['content']
                 activity = state['activity']
                 final = state['final']
-            interval = 1.3 if activity == '正在生成回复' else 4
+            interval = 1.0 if activity == '正在生成回复' else 2.0
             if time.monotonic() - last_edit >= interval:
                 seconds = int(time.monotonic() - started)
                 progress = activity + ' · 已运行' + str(seconds) + '秒'
