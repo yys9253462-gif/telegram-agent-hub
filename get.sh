@@ -119,11 +119,12 @@ tar -xzf "$ARCHIVE" -C "$WORK/src" --strip-components=1 --no-same-owner --no-sam
 say ""
 say "源码已就绪，开始交互式安装。"
 # 通过 curl | bash 执行时标准输入是管道，交互问答会读不到终端。
-# 存在控制终端时把标准输入接回终端；没有终端则交给安装器报错提示用 --yes。
+# 有控制终端就把它接回标准输入；完全没有终端时交给安装器提示改用 --yes --config。
+# 注意：[ -r /dev/tty ] 在无控制终端的会话里仍可能为真，必须真正打开才算数。
 if [ -t 0 ]; then
     exec python3 "$WORK/src/install.py" "$@"
-elif [ -r /dev/tty ] && exec 3</dev/tty 2>/dev/null; then
-    exec python3 "$WORK/src/install.py" "$@" <&3 3<&-
-else
-    exec python3 "$WORK/src/install.py" "$@"
 fi
+if exec 3<>/dev/tty 2>/dev/null; then
+    exec python3 "$WORK/src/install.py" "$@" <&3 3<&-
+fi
+exec python3 "$WORK/src/install.py" "$@"
