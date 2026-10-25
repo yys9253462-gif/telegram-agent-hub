@@ -113,9 +113,14 @@ sudo python3 /opt/telegram-agent-hub/install.py --uninstall
 |---|---|---|
 | Claude | 有 `claude auth logout` | 直接调用官方命令 |
 | Codex | **没有** logout 子命令 | 移除整个 `~/.codex/auth.json` |
-| CodeBuddy | **没有** logout 子命令 | 清空 `~/.local/share/CodeBuddyExtension/Data/Public/auth/*.info` 里的 `auth` 段 |
+| CodeBuddy | **没有** logout 子命令 | 清空 `~/.local/share/CodeBuddyExtension/Data/Public/auth/*.info` 里的 `auth` 与 `account` 段（同一文件里的其它设置保留） |
 
 Codex 那条最容易写错：只把文件里的 `tokens` 置空、甚至把 `auth_mode` 也写成 null，`codex login status` **仍然报已登录**——它只看文件在不在。所以必须整份移除。移除前会备份成 `auth.json.logout-<时间>.bak`（权限 600），因为同一个文件里可能还有网关的 `OPENAI_API_KEY`。
+
+两条实测踩出来的细节：
+
+- **CodeBuddy 的「未登录」可能是假的。** 它的登录态靠跑一段临时对话来探，那一段会因为超时或网络抖动失败，看起来像没登录。所以退出前判断"能不能退"时会同时看凭据文件在不在：官方说未登录但凭据还在，仍然允许退出，否则凭据好好的却退不掉。
+- **身份不是只有邮箱。** CodeBuddy 的凭据里没有邮箱字段，但有 `displayName` / `enterpriseName`，所以菜单显示成「CodeBuddy：已登录 · 李静 · 某教育公益版」，按钮也带上名字（`退出CodeBuddy账号（李静）`）。取不到展示名时只显示「已登录」，不会编造，也不会把状态词当身份渲染成「已登录 · 已登录」。
 
 ## 外部平台授权（GitHub / Cloudflare）
 
