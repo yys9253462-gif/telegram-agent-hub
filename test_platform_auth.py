@@ -935,6 +935,69 @@ class CloudflareWhoamiTest(unittest.TestCase):
         self.assertIn('权限', str(caught.exception))
 
 
+class CloudflareRenewalTest(unittest.TestCase):
+    """缺陷：访问令牌一天就过期，每次都要人工重新授权。
+
+    设备码流程带了 offline_access，响应里有刷新令牌；
+    到期前用它换新令牌并写回凭据文件，机主就不用再点一次授权。
+    """
+
+    def setUp(self):
+        self.temp = Path(tempfile.mkdtemp(prefix='cf-renew-'))
+        self.addCleanup(shutil.rmtree, self.temp, True)
+        self.original = bot.CREDENTIALS
+        bot.CREDENTIALS = self.temp / 'credentials.json'
+        self.addCleanup(setattr, bot, 'CREDENTIALS', self.original)
+
+    def save(self, expires_in, refresh='refresh-value'):
+        store = credentials.CredentialStore(bot.CREDENTIALS)
+        store.save('cloudflare', FAKE_CF, scope='站点', refresh=refresh, expires_in=expires_in)
+        return store
+
+    def test_near_expiry_token_is_renewed_and_saved(self):
+        store = self.save(600)
+        body = {'access_token': 'cfut_' + 'Ne' * 20, 'refresh_token': 'next-refresh',
+                'expires_in': 86400}
+        with patch('bot.cloudflare_auth.refresh', return_value=body) as refresh:
+            value = bot.renew_cloudflare_token()
+        self.assertTrue(refresh.called)
+        self.assertEqual(value, body['access_token'])
+        record = store.get('cloudflare')
+        self.assertEqual(record['value'], body['access_token'])
+        self.assertEqual(record['refresh'], 'next-refresh')
+        self.assertGreater(record['expires_at'], int(time.time()) + 3600)
+
+    def test_fresh_token_is_left_alone(self):
+        store = self.save(86400)
+        with patch('bot.cloudflare_auth.refresh', side_effect=AssertionError('不该刷新')):
+            self.assertIsNone(bot.renew_cloudflare_token())
+        self.assertEqual(store.get('cloudflare')['value'], FAKE_CF)
+
+    def test_missing_refresh_token_cannot_renew(self):
+        store = self.save(600, refresh=None)
+        with patch('bot.cloudflare_auth.refresh', side_effect=AssertionError('不该刷新')):
+            self.assertIsNone(bot.renew_cloudflare_token())
+        self.assertEqual(store.get('cloudflare')['value'], FAKE_CF)
+
+    def test_failed_refresh_keeps_old_token(self):
+        store = self.save(600)
+        with patch('bot.cloudflare_auth.refresh', side_effect=cloudflare_auth.CloudflareError('已失效')):
+            self.assertIsNone(bot.renew_cloudflare_token())
+        self.assertEqual(store.get('cloudflare')['value'], FAKE_CF)
+
+    def test_environment_uses_renewed_token(self):
+        self.save(600)
+        body = {'access_token': 'cfut_' + 'En' * 20, 'refresh_token': 'r2', 'expires_in': 86400}
+        with patch('bot.cloudflare_auth.refresh', return_value=body):
+            environment = bot.credential_environment({})
+        self.assertEqual(environment.get('CLOUDFLARE_API_TOKEN'), body['access_token'])
+
+    def test_status_shows_renewal_capability(self):
+        self.save(600, refresh='r1')
+        text = bot.auth_status_text()
+        self.assertIn('自动续期', text)
+
+
 class SensitiveFileTest(unittest.TestCase):
     """缺陷：模型用「发文件」把凭据文件原样传回聊天。"""
 
