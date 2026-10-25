@@ -512,6 +512,8 @@ def credentials():
 # 外部去刷新会打断它的轮换状态。
 CLAUDE_CREDENTIALS = Path(os.environ.get('CLAUDE_CREDENTIALS')
                           or os.path.join(os.path.expanduser('~'), '.claude', '.credentials.json'))
+CODEX_AUTH = Path(os.environ.get('CODEX_AUTH_FILE')
+                  or os.path.join(os.path.expanduser('~'), '.codex', 'auth.json'))
 
 
 def claude_oauth_token(path=None):
@@ -528,11 +530,36 @@ def claude_oauth_token(path=None):
     return token if isinstance(token, str) and token.strip() else None
 
 
+def codex_account_token(path=None):
+    """取 Codex CLI 的 ChatGPT 账号令牌与账号 ID；API Key 模式返回 None。
+
+    只有 auth_mode 为 chatgpt 才算账号模式：用 API Key 登录的同样写着
+    auth.json，但那种情况下没有套餐窗口可查，硬查会得到一个误导性的 403。
+    """
+    path = Path(path) if path else CODEX_AUTH
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get('auth_mode') != 'chatgpt':
+        return None
+    tokens = data.get('tokens')
+    if not isinstance(tokens, dict):
+        return None
+    token = tokens.get('access_token')
+    if not isinstance(token, str) or not token.strip():
+        return None
+    account = tokens.get('account_id')
+    return {'value': token, 'account': account if isinstance(account, str) else ''}
+
+
 def usage_credential(provider):
-    """用量读取用的凭证回调：Claude 走 CLI 自己的文件，其余暂无可查通道。"""
+    """用量读取用的凭证回调：两家都读 CLI 自己的凭据文件，不碰 credentials.json。"""
     if provider == 'claude':
         token = claude_oauth_token()
         return {'value': token} if token else None
+    if provider == 'codex':
+        return codex_account_token()
     return None
 
 

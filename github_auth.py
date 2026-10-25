@@ -570,6 +570,10 @@ class LoginManager:
 
 USAGE_CLAUDE_URL = 'https://api.anthropic.com/api/oauth/usage'
 USAGE_CLAUDE_BETA = 'oauth-2025-04-20'
+# Codex 账号用量。必须同时带 chatgpt-account-id，只有 Bearer 会 403。
+# 同域的 /backend-api/codex/usage 是 403、/backend-api/wham/rate-limits 是 404，
+# 别拿它们试（实测）。
+USAGE_CODEX_URL = 'https://chatgpt.com/backend-api/wham/usage'
 USAGE_TIMEOUT = 8
 USAGE_WINDOWS = (
     ('five_hour', '5小时', 300),
@@ -691,12 +695,30 @@ def usage_parse_headers(headers):
 
 
 def usage_parse_codex(payload):
-    """解析 Codex（wham / rate_limits）结构的用量。"""
+    """解析 Codex 账号用量（GET /backend-api/wham/usage）。
+
+    真实响应形状（2026-10 实测）：
+        {"plan_type": "plus",
+         "rate_limit": {"limit_reached": true,
+                        "primary_window":   {"used_percent": 100,
+                                             "limit_window_seconds": 18000,
+                                             "reset_after_seconds": 3056,
+                                             "reset_at": 1792953411},
+                        "secondary_window": {"used_percent": 31, ...}}}
+
+    ⚠ 字段名是单数 rate_limit + *_window，不是 Codex 二进制里那份
+    Rust 结构体名的 rate_limits + primary/secondary —— 两者都保留兼容，
+    但判断顺序要以前者（实测过的线上形状）优先。
+    """
     if not isinstance(payload, dict):
         raise UsageError('用量响应结构不认识（不是对象）。')
-    # 真实响应可能把限流信息包在 rate_limits 里，也可能直接平铺，两种都试。
-    block = payload.get('rate_limits')
-    if not isinstance(block, dict):
+    block = None
+    for name in ('rate_limit', 'rate_limits'):
+        candidate = payload.get(name)
+        if isinstance(candidate, dict):
+            block = candidate
+            break
+    if block is None:
         block = payload
     windows = []
     for slot, fallback in (('primary', '5小时'), ('secondary', '7天')):
@@ -712,7 +734,10 @@ def usage_parse_codex(payload):
         # 窗口时长优先用作名字：服务端会把 5 小时窗口挪到 primary 或 secondary，
         # 按位置写死标签迟早标错。
         label = _usage_window_label(minutes, fallback)
-        reset = item.get('resets_at')
+        # reset_at 是绝对秒级时间戳；resets_at 是它在部分版本里的叫法。
+        reset = item.get('reset_at')
+        if reset is None:
+            reset = item.get('resets_at')
         if reset is None:
             reset = item.get('reset_after_seconds')
             if reset is not None:
@@ -848,11 +873,11 @@ class UsageReporter:
             self.cache[key] = {'value': value, 'expires': self.clock() + ttl}
         return value
 
-    def _credentials(self):
+    def _credentials(self, provider='claude'):
         if self.credential is None:
             return None
         try:
-            record = self.credential('claude')
+            record = self.credential(provider)
         except Exception:
             return None
         return record if isinstance(record, dict) else None
@@ -864,7 +889,7 @@ class UsageReporter:
             hit = self._cached(key)
             if hit is not None:
                 return hit
-        record = self._credentials()
+        record = self._credentials('claude')
         token = (record or {}).get('value')
         if not token:
             return self._store(key, {'provider': 'claude', 'ok': False, 'windows': [],
@@ -886,6 +911,38 @@ class UsageReporter:
         return self._store(key, {'provider': 'claude', 'ok': True, 'windows': windows,
                                  'error': '', 'at': self.clock()})
 
+    def codex(self, force=False):
+        """Codex 账号用量：GET /backend-api/wham/usage。
+
+        凭证来自 codex 自己的 ~/.codex/auth.json，与 Claude 同理只读不写。
+        必须同时带 chatgpt-account-id 头，缺了会被 403。
+        """
+        key = 'codex'
+        if not force:
+            hit = self._cached(key)
+            if hit is not None:
+                return hit
+        record = self._credentials('codex') if self.credential else None
+        token = (record or {}).get('value')
+        account = (record or {}).get('account')
+        if not token:
+            return self._store(key, {'provider': 'codex', 'ok': False, 'windows': [],
+                                     'error': '未登录 Codex 账号。', 'at': self.clock()})
+        headers = {'Authorization': 'Bearer ' + token, 'Accept': 'application/json'}
+        if account:
+            headers['chatgpt-account-id'] = account
+        try:
+            payload, _headers = self.fetcher(USAGE_CODEX_URL, headers)
+            windows = usage_parse_codex(payload)
+        except UsageError as exc:
+            return self._store(key, {'provider': 'codex', 'ok': False, 'windows': [],
+                                     'error': str(exc), 'at': self.clock()})
+        except Exception:
+            return self._store(key, {'provider': 'codex', 'ok': False, 'windows': [],
+                                     'error': '读取用量时出错。', 'at': self.clock()})
+        return self._store(key, {'provider': 'codex', 'ok': True, 'windows': windows,
+                                 'error': '', 'at': self.clock()})
+
     def remember_headers(self, provider, headers):
         """把某一轮对话响应头里的窗口读数记进缓存。
 
@@ -905,8 +962,10 @@ class UsageReporter:
             return None
         if provider == 'claude':
             return self.claude(force=force)
-        # Codex 与 CodeBuddy 目前只有「跑一轮任务时顺带拿到」这一条免费通道，
-        # 不做主动查询（会多花一次请求额度），这里只读缓存。
+        if provider == 'codex':
+            return self.codex(force=force)
+        # CodeBuddy 没有公开的用量查询接口，只有对话响应头这一条免费通道，
+        # 所以只读缓存，不主动发请求。
         hit = self._cached(provider)
         if hit is not None:
             return hit

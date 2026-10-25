@@ -59,6 +59,28 @@ class UsageParseTests(unittest.TestCase):
         self.assertEqual(gh.usage_parse_headers({}), [])
         self.assertEqual(gh.usage_parse_headers(None), [])
 
+    def test_codex_real_response_shape(self):
+        # 2026-10-26 在真实 Plus 账号上抓到的响应，原样做夹具。
+        # 字段是单数 rate_limit + *_window，之前按二进制里的 Rust 结构体名
+        # 写成 rate_limits + primary，结果线上一个窗口都读不出来。
+        payload = {'plan_type': 'plus',
+                   'rate_limit': {'allowed': False, 'limit_reached': True,
+                                  'primary_window': {'used_percent': 100,
+                                                     'limit_window_seconds': 18000,
+                                                     'reset_after_seconds': 3043,
+                                                     'reset_at': 1792953411},
+                                  'secondary_window': {'used_percent': 31,
+                                                       'limit_window_seconds': 604800,
+                                                       'reset_after_seconds': 568936,
+                                                       'reset_at': 1793519304}},
+                   'model_usage': {'gpt-6-astra': {'available': False}}}
+        windows = gh.usage_parse_codex(payload)
+        self.assertEqual([item['label'] for item in windows], ['5小时', '7天'])
+        self.assertEqual(windows[0]['used_percent'], 100.0)
+        self.assertEqual(windows[1]['resets_at'], 1793519304)
+        # 用满时剩余必须是 0，不能因为 100 看着像「满格」就显示成 100%。
+        self.assertEqual(gh.usage_remaining(windows[0]), 0.0)
+
     def test_codex_label_follows_window_minutes_not_slot(self):
         # 服务端会把 5 小时窗口放在 primary 或 secondary，按位置写死标签迟早标错。
         payload = {'rate_limits': {'primary': {'used_percent': 5, 'window_minutes': 10080},
@@ -210,7 +232,32 @@ class UsageReporterTests(unittest.TestCase):
         reporter = gh.UsageReporter(credential=lambda provider: None)
         state = reporter.snapshot('codex')
         self.assertFalse(state['ok'])
-        self.assertIn('尚无读数', state['error'])
+        self.assertIn('未登录', state['error'])
+
+    def test_codex_requires_account_id_header(self):
+        # 只带 Bearer 会 403，必须同时带 chatgpt-account-id。
+        seen = {}
+
+        def fetcher(url, headers):
+            seen.update(headers)
+            return {'rate_limit': {'primary_window': {'used_percent': 5,
+                                                      'limit_window_seconds': 18000,
+                                                      'reset_at': 1792953411}}}, {}
+
+        reporter = gh.UsageReporter(
+            credential=lambda provider: {'value': 'tok', 'account': 'acct-1'},
+            fetcher=fetcher)
+        state = reporter.codex()
+        self.assertTrue(state['ok'])
+        self.assertEqual(seen.get('chatgpt-account-id'), 'acct-1')
+        self.assertEqual(seen.get('Authorization'), 'Bearer tok')
+
+    def test_codex_api_key_mode_is_not_account_mode(self):
+        # API Key 登录也写 auth.json，但没有套餐窗口，不能当成账号查。
+        tmp = Path(tempfile.mkdtemp()) / 'auth.json'
+        tmp.write_text(json.dumps({'auth_mode': 'apikey',
+                                   'tokens': {'access_token': 'x', 'account_id': 'y'}}))
+        self.assertIsNone(bot.codex_account_token(tmp))
 
     def test_unsupported_engine_returns_none(self):
         reporter = gh.UsageReporter(credential=lambda provider: None)
