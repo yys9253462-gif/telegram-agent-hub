@@ -646,6 +646,25 @@ def set_account_model(engine, model):
 USAGE = UsageReporter(credential=usage_credential)
 
 
+def execution_footer(engine=None, started=None):
+    """会话底部那一行：执行器 · 模型 · 耗时，后面接用量。
+
+    这些信息以前是靠入队时单独发一条「已加入队列」消息给出的，
+    每轮对话多一条刷屏的噪音，而且用户要往上翻才知道这轮用了什么。
+    现在统一压到最后一条回复的底部，与用量同行，翻到底就一目了然。
+    """
+    engine = engine or current_engine()
+    label = engine_spec(engine)['label']
+    if auth_channel(engine) == 'account':
+        model = account_model(engine) or '官方默认'
+    else:
+        model = current_model()
+    parts = ['执行器：' + label, '模型：' + str(model)]
+    if started is not None:
+        parts.append('耗时：' + str(int(max(0, time.time() - started))) + '秒')
+    return ' · '.join(parts)
+
+
 def usage_footer_for(engine=None, force=False):
     """账号模式下给出「用量：…」这一行；接口密钥模式或读不到时返回空串。
 
@@ -664,6 +683,21 @@ def usage_footer_for(engine=None, force=False):
         return usage_footer(state)
     except Exception:
         return ''
+
+
+def reply_footer(engine=None, started=None, force=False):
+    """回复末尾那一段：执行摘要一行 + 用量一行（有就读）。
+
+    合并成一整块而不是两条消息：用户要的是「这条回复是谁产出、花了多久、
+    还剩多少额度」，分开显示反而要来回对照。
+    用量读不到时只留执行摘要——它是本地就能算出来的确定信息，不该因为
+    用量接口失败而一起消失。
+    """
+    lines = [execution_footer(engine, started)]
+    usage = usage_footer_for(engine, force=force)
+    if usage:
+        lines.append(usage)
+    return '\n'.join(lines)
 
 
 # 两个平台的访问令牌都会过期：Cloudflare 约一天，GitHub App 用户令牌 8 小时。
@@ -2038,10 +2072,12 @@ def parse_codex_event(event, state):
 def run_stream(chat, text):
     task = getattr(TASK_LOCAL, 'task', None)
     label = ('任务 ' + task['id'] + ' · ' + redact(text).replace('\n', ' ')[:80] + '\n') if task else ''
-    initial = label + '已接收，正在生成…'
+    engine = current_engine()
+    # 开头就说清这轮是谁在跑：执行器与模型在任务开始时就已确定，
+    # 不必等结束才告诉用户。耗时在结束时补进同一条消息的末尾。
+    initial = label + execution_footer(engine) + '\n已接收，正在生成…'
     status = api('sendMessage', {'chat_id': chat, 'text': initial})
     message_id = status['message_id']
-    engine = current_engine()
     instructions = agent_instructions()
     history = task['snapshot'].get('handoff', []) if task else []
     if history:
@@ -2168,9 +2204,9 @@ def run_stream(chat, text):
             task['result'] = redact(answer[:24000])
             task['execution_error'] = crashed
         answer = redact(answer[:24000])
-        # 账号渠道才追加用量：接口密钥渠道按量计费，没有「套餐窗口」这个概念，
-        # 硬塞一行剩余百分比只会误导。放在正文之后单独一行，不与回复内容混淆。
-        footer = usage_footer_for(engine)
+        # 末尾统一压一段：执行器、模型、耗时 + 用量（账号渠道才有）。
+        # 这几项以前分散在入队消息与「查看进度」里，用户要翻上翻下才拼得出来。
+        footer = reply_footer(engine, started)
         if footer:
             answer = answer + '\n\n' + footer
         pieces = split_message(answer)
@@ -3352,9 +3388,10 @@ class TaskController:
             send(chat, 'Claude 账号登录成功。\n' + detail + '\n\n要改用它，请到“设置 → 渠道切换 → 使用Claude账号”。'
                       if ok else '授权码未通过校验：' + detail + '\n可以重新发送“登录Claude”获取新链接。')
         else:
-            task = self.enqueue(chat, text, update_id=update_id)
-            if task:
-                send(chat, '已加入队列：' + task['id'] + '\n' + self.task_summary(task))
+            # 入队不再单独发一条「已加入队列 + 摘要」：那条消息与随后
+            # 「已接收，正在生成…」重复，且一整块信息对用户没什么用。
+            # 执行器、模型、耗时改为压到最终回复底部，与用量同行。
+            self.enqueue(chat, text, update_id=update_id)
 
 
 def show_model_items(chat, models, page=0, key=None):

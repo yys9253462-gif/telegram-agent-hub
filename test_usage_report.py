@@ -352,6 +352,84 @@ class BotUsageWiringTests(unittest.TestCase):
             self.assertIn('套餐用量', bot.usage_overview_text())
 
 
+class ReplyFooterTests(unittest.TestCase):
+    """回复底部那一段：执行器 · 模型 · 耗时，账号渠道再接用量。
+
+    2026-10-26 用户要求：执行器/模型/耗时不要再单独发一条消息，
+    统一压到每条对话的底部，与用量同行。
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.saved = (bot.AUTH_STATE, bot.MODEL_STATE, bot.USAGE)
+        bot.AUTH_STATE = self.tmp / 'auth-channel.json'
+        bot.MODEL_STATE = self.tmp / 'selected-model.json'
+        bot.USAGE = gh.UsageReporter(credential=bot.usage_credential)
+
+    def tearDown(self):
+        bot.AUTH_STATE, bot.MODEL_STATE, bot.USAGE = self.saved
+
+    def test_executor_and_model_are_named(self):
+        bot.set_auth_channel('gateway', 'claude')
+        bot.MODEL_STATE.write_text(json.dumps({'model': 'wbdp4.1f'}))
+        line = bot.execution_footer('claude')
+        self.assertEqual(line, '执行器：Claude · 模型：wbdp4.1f')
+
+    def test_executor_label_comes_from_engine_spec(self):
+        # 写死英文名会与菜单里的中文标签对不上，用户会以为是两个东西。
+        bot.set_auth_channel('gateway', 'codebuddy')
+        self.assertIn('执行器：CodeBuddy', bot.execution_footer('codebuddy'))
+
+    def test_duration_only_appears_when_started_is_known(self):
+        bot.set_auth_channel('gateway', 'claude')
+        self.assertNotIn('耗时', bot.execution_footer('claude'))
+        line = bot.execution_footer('claude', started=time.time() - 37)
+        self.assertIn('耗时：37秒', line)
+
+    def test_negative_duration_is_clamped_to_zero(self):
+        # 机器时钟回拨会让耗时变成负数，显示「-3秒」比不显示更糟。
+        bot.set_auth_channel('gateway', 'claude')
+        self.assertIn('耗时：0秒', bot.execution_footer('claude', started=time.time() + 60))
+
+    def test_account_channel_shows_official_default_when_unset(self):
+        # 账号模式没选模型时用的是官方默认，不能显示成网关那个模型名。
+        bot.set_auth_channel('account', 'claude')
+        bot.MODEL_STATE.write_text(json.dumps({'model': 'wbdp4.1f'}))
+        with patch.object(bot, 'account_model', return_value=''):
+            self.assertIn('模型：官方默认', bot.execution_footer('claude'))
+            self.assertNotIn('wbdp4.1f', bot.execution_footer('claude'))
+
+    def test_account_channel_shows_the_chosen_account_model(self):
+        bot.set_auth_channel('account', 'claude')
+        with patch.object(bot, 'account_model', return_value='opus'):
+            self.assertIn('模型：opus', bot.execution_footer('claude'))
+
+    def test_gateway_reply_has_no_usage_line(self):
+        bot.set_auth_channel('gateway', 'claude')
+        text = bot.reply_footer('claude', started=time.time() - 5)
+        self.assertIn('执行器：Claude', text)
+        self.assertNotIn('用量', text)
+
+    def test_account_reply_puts_usage_on_its_own_line(self):
+        bot.set_auth_channel('account', 'claude')
+        with patch.object(bot, 'usage_footer_for', return_value='用量：5小时 剩余 75%'):
+            text = bot.reply_footer('claude', started=time.time() - 12)
+        lines = text.split('\n')
+        self.assertEqual(len(lines), 2)
+        self.assertIn('执行器：Claude', lines[0])
+        self.assertIn('耗时：12秒', lines[0])
+        self.assertEqual(lines[1], '用量：5小时 剩余 75%')
+
+    def test_usage_failure_does_not_swallow_the_executor_line(self):
+        # 用量读不到时执行摘要仍必须在：那是本地就能算出来的确定信息。
+        bot.set_auth_channel('account', 'claude')
+        with patch.object(bot, 'usage_footer_for', return_value=''):
+            text = bot.reply_footer('claude', started=time.time() - 3)
+        self.assertIn('执行器：Claude', text)
+        self.assertIn('耗时：3秒', text)
+        self.assertEqual(text.count('\n'), 0)
+
+
 class UsageReverseVerification(unittest.TestCase):
     """反向验证：把这些保护拆掉，测试必须报红，证明前面的用例不是永远绿的。"""
 
