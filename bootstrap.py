@@ -37,6 +37,9 @@ class SafeRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def github_token():
+    supplied = os.environ.pop('AGENT_GITHUB_TOKEN', '')
+    if supplied:
+        return supplied
     if shutil.which('gh'):
         result = subprocess.run(['gh', 'auth', 'token', '--hostname', 'github.com'], stdout=subprocess.PIPE,
                                 stderr=subprocess.DEVNULL, text=True)
