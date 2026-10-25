@@ -71,7 +71,8 @@ MENU_GROUPS = {
     },
     '更多': {
         '账号与渠道': ['登录Claude', '账号状态', '渠道切换'],
-        '平台授权': ['授权GitHub', '授权Cloudflare', '授权状态', '撤销授权'],
+        '平台授权': ['授权GitHub', '授权Cloudflare', '授权状态', '撤销授权',
+                     '云flare粘贴令牌'],
         '执行与查询': ['执行策略', '长期记忆', '技能查询', '工具审计'],
         '系统与帮助': ['权限状态', '工作目录', '任务说明', '收起菜单'],
     },
@@ -363,11 +364,23 @@ GITHUB_CLIENT_ID = os.environ.get('GITHUB_CLIENT_ID') or 'Iv1.b231c327f1eaa229'
 # 申请的权限：repo 用于仓库读写，read:org 用于确认组织成员身份，gist 用于片段。
 # 刻意不申请 workflow 与 delete_repo —— 默认给最小集合，需要时再用 scope 追加。
 GITHUB_SCOPE = os.environ.get('GITHUB_SCOPE', 'repo read:org gist')
+# Cloudflare 走的是 wrangler（官方 CLI）的公开 client_id，同样只需要 client_id。
+# 用它换来的是 OAuth 访问令牌，可续期、权限由授权页统一授予；
+# 想换成自己注册的 OAuth 客户端，用 CLOUDFLARE_CLIENT_ID 覆盖即可。
+CLOUDFLARE_CLIENT_ID = (os.environ.get('CLOUDFLARE_CLIENT_ID')
+                        or '54d11594-84e4-41aa-b438-e81b8fa78ee7')
+CLOUDFLARE_SCOPE = os.environ.get('CLOUDFLARE_SCOPE', cloudflare_auth.DEFAULT_SCOPE)
 # 设备码与等待线程都只放在进程内存里，绝不落盘：
 # device_code 等同于半个令牌，写进状态文件等于给了任何能读该目录的人一次换取机会。
 DEVICE_FLOW = {'provider': '', 'client_id': '', 'device_code': '', 'user_code': '',
                'verification_uri': '', 'expires_at': 0, 'thread': None, 'chat': None}
 PENDING_TOKEN = {'provider': '', 'chat': None, 'expires_at': 0}
+# Cloudflare 的设备码状态。
+# 不能和 GitHub 共用 DEVICE_FLOW：两个平台可以同时各有一轮进行中，
+# 共用一份状态会让后发起的把先发起的 device_code 覆盖掉，先那轮就永远换不到令牌。
+CLOUDFLARE_FLOW = {'client_id': '', 'device_code': '', 'user_code': '',
+                   'verification_uri': '', 'verification_uri_complete': '',
+                   'expires_at': 0, 'interval': 5, 'thread': None, 'chat': None}
 # 轮询线程与主线程都要读凭据文件，加锁避免读到写一半的内容。
 # atomic_json 已保证单文件原子替换，这里的锁只是为了不去抢同一个句柄。
 CREDENTIAL_LOCK = threading.Lock()
@@ -428,6 +441,11 @@ def auth_status_text():
     active = DEVICE_FLOW.get('provider')
     if active:
         lines.append('GitHub 有进行中的设备码授权，等待你在 github.com/login/device 输入：' + DEVICE_FLOW['user_code'])
+    # 两个平台的设备码可以同时进行，所以是两条独立判断而不是 if/elif。
+    cloud_flow = CLOUDFLARE_FLOW.get('thread')
+    if cloud_flow is not None and cloud_flow.is_alive():
+        lines.append('Cloudflare 有进行中的设备码授权，等待你在 dash.cloudflare.com 确认：'
+                     + CLOUDFLARE_FLOW['user_code'])
     return '\n'.join(lines) + '\n\n凭据只存在本机，不进任务记录、不进日志、不发给模型。'
 
 
@@ -517,6 +535,114 @@ def github_poll_worker(chat, snapshot):
                   + '\n范围：' + (scope or '未返回')
                   + '\n凭据已写入本机，仅在新任务启动时以 GH_TOKEN 注入执行器。'
                   '\n查询状态：「授权状态」；撤销：「撤销GitHub」。')
+
+
+def start_cloudflare_device_flow(chat):
+    """申请 Cloudflare 设备码并在后台开始轮询。返回给机主看的 HTML 文本。
+
+    与 GitHub 版的两处实质差异：
+    1) Cloudflare 会给 verification_uri_complete，链接自带用户码，点进去只剩一个
+       「允许」按钮 —— 所以优先用它，机主少一步手抄。
+    2) 用户码只有 5 分钟有效期（GitHub 是 15 分钟），提示里必须说清楚，
+       否则机主慢一点回来就必然看到「已过期」。
+    """
+    if not CLOUDFLARE_CLIENT_ID:
+        raise MediaError('Cloudflare client_id 被配置成了空值。删掉配置文件里的 '
+                         'CLOUDFLARE_CLIENT_ID 即可用内置默认值，或填入你自己 OAuth 客户端的 '
+                         'client_id 后重启服务。')
+    running = CLOUDFLARE_FLOW.get('thread')
+    if running is not None and running.is_alive():
+        remain = int(CLOUDFLARE_FLOW.get('expires_at', 0) - time.time())
+        if remain > 0:
+            # 还在有效期内就复用，不重新申请：既省配额，也避免机主手上那个码忽然失效。
+            return cloudflare_device_code_message(CLOUDFLARE_FLOW, remain, reused=True)
+        # 已经过期但线程还没退干净（最多差一个轮询间隔），直接重新申请。
+    try:
+        body = cloudflare_auth.start(CLOUDFLARE_CLIENT_ID, CLOUDFLARE_SCOPE)
+    except cloudflare_auth.DeviceFlowError as exc:
+        raise MediaError(str(exc)) from None
+    expires_in = int(body.get('expires_in') or 300)
+    CLOUDFLARE_FLOW.update({'client_id': CLOUDFLARE_CLIENT_ID,
+                            'device_code': body['device_code'],
+                            'user_code': body['user_code'],
+                            'verification_uri': body['verification_uri'],
+                            'verification_uri_complete': (body.get('verification_uri_complete')
+                                                          or body['verification_uri']),
+                            'expires_at': time.time() + expires_in,
+                            'interval': int(body.get('interval') or 5),
+                            'chat': chat})
+    thread = threading.Thread(target=cloudflare_poll_worker, args=(chat, dict(CLOUDFLARE_FLOW)),
+                              daemon=True, name='cloudflare-device-poll')
+    CLOUDFLARE_FLOW['thread'] = thread
+    thread.start()
+    return cloudflare_device_code_message(CLOUDFLARE_FLOW, expires_in)
+
+
+def cloudflare_device_code_message(flow, seconds, reused=False):
+    """把 Cloudflare 设备码渲染成可点的样子。
+
+    主链接用 verification_uri_complete（自带码），另外单独留一行原始 verification_uri
+    与用户码 —— 手机在电报内部浏览器里打开时偶尔会丢掉查询参数，
+    这时机主还能按老办法手输那 8 位。
+    """
+    minutes = max(1, int(seconds) // 60)
+    complete = flow.get('verification_uri_complete') or flow.get('verification_uri') or ''
+    plain_uri = flow.get('verification_uri') or ''
+    user_code = flow.get('user_code') or ''
+    head = ('已有一轮 Cloudflare 授权在等你完成，链接和码都还是原来那组：' if reused
+            else '请在浏览器打开下面这个地址（点一下直接进授权页，码已经替你填好）：')
+    return ('<b>Cloudflare 授权</b>\n\n'
+            + head + '\n'
+            '<a href="' + html.escape(complete) + '">' + html.escape(complete) + '</a>\n\n'
+            '页面里点一下「允许」即可。要是链接里的码没自动填上，手输这个：\n'
+            '<code>' + html.escape(user_code) + '</code>\n\n'
+            '授权完成后我会自动收到通知，不需要你回来做任何事。\n'
+            '这个码只有 ' + str(minutes) + ' 分钟有效（比 GitHub 短得多），'
+            '过期就再发一次「授权Cloudflare」。\n\n'
+            '<i>打开不了的备用地址：' + html.escape(plain_uri) + '</i>')
+
+
+def cloudflare_poll_worker(chat, snapshot):
+    """后台轮询 Cloudflare。成功、失败、超时都会主动通知机主。
+
+    与 GitHub 版的关键差异：Cloudflare 换到的是 OAuth 访问令牌，它不能走
+    /user/tokens/verify（那是给 API 令牌的接口，用它只会得到一个误判的失败）。
+    所以校验走 /user，那才是访问令牌真能碰的地方。
+    """
+    try:
+        body = cloudflare_auth.poll(snapshot['client_id'], snapshot['device_code'],
+                                    interval=snapshot.get('interval') or 5,
+                                    expires_in=max(1, int(snapshot.get('expires_at', 0) - time.time())))
+    except cloudflare_auth.DeviceFlowError as exc:
+        CLOUDFLARE_FLOW.update({'thread': None, 'device_code': '', 'user_code': ''})
+        notify(chat, 'Cloudflare 授权未完成：' + str(exc))
+        return
+    token = body.get('access_token') or ''
+    # scope 可能是空格分隔的串，也可能缺省；原样记录，只用来给机主看。
+    scope = body.get('scope') or CLOUDFLARE_SCOPE
+    try:
+        who = cloudflare_auth.whoami(token)
+    except cloudflare_auth.CloudflareError as exc:
+        notify(chat, '拿到了令牌但校验失败：' + str(exc) + '\n未保存，请重新授权。')
+        return
+    try:
+        credentials().save('cloudflare', token, scope=scope,
+                           refresh=body.get('refresh_token'),
+                           expires_in=body.get('expires_in'))
+    except ValueError as exc:
+        notify(chat, 'Cloudflare 返回的令牌形态无法识别，未保存：' + str(exc))
+        return
+    CLOUDFLARE_FLOW.update({'thread': None, 'device_code': '', 'user_code': ''})
+    expire_note = ''
+    if body.get('expires_in'):
+        expire_note = ('\n注意：这是 OAuth 访问令牌，约 '
+                       + str(max(1, int(body['expires_in']) // 86400)) + ' 天后过期，'
+                       '过期后重新发「授权Cloudflare」即可。')
+    notify(chat, 'Cloudflare 授权成功，账号：' + (who['email'] or who['id'] or '（未返回）')
+                  + '\n范围：' + (scope or '未返回')
+                  + '\n凭据已写入本机，仅在新任务启动时以 CLOUDFLARE_API_TOKEN 注入执行器。'
+                  + expire_note
+                  + '\n查询状态：「授权状态」；撤销：「撤销Cloudflare」。')
 
 
 def submit_cloudflare_token(chat, text):
@@ -2228,12 +2354,18 @@ class TaskController:
         elif text == '授权GitHub':
             send_rich(chat, start_github_device_flow(chat))
         elif text == '授权Cloudflare':
+            # 默认走设备码：一次点击 + 一次输码，比让机主去后台勾二十几个权限项省事得多。
+            send_rich(chat, start_cloudflare_device_flow(chat))
+        elif text == '云flare粘贴令牌':
+            # 备选入口。它不是「默认路径」的下半段，而是一条独立的窄路：
+            # 只要某个站点、不要整账号、或者不想要会过期的 OAuth 令牌时走这里。
             # 用两步确认而不是直接进「等待令牌」态：否则机主点错按钮之后，
             # 下一条正常任务描述就会被当成令牌去校验，白跑一次还报错。
             PENDING_TOKEN.update({'provider': 'cloudflare', 'chat': chat,
                                   'expires_at': time.time() + 300})
-            send(chat, '请到 Cloudflare 控制台「我的个人资料 → API 令牌」创建一个令牌，'
-                       '权限按需勾选（建议只给要用的站点与 Zone 读/编辑），然后把它整段发给我。\n'
+            send(chat, '改用粘贴 API 令牌。请到 Cloudflare 控制台「我的个人资料 → API 令牌」'
+                       '创建一个令牌，权限按需勾选（建议只给要用的站点与 Zone 读/编辑），'
+                       '然后把它整段发给我。\n'
                        '五分钟后自动失效；现在也可以发「取消授权」放弃。\n'
                        '不接受账号密码、Global API Key。')
         elif text in ('取消授权', '取消'):
@@ -2251,6 +2383,10 @@ class TaskController:
                 # 内存里可能还有一轮等待中的设备码，撤销后必须一起清掉，
                 # 否则轮询线程还会把新拿到的令牌写回去。
                 DEVICE_FLOW.update({'provider': '', 'device_code': '', 'user_code': ''})
+            else:
+                # Cloudflare 同理。别漏这一步：撤销之后三十秒轮询才成功，
+                # 凭据就又回来了，机主会以为撤销没生效。
+                CLOUDFLARE_FLOW.update({'thread': None, 'device_code': '', 'user_code': ''})
             send(chat, (PROVIDERS[provider]['label'] + ' 授权已撤销，凭据已从本机删除。'
                         '注意：这只是删掉本地那份，平台侧的授权仍然存在，需要在平台页面另行撤销。'
                         if removed else PROVIDERS[provider]['label'] + ' 本来就没有保存的凭据。'))

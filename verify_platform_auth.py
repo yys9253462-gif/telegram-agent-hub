@@ -12,6 +12,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 TARGET = ROOT / 'credentials.py'
 BOT = ROOT / 'bot.py'
+CF = ROOT / 'cloudflare_auth.py'
 
 # (说明, 文件, 原文, 替换为)
 VARIANTS = [
@@ -27,8 +28,8 @@ VARIANTS = [
      "        if spec['env'] not in overrides:\n            environment.pop(spec['env'], None)",
      "        if False:\n            environment.pop(spec['env'], None)"),
     ('撤销时不清设备码等待态', BOT,
-     "                DEVICE_FLOW.update({'provider': '', 'device_code': '', 'user_code': ''})\n            send(chat, (PROVIDERS[provider]['label'] + ' 授权已撤销",
-     "                pass\n            send(chat, (PROVIDERS[provider]['label'] + ' 授权已撤销"),
+     "                DEVICE_FLOW.update({'provider': '', 'device_code': '', 'user_code': ''})\n            else:",
+     "                pass\n            else:"),
     ('等待令牌时不再校验形态', BOT,
      "    candidate = looks_like('cloudflare', text)\n    if not candidate:",
      "    candidate = True\n    if not candidate:"),
@@ -36,6 +37,43 @@ VARIANTS = [
      "    value = re.sub(r'\\bcfut_[A-Za-z0-9_-]{20,}', '[已隐藏令牌]', value)\n", ''),
     ('设备码重复发起不再复用', BOT,
      "    if running is not None and running.is_alive():", "    if False:"),
+    # ── Cloudflare 设备码相关 ──
+    # 这几处都属于「改坏了不报错、只是功能静默失效」的类型，必须有反向验证兜着。
+    ('dash 请求丢掉 wrangler 的 UA', CF,
+     "        'Accept': ACCEPT, 'Content-Type': 'application/x-www-form-urlencoded',\n        'User-Agent': CLIENT_UA})",
+     "        'Accept': ACCEPT, 'Content-Type': 'application/x-www-form-urlencoded'})"),
+    # ★ 最致命的一处：Cloudflare 用 HTTP 400 返回 authorization_pending。
+    # 把 4xx 一律当异常，轮询每一轮都是「失败」，设备码流程永远走不完。
+    ('400 响应体不再解析（轮询必然失败）', CF,
+     "        if isinstance(body, dict) and body.get('error'):\n            return body\n",
+     ""),
+    ('令牌自省略去 offline_access', CF,
+     "DEFAULT_SCOPE = 'offline_access account:read zone:read workers:read'",
+     "DEFAULT_SCOPE = 'account:read zone:read workers:read'"),
+    ('slow_down 仍按原间隔猛轮', CF,
+     "        if error == 'slow_down':\n            # 规范要求：收到 slow_down 在原间隔上加 5 秒。\n            wait += 5\n            continue",
+     "        if error == 'slow_down':\n            continue"),
+    ('用令牌自检接口校验 OAuth 令牌', CF,
+     "    request = urllib.request.Request(API_BASE + '/user', headers={",
+     "    request = urllib.request.Request(VERIFY_URL, headers={"),
+    ('403 提示不再给出粘贴退路', CF,
+     "'要么该 client_id 不被接受。请稍后重试，或改用「粘贴API令牌」。'",
+     "'要么该 client_id 不被接受。请稍后重试。'"),
+    ('改回按 GitHub 的十五分钟提示', BOT,
+     "            '这个码只有 ' + str(minutes) + ' 分钟有效（比 GitHub 短得多），'",
+     "            '这个码 ' + str(minutes) + ' 分钟内有效，'"),
+    ('设备码消息丢掉自带码的主链接', BOT,
+     "    complete = flow.get('verification_uri_complete') or flow.get('verification_uri') or ''",
+     "    complete = flow.get('verification_uri') or ''"),
+    ('撤销 Cloudflare 时不清设备码', BOT,
+     "                CLOUDFLARE_FLOW.update({'thread': None, 'device_code': '', 'user_code': ''})",
+     "                pass"),
+    ('Cloudflare 设备码复用两个平台共用状态', BOT,
+     "    running = CLOUDFLARE_FLOW.get('thread')\n    if running is not None and running.is_alive():\n        remain",
+     "    running = DEVICE_FLOW.get('thread')\n    if running is not None and running.is_alive():\n        remain"),
+    ('凭据形态不再接受 OAuth 令牌', TARGET,
+     "|[A-Za-z0-9_-]{40}|[A-Za-z0-9._~+/-]{20,})$'",
+     "|[A-Za-z0-9_-]{40})$'"),
 ]
 
 

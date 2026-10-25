@@ -83,7 +83,11 @@ sudo python3 /opt/telegram-agent-hub/install.py --uninstall
 
 之所以能免注册：设备码流程只要 client_id（GitHub 官方文档明确写着不需要 secret），而 client_id 本身就是公开标识，所以代码里预置了一个公共 App 的 client_id 作为默认值。想独享每小时 50 次的设备码配额，或换成自己名下的 App，注册一个 OAuth App 并勾选 **Enable Device Flow**，把 client_id 填到安装配置的 `github_client_id` 覆盖即可。
 
-**Cloudflare 走 API 令牌**。Cloudflare 对第三方应用只开放授权码流程，不支持设备码，而授权码流程要求一个真实的 HTTPS 回调地址——机器人跑在没有公网回调的服务端，所以这里改为粘贴令牌。点「授权Cloudflare」后到控制台创建令牌，按需只勾要用的站点与权限，整段发给机器人即可。不接受账号密码和 Global API Key。
+**Cloudflare 也走设备码流程，同样开箱即用。** 点「授权Cloudflare」后机器人给一条消息，链接里**已经带好了用户码**，你点进去只剩一个「允许」按钮，确认完机器人自己收到令牌并通知你。用的是 wrangler（Cloudflare 官方 CLI）的公开 client_id，不需要你去注册 OAuth 客户端。
+
+有两点和 GitHub 不同，值得知道：用户码只有 **5 分钟**（GitHub 是 15 分钟），过期就再发一次；换回来的是 **OAuth 访问令牌**，约几天后过期，会附带 refresh_token，但当前版本不自动续期，过期后重新授权即可。
+
+如果只想要某个站点的最小权限、或者不想要会过期的令牌，走**备选路径**：菜单里的「云flare粘贴令牌」，到控制台「我的个人资料 → API 令牌」按需勾权限，把整段令牌发给机器人。不接受账号密码和 Global API Key。
 
 凭据去向：
 
@@ -93,7 +97,9 @@ sudo python3 /opt/telegram-agent-hub/install.py --uninstall
 - 「授权状态」只显示指纹与作用范围，任何情况下都不显示令牌原文。
 - 「撤销授权」只删本地那份，**平台侧的授权仍然存在**，需要在 GitHub 的 Authorized OAuth Apps 或 Cloudflare 的令牌列表里另行撤销。
 
-边界说明：设备码有效期 15 分钟，过期需重新发起；同一 OAuth App 每小时最多申请 50 次设备码。注入的是长期令牌，机器人侧无法感知它被平台吊销，只会在下次调用时失败——所以「授权状态」显示的是**有没有保存**，不是**现在一定能用**。
+边界说明：GitHub 的设备码有效期 15 分钟（同一 OAuth App 每小时最多申请 50 次）；Cloudflare 设备码只有 5 分钟。两者都是长期凭据或数天有效的令牌，机器人侧无法感知它在平台被吊销，只会在下次调用时失败——所以「授权状态」显示的是**有没有保存**，不是**现在一定能用**。
+
+Cloudflare 这条路径有一个环境前提：请求发往 `dash.cloudflare.com`，该域名前置了 Cloudflare 自己的机器人防护，**不带 User-Agent 的请求会被 403 拦截**（与出口 IP 无关）。代码里统一带 wrangler 的 UA，若你把它改掉，授权会在申请设备码这一步就失败，且报错看起来像网络问题。
 
 ## 仓库里没有什么
 

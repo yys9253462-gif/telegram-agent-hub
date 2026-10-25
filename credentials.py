@@ -29,15 +29,22 @@ PROVIDERS = {
         'label': 'Cloudflare',
         'env': 'CLOUDFLARE_API_TOKEN',
         'aliases': ('CF_API_TOKEN', 'CLOUDFLARE_API_KEY', 'CLOUDFLARE_EMAIL'),
-        # Cloudflare 新令牌带 cfut_ 前缀，老令牌是 40 位无前缀字母数字。
-        'pattern': r'^(?:cfut_[A-Za-z0-9_-]{20,}|[A-Za-z0-9_-]{40})$',
-        'hint': '形如 cfut_ 开头的 API 令牌，或 40 位无前缀的旧格式令牌',
+        # 三种合法形态，都见过实物：
+        #   cfut_ 前缀 = 控制台创建的 API 令牌（新格式）
+        #   40 位无前缀 = 老格式 API 令牌
+        #   设备码流程换来的 OAuth 访问令牌 = 长度不固定的一串 base64url 风格字符
+        # 不能只认前两种：设备码授权成功后会被自己的校验拦下来，功能等于白做。
+        # 这里保持「无空白 + 长度区间 + 字符集受限」，误判风险仍很低。
+        'pattern': r'^(?:cfut_[A-Za-z0-9_-]{20,}|[A-Za-z0-9_-]{40}|[A-Za-z0-9._~+/-]{20,})$',
+        'hint': '形如 cfut_ 开头的 API 令牌、40 位旧格式令牌，或一次成功的设备码授权',
     },
 }
 
 # 凭据最短长度。低于这个长度的输入基本都是误粘贴，直接拒绝而不是存进去等调用失败。
 MIN_LENGTH = 20
-MAX_LENGTH = 400
+# Cloudflare 的 OAuth 访问令牌实测长 64~300 字符，留足余量到 2000。
+# 上限大了会不会误吞任务描述？不会 —— 还有「无空白 + 字符集受限」两道闸。
+MAX_LENGTH = 2000
 
 
 def fingerprint(value):

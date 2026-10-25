@@ -15,6 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import credentials
+import cloudflare_auth
 import github_auth
 from credentials import CredentialStore, fingerprint, looks_like
 import bot
@@ -49,10 +50,18 @@ class CredentialShapeTest(unittest.TestCase):
         self.assertTrue(looks_like('cloudflare', FAKE_CF))
         self.assertTrue(looks_like('cloudflare', FAKE_CF_OLD))
 
-    def test_cloudflare_rejects_wrong_length(self):
-        # 40 位是旧格式的固定长度，39/41 位说明复制不完整或多了字符。
-        self.assertFalse(looks_like('cloudflare', 'a' * 39))
-        self.assertFalse(looks_like('cloudflare', 'a' * 41))
+    def test_cloudflare_rejects_short_input(self):
+        """太短的一律不是令牌。注意 39/40 位不带前缀的串仍会被接受 ——
+        因为设备码换来的 OAuth 令牌长度不固定，不能再用「必须正好 40 位」当判据；
+        真令牌会因为长度区间（20~2000）之外而被拦。"""
+        self.assertTrue(looks_like('cloudflare', 'a' * 40))
+        self.assertFalse(looks_like('cloudflare', 'a' * 12))
+        self.assertFalse(looks_like('cloudflare', 'cfut_' + 'a' * 5))
+
+    def test_cloudflare_overlong_rejected(self):
+        """上限要拦住整段粘贴（比如复制了半页页面），但必须放过真实令牌。"""
+        self.assertTrue(looks_like('cloudflare', 'a' * 300))
+        self.assertFalse(looks_like('cloudflare', 'a' * 2001))
 
     def test_whitespace_rejected(self):
         """手机复制常带尾随换行，但中间有空格一定是复制错了。"""
@@ -525,6 +534,7 @@ class RevokeTest(TempStoreMixin):
         bot.send = self.original_send
         bot.send_options = self.original_options
         bot.DEVICE_FLOW.update({'provider': '', 'device_code': '', 'user_code': '', 'thread': None})
+        bot.CLOUDFLARE_FLOW.update({'thread': None, 'device_code': '', 'user_code': ''})
         super().tearDown()
 
     def handle(self, text):
@@ -548,6 +558,17 @@ class RevokeTest(TempStoreMixin):
         self.store.save('cloudflare', FAKE_CF)
         self.handle('撤销Cloudflare')
         self.assertIsNotNone(bot.credentials().get('github'))
+        self.assertIsNone(bot.credentials().get('cloudflare'))
+
+    def test_revoke_cloudflare_clears_cloudflare_flow(self):
+        """缺陷：撤销 Cloudflare 后不清它自己的设备码状态，轮询线程随后
+        把新拿到的令牌写回文件，撤销等于没做 —— 而机主以为权限已经收回。"""
+        self.store.save('cloudflare', FAKE_CF)
+        bot.CLOUDFLARE_FLOW.update({'thread': None, 'device_code': 'cf-dc-secret',
+                                    'user_code': 'iw3QpfiT'})
+        self.handle('撤销Cloudflare')
+        self.assertEqual(bot.CLOUDFLARE_FLOW['device_code'], '')
+        self.assertEqual(bot.CLOUDFLARE_FLOW['user_code'], '')
         self.assertIsNone(bot.credentials().get('cloudflare'))
 
     def test_revoke_menu_offers_both(self):
@@ -588,10 +609,248 @@ class MenuEntryTest(unittest.TestCase):
         for label in ('授权GitHub', '授权Cloudflare', '授权状态', '撤销授权'):
             self.assertIn(label, bot.MENU_GROUPS['更多']['平台授权'])
 
+    def test_cloudflare_paste_entry_present(self):
+        """粘贴令牌这条路必须仍然可达，否则只想要单站点最小权限的机主无路可走。"""
+        self.assertIn('云flare粘贴令牌', bot.MENU_GROUPS['更多']['平台授权'])
+
     def test_aliases_point_to_real_buttons(self):
         labels = set(bot.MENU_GROUPS['更多']['平台授权'])
         for alias in ('/gh', '/cf', '/auth'):
             self.assertIn(bot.ALIASES[alias], labels)
+
+
+class CloudflareDeviceFlowTest(unittest.TestCase):
+    """Cloudflare 改走设备码。每个用例都对应一处会让功能整体失效的坑。"""
+
+    def test_client_id_has_usable_default(self):
+        """缺陷：把 client_id 做成必填项，等于把注册 OAuth 客户端的负担丢给机主。"""
+        source = Path(bot.__file__).read_text(encoding='utf-8')
+        self.assertIn("os.environ.get('CLOUDFLARE_CLIENT_ID')", source)
+        self.assertTrue(bot.CLOUDFLARE_CLIENT_ID)
+
+    def test_dash_requests_carry_wrangler_ua(self):
+        """缺陷（实测踩过）：不带 User-Agent 请求 dash.cloudflare.com 必定吃 403
+        「Attention Required!」拦截页，与 IP 无关。少了这个头，服务器上必然失败。"""
+        source = Path(github_auth.__file__).with_name('cloudflare_auth.py').read_text(encoding='utf-8')
+        self.assertIn("'User-Agent': CLIENT_UA", source)
+        self.assertTrue(cloudflare_auth.CLIENT_UA.startswith('wrangler/'))
+
+    def test_scope_asks_for_refresh_token(self):
+        """没有 offline_access 就没有 refresh_token，令牌几天后到期只能重新授权。"""
+        self.assertIn('offline_access', cloudflare_auth.DEFAULT_SCOPE)
+
+    def test_token_endpoint_payload_matches_spec(self):
+        """缺陷：grant_type 写错会被 Cloudflare 判 unsupported_grant_type，轮询永远失败。"""
+        self.assertEqual(cloudflare_auth.GRANT_TYPE,
+                         'urn:ietf:params:oauth:grant-type:device_code')
+        self.assertEqual(cloudflare_auth.TOKEN_URL,
+                         'https://dash.cloudflare.com/oauth2/token')
+
+    def test_poll_honours_slow_down(self):
+        """缺陷：收到 slow_down 仍按原间隔猛轮，会被一直惩罚到过期。"""
+        waits = []
+
+        def fake_sleep(seconds):
+            waits.append(seconds)
+
+        responses = [{'error': 'authorization_pending'},
+                     {'error': 'slow_down'},
+                     {'access_token': 'cf-oauth-token'}]
+        original = cloudflare_auth._dash
+        cloudflare_auth._dash = lambda url, payload, timeout=20: responses.pop(0)
+        try:
+            body = cloudflare_auth.poll('cid', 'dc', interval=5, expires_in=60, sleep=fake_sleep)
+        finally:
+            cloudflare_auth._dash = original
+        self.assertEqual(body['access_token'], 'cf-oauth-token')
+        self.assertEqual(waits, [5, 5, 10], '第一次 slow_down 后间隔必须加 5 秒')
+
+    def test_poll_raises_on_access_denied(self):
+        original = cloudflare_auth._dash
+        cloudflare_auth._dash = lambda url, payload, timeout=20: {'error': 'access_denied'}
+        try:
+            with self.assertRaises(cloudflare_auth.DeviceFlowError) as caught:
+                cloudflare_auth.poll('cid', 'dc', interval=1, expires_in=60, sleep=lambda s: None)
+        finally:
+            cloudflare_auth._dash = original
+        self.assertIn('拒绝了授权', str(caught.exception))
+
+    def test_pending_returned_as_http_400_is_still_pending(self):
+        """★ 实测踩过的坑，最致命的一个：
+        Cloudflare 把 authorization_pending 用 HTTP 400 返回（GitHub 是 200）。
+        若 _dash 把 4xx 一律当异常抛，轮询每一轮都会变成「授权失败」，
+        设备码流程永远走不完 —— 而机主在页面上明明已经点了允许。
+        所以这里必须真的造一个 400 响应，确认轮询能继续而不是抛错。"""
+        original = cloudflare_auth.urllib.request.urlopen
+        calls = []
+
+        def boom(request, timeout=None):
+            calls.append(1)
+            body = (b'{"error":"authorization_pending","error_description":'
+                    b'"The authorization request is still pending."}')
+            raise cloudflare_auth.urllib.error.HTTPError(
+                request.full_url, 400, 'Bad Request', {}, __import__('io').BytesIO(body))
+
+        cloudflare_auth.urllib.request.urlopen = boom
+        try:
+            with self.assertRaises(cloudflare_auth.DeviceFlowError) as caught:
+                # expires_in=2 让轮询在两秒内自然到期，于是以「过期」收尾，
+                # 而不是以「HTTP 400 请稍后重试」收尾。
+                cloudflare_auth.poll('cid', 'dc', interval=1, expires_in=2,
+                                     sleep=lambda s: None)
+        finally:
+            cloudflare_auth.urllib.request.urlopen = original
+        self.assertTrue(calls, '轮询必须真的发出了请求')
+        message = str(caught.exception)
+        self.assertNotIn('HTTP 400', message,
+                         '400 + authorization_pending 不能被当成错误抛出去')
+        self.assertIn('过期', message)
+
+    def test_real_error_body_on_400_is_surfaced(self):
+        """反过来也要成立：400 里带的是真错误（比如 access_denied）时不能吞掉。"""
+        original = cloudflare_auth.urllib.request.urlopen
+
+        def boom(request, timeout=None):
+            body = b'{"error":"access_denied","error_description":"User denied."}'
+            raise cloudflare_auth.urllib.error.HTTPError(
+                request.full_url, 400, 'Bad Request', {}, __import__('io').BytesIO(body))
+
+        cloudflare_auth.urllib.request.urlopen = boom
+        try:
+            with self.assertRaises(cloudflare_auth.DeviceFlowError) as caught:
+                cloudflare_auth.poll('cid', 'dc', interval=1, expires_in=60,
+                                     sleep=lambda s: None)
+        finally:
+            cloudflare_auth.urllib.request.urlopen = original
+        self.assertIn('拒绝了授权', str(caught.exception))
+
+    def test_403_message_offers_the_paste_fallback(self):
+        """403 有两种成因（机器人拦截 / client_id 不被接受），提示必须同时给出退路，
+        否则机主只会对着同一句报错反复重试。"""
+        original = cloudflare_auth.urllib.request.urlopen
+
+        def boom(request, timeout=None):
+            raise cloudflare_auth.urllib.error.HTTPError(
+                request.full_url, 403, 'Forbidden', {}, None)
+
+        cloudflare_auth.urllib.request.urlopen = boom
+        try:
+            with self.assertRaises(cloudflare_auth.DeviceFlowError) as caught:
+                cloudflare_auth.start('cid')
+        finally:
+            cloudflare_auth.urllib.request.urlopen = original
+        self.assertIn('粘贴API令牌', str(caught.exception))
+
+    def test_whoami_uses_user_endpoint_not_token_verify(self):
+        """缺陷：OAuth 访问令牌走 /user/tokens/verify 会被判无效，
+        于是「授权成功」变成「校验失败」，功能名义上做了实际用不了。"""
+        original = cloudflare_auth.urllib.request.urlopen
+        seen = []
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return b'{"result": {"email": "a@b.c", "id": "123"}}'
+
+        def spy(request, timeout=None):
+            seen.append(request.full_url)
+            return Response()
+
+        cloudflare_auth.urllib.request.urlopen = spy
+        try:
+            who = cloudflare_auth.whoami('token')
+        finally:
+            cloudflare_auth.urllib.request.urlopen = original
+        self.assertEqual(who['email'], 'a@b.c')
+        self.assertTrue(seen[0].endswith('/client/v4/user'), seen)
+
+    def test_message_prefers_complete_uri(self):
+        """有 verification_uri_complete 就必须用它：自带码，机主少一步手抄。"""
+        text = bot.cloudflare_device_code_message(self.flow(), 299)
+        self.assertIn('<a href="https://dash.cloudflare.com/oauth2/device/verify?user_code=iw3QpfiT">', text)
+        self.assertIn('<code>iw3QpfiT</code>', text)
+
+    def test_message_says_five_minutes_not_fifteen(self):
+        """Cloudflare 只有 5 分钟（GitHub 15 分钟）。照抄 GitHub 的文案会让机主
+        以为还有十分钟可用，实际早过期了。所以这里断言的是 Cloudflare 版独有的
+        措辞（「分钟有效（比 GitHub 短得多）」），而不是数字 ——
+        只断言数字的话，把文案改回 GitHub 那版照样能通过。"""
+        text = bot.cloudflare_device_code_message(self.flow(), 299)
+        self.assertIn('比 GitHub 短得多', text)
+        self.assertIn('4 分钟', text)
+
+    def test_message_keeps_plain_uri_as_fallback(self):
+        """电报内置浏览器偶尔会丢掉查询参数，那时还得能手输码。"""
+        text = bot.cloudflare_device_code_message(self.flow(), 299)
+        self.assertIn('https://dash.cloudflare.com/oauth2/device/verify<', text)
+
+    def test_message_falls_back_when_complete_uri_missing(self):
+        flow = self.flow()
+        flow['verification_uri_complete'] = ''
+        text = bot.cloudflare_device_code_message(flow, 299)
+        self.assertIn('<a href="https://dash.cloudflare.com/oauth2/device/verify">', text)
+
+    @staticmethod
+    def flow():
+        return {'verification_uri': 'https://dash.cloudflare.com/oauth2/device/verify',
+                'verification_uri_complete':
+                    'https://dash.cloudflare.com/oauth2/device/verify?user_code=iw3QpfiT',
+                'user_code': 'iw3QpfiT'}
+
+
+class CloudflareFlowIsolationTest(unittest.TestCase):
+    """缺陷：两个平台共用一份设备码状态，后发起的把先发起的覆盖掉，
+    先那轮就永远换不到令牌（而机主看起来两轮都在「等待中」）。"""
+
+    def test_two_flows_are_separate_dicts(self):
+        self.assertIsNot(bot.DEVICE_FLOW, bot.CLOUDFLARE_FLOW)
+        bot.CLOUDFLARE_FLOW['user_code'] = 'iw3QpfiT'
+        self.assertNotEqual(bot.DEVICE_FLOW.get('user_code'), 'iw3QpfiT')
+        bot.CLOUDFLARE_FLOW['user_code'] = ''
+
+    def test_reusing_live_flow_does_not_request_new_code(self):
+        """有效期内重复点按钮必须复用，不能重新申请：既浪费配额，也让手上那个码失效。"""
+        class Alive:
+            def is_alive(self):
+                return True
+
+        bot.CLOUDFLARE_FLOW.update({'thread': Alive(), 'user_code': 'iw3QpfiT',
+                                    'verification_uri': 'https://dash.cloudflare.com/oauth2/device/verify',
+                                    'verification_uri_complete': 'https://dash.cloudflare.com/oauth2/device/verify?user_code=iw3QpfiT',
+                                    'expires_at': time.time() + 200})
+        original = cloudflare_auth.start
+        calls = []
+        cloudflare_auth.start = lambda *a, **k: calls.append(1) or {}
+        try:
+            text = bot.start_cloudflare_device_flow(1)
+        finally:
+            cloudflare_auth.start = original
+            bot.CLOUDFLARE_FLOW.update({'thread': None, 'user_code': ''})
+        self.assertEqual(calls, [], '有效期内不应再次申请设备码')
+        self.assertIn('iw3QpfiT', text)
+
+
+class OAuthTokenShapedCredentialTest(unittest.TestCase):
+    """缺陷：凭据形态只认 cfut_ 与 40 位旧格式，设备码换来的 OAuth 令牌
+    在保存时被自己的校验拦下，整条流程白跑。"""
+
+    def test_oauth_access_token_accepted(self):
+        token = 'A' * 64
+        self.assertTrue(looks_like('cloudflare', token))
+
+    def test_long_base64url_token_accepted(self):
+        token = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r'
+        self.assertTrue(looks_like('cloudflare', token))
+
+    def test_task_sentence_still_rejected(self):
+        """放开形态不能把正常任务描述也放进来 —— 那会在等待态里被误吞成令牌。"""
+        for value in ('这是一句普通的任务描述', '幫我把这个仓库的 CI 修一下', 'please deploy it now'):
+            self.assertFalse(looks_like('cloudflare', value), value)
 
 
 class SensitiveFileTest(unittest.TestCase):
