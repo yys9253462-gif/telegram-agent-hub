@@ -3391,8 +3391,12 @@ class TaskController:
                 label = engine_spec(name)['label']
                 identity = subscription_identity(name)
                 if identity:
-                    lines.append(label + '：已登录 · ' + github_auth.account_identity_label(identity))
-                    options.append(('退出' + label + '账号', '退出账号 ' + name))
+                    who = github_auth.account_identity_label(identity)
+                    lines.append(label + '：已登录 · ' + who)
+                    # 按钮上也带上身份。按钮与文字分开显示，只写「退出X账号」
+                    # 的话，机主点的那一刻还得往上翻才想得起退的是谁。
+                    button = '退出' + label + '账号' + ('（' + who.split(' · ')[0] + '）' if who != '已登录' else '')
+                    options.append((button, '退出账号 ' + name))
                 else:
                     lines.append(label + '：未登录或无法确认')
             if not options:
