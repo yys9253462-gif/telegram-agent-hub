@@ -19,10 +19,14 @@ REPO="yys9253462-gif/telegram-agent-hub"
 REF="${AGENT_REF:-}"
 SHA256="${AGENT_ARCHIVE_SHA256:-}"
 VERSION_URLS=(
+    # 官方接口直读，不经过 CDN 缓存，是唯一能保证拿到最新发布值的来源。
+    "https://api.github.com/repos/$REPO/contents/version.txt?ref=main"
     "https://raw.githubusercontent.com/$REPO/main/version.txt"
     "https://ghproxy.net/https://raw.githubusercontent.com/$REPO/main/version.txt"
     "https://cdn.jsdelivr.net/gh/$REPO@main/version.txt"
 )
+# 官方接口默认返回 JSON，加此头才回原始文本。
+CONTENTS_ACCEPT="Accept: application/vnd.github.raw"
 
 say() { printf '%s\n' "$*"; }
 fail() { printf '安装中止：%s\n' "$*" >&2; exit 1; }
@@ -54,11 +58,14 @@ esac
 if [ -z "$REF" ]; then
     say "正在获取固定版本号…"
     for url in "${VERSION_URLS[@]}"; do
-        version="$(curl --proto '=https' --proto-redir '=https' -fsSL --max-time 30 "$url" 2>/dev/null || true)"
+        case "$url" in
+            https://api.github.com/*)
+                version="$(curl --proto '=https' --proto-redir '=https' -fsSL --max-time 30 -H "$CONTENTS_ACCEPT" "$url" 2>/dev/null || true)" ;;
+            *)
+                version="$(curl --proto '=https' --proto-redir '=https' -fsSL --max-time 30 "$url" 2>/dev/null || true)" ;;
+        esac
         ref_line="$(printf '%s' "$version" | tr -d '\r' | grep -E '^[0-9a-f]{40}$' | head -1 || true)"
         sha_line="$(printf '%s' "$version" | tr -d '\r' | grep -E '^sha256:[0-9a-f]{64}$' | head -1 | cut -d: -f2 || true)"
-        # raw 最先取（无缓存滞后）；jsdelivr 作最后兜底，但它对 main 分支有数小时缓存，
-        # 可能返回旧版本号，所以只在其他源都不通时才用。
         if [ -n "$ref_line" ]; then
             REF="$ref_line"
             [ -n "$sha_line" ] && SHA256="$sha_line"
@@ -66,6 +73,8 @@ if [ -z "$REF" ]; then
         fi
     done
     [ -n "$REF" ] || fail "无法获取固定版本号。请检查网络，或手动指定 AGENT_REF=<40位提交号> 后重试。"
+    # 校验值必须与提交号同源同代，否则会把新提交配上旧哈希，校验必然失败。
+    [ -n "$SHA256" ] || fail "版本号与校验值不完整，已停止。请稍后重试，或手动指定 AGENT_ARCHIVE_SHA256=<64位哈希>。"
 fi
 
 WORK="$(mktemp -d)"
