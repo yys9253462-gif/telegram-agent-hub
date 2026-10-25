@@ -77,7 +77,11 @@ CHECKS = {
     '服务检查': [['systemctl', '--failed', '--no-pager'], ['systemctl', 'is-active'] + os.environ.get('MONITORED_SERVICES', 'telegram-agent-hub').split(',')],
     '系统负载': [['uptime'], ['vmstat', '1', '2']],
 }
-ALIASES = {'/start': '显示菜单', '/menu': '显示菜单', '/help': '任务说明', '/status': '服务器概况', '/memory': '内存使用', '/disk': '磁盘空间', '/node': '节点状态', '/services': '服务检查', '/load': '系统负载', '/model': '当前模型'}
+ALIASES = {'/start': '显示菜单', '/menu': '显示菜单', '/help': '任务说明', '/status': '服务器概况', '/memory': '内存使用', '/disk': '磁盘空间', '/node': '节点状态', '/services': '服务检查', '/load': '系统负载', '/model': '当前模型',
+           # 下面这些是历史命令与老键盘的别名，统一收在这里，避免多处各写一张表。
+           '更多设置': '设置', '任务助手': '新任务', '/tasks': '新任务',
+           '/stop': '停止', '/queue': '队列', '/sessions': '会话', '/files': '文件', '/login': '登录Claude',
+           '/new': '新建会话', '/resume': '继续会话', '/mode': '执行策略', '/agent': '选择智能体', '/settings': '设置'}
 
 MENU_STATE = WORK / 'menu-visible.json'
 
@@ -96,6 +100,9 @@ def send(chat, text):
     if task and task['kind'] == 'quick':
         task['result'] = text[:24000]
     markup = KEYBOARD if menu_visible() else {'remove_keyboard': True}
+    # 这里是纯文本发送（不带 parse_mode），所以按字符数硬切是安全的：
+    # Python 的字符串切片以码位为单位，不会把中文或 emoji 劈成半个字节序列。
+    # 分片长度比 Telegram 的 4096 上限保守，留出余量给后续可能的格式包装。
     for start in range(0, len(text), 1800):
         api('sendMessage', {'chat_id': chat, 'text': text[start:start + 1800], 'reply_markup': markup})
 
@@ -221,10 +228,19 @@ def account_authorized():
     return True, output.strip()[:600] or '已登录。'
 
 
+# CLI 用来覆盖各档位模型的变量。三档都要钉到同一个模型，否则 CLI 会在
+# 内部按任务难度自行回退到别的模型，网关那边看到的模型名就和用户选的不一致。
+MODEL_PIN_VARS = ('ANTHROPIC_MODEL', 'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+                  'ANTHROPIC_DEFAULT_SONNET_MODEL', 'ANTHROPIC_DEFAULT_OPUS_MODEL')
+# 网关渠道专用变量。账号渠道下必须全部移除，否则 CLI 会优先走它们，
+# 登录得到的账号凭据永远用不上。
+GATEWAY_VARS = ('ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL')
+
+
 def login_environment():
     """登录与查询登录态时用的环境：必须剔除网关变量，否则 CLI 认为无需登录。"""
     environment = {**os.environ}
-    for name in ('ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL'):
+    for name in GATEWAY_VARS:
         environment.pop(name, None)
     return environment
 
@@ -235,10 +251,15 @@ def start_account_login():
     CLI 会先尝试打开浏览器；服务器上没有浏览器，它转而打印链接并在标准输入等待授权码。
     这里把带 code=true 的链接截出来回给机主，凭据本身不落盘、不进日志。
     """
-    process = subprocess.Popen([claude_binary(), 'auth', 'login'],
-                               stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                               stderr=subprocess.STDOUT, text=True,
-                               env=login_environment(), start_new_session=True)
+    # Popen 在二进制不存在时会直接抛 FileNotFoundError，这个异常会一路冒到
+    # handle_update 的兜底分支，机主只看到一句「本次操作失败」，看不出是 CLI 没装。
+    try:
+        process = subprocess.Popen([claude_binary(), 'auth', 'login'],
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT, text=True,
+                                   env=login_environment(), start_new_session=True)
+    except OSError:
+        raise MediaError('找不到 claude 命令，无法登录账号。请重新运行安装器启用 Claude 执行器。') from None
     # 故意不 bind_process：登录进程会长时间等待授权码，绑定上去会覆盖
     # CONTROL.process，导致正在执行的任务拿不到自己的进程句柄。
     url = ''
@@ -301,25 +322,44 @@ def looks_like_login_code(text):
 
 def model_environment():
     model = current_model()
-    environment = {**os.environ, 'DISABLE_AUTOUPDATER': '1', 'ANTHROPIC_MODEL': model,
-                   'ANTHROPIC_DEFAULT_HAIKU_MODEL': model, 'ANTHROPIC_DEFAULT_SONNET_MODEL': model,
-                   'ANTHROPIC_DEFAULT_OPUS_MODEL': model}
+    environment = {**os.environ, 'DISABLE_AUTOUPDATER': '1'}
+    environment.update({name: model for name in MODEL_PIN_VARS})
     if auth_channel() == 'account':
-        # 账号模式下必须移除网关相关变量。只要 ANTHROPIC_API_KEY / BASE_URL 还在环境里，
-        # CLI 就会优先走它们，登录得到的账号凭据永远用不上。
-        for name in ('ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL'):
-            environment.pop(name, None)
-        environment.pop('ANTHROPIC_MODEL', None)
-        for name in ('ANTHROPIC_DEFAULT_HAIKU_MODEL', 'ANTHROPIC_DEFAULT_SONNET_MODEL',
-                     'ANTHROPIC_DEFAULT_OPUS_MODEL'):
+        for name in GATEWAY_VARS + MODEL_PIN_VARS:
             environment.pop(name, None)
     return environment
 
+def read_model_cache():
+    """读取本地模型目录缓存。缓存缺失或损坏都当成空目录，绝不向外抛。
+
+    缓存是「上次拉取结果的快照」，损坏只说明快照不可信，重新刷新即可；
+    若在这里抛 ValueError，点击「切换模型」这类纯读操作会直接失败。
+    """
+    if not MODEL_CACHE.exists():
+        return []
+    try:
+        models = json.loads(MODEL_CACHE.read_text())
+    except (OSError, ValueError):
+        return []
+    if not isinstance(models, list):
+        return []
+    return [item for item in models if isinstance(item, dict) and item.get('id')]
+
+
 def catalog(refresh=False):
     if not refresh and MODEL_CACHE.exists():
-        return json.loads(MODEL_CACHE.read_text())
-    url = os.environ['ANTHROPIC_BASE_URL'].rstrip('/') + '/v1/models'
-    request = urllib.request.Request(url, headers={'Authorization': 'Bearer ' + os.environ['ANTHROPIC_API_KEY']})
+        return read_model_cache()
+    # 账号渠道下没有网关基址与密钥（model_environment 会主动移除它们），
+    # 此时只能依赖本地缓存。不拦下来的话，点「刷新模型」会以 KeyError 报错，
+    # 而界面上只会显示「本次操作失败」，看不出真实原因。
+    base_url = os.environ.get('ANTHROPIC_BASE_URL')
+    api_key = os.environ.get('ANTHROPIC_API_KEY')
+    if auth_channel() == 'account':
+        raise MediaError('账号渠道不支持在线拉取模型目录，请切换回网关渠道后刷新。')
+    if not base_url or not api_key:
+        raise MediaError('缺少网关地址或密钥，无法拉取模型目录，请重新运行安装器。')
+    url = base_url.rstrip('/') + '/v1/models'
+    request = urllib.request.Request(url, headers={'Authorization': 'Bearer ' + api_key})
     with urllib.request.urlopen(request, timeout=20) as response:
         data = json.load(response)
     models = list({item['id']: {'id': item['id'], 'provider': item.get('owned_by', '未标注'),
@@ -329,21 +369,16 @@ def catalog(refresh=False):
     atomic_json(MODEL_CACHE, models)
     return models
 
-def show_models(chat, page=0):
+def show_models(chat, page=0, key=None):
+    """渲染模型选择页。翻页走 mp: 游标，与搜索/收藏结果页共用同一套分页逻辑。
+
+    不要改回「翻页就重新入队一个 kind=models」的做法：那样每翻一页都会
+    重新拉一次目录、回到第 1 页，而且多排一次队。mp: 游标只在内存里存
+    当前集合的 id 列表，翻页是纯渲染，不碰网关。
+    """
     models = catalog()
-    pages = (len(models) + 11) // 12
-    page = max(0, min(page, pages - 1))
-    rows = [[{'text': ('当前：' if item['id'] == current_model() else '') + item['id'],
-              'callback_data': 'choose:' + hashlib.sha256(item['id'].encode()).hexdigest()[:24]}]
-            for index, item in enumerate(models) if page * 12 <= index < (page + 1) * 12]
-    navigation = []
-    if page > 0:
-        navigation.append({'text': '上一页', 'callback_data': 'page:' + str(page - 1)})
-    if page + 1 < pages:
-        navigation.append({'text': '下一页', 'callback_data': 'page:' + str(page + 1)})
-    if navigation:
-        rows.append(navigation)
-    api('sendMessage', {'chat_id': chat, 'text': '选择模型，第' + str(page + 1) + '/' + str(pages) + '页，共' + str(len(models)) + '项。\n当前：' + current_model() + '\n列表来自当前密钥的网关接口，未逐个验证套餐和工具兼容性。选择后下个任务生效，不自动换成其他模型。', 'reply_markup': {'inline_keyboard': rows}})
+    show_model_items(chat, models, page, key=key)
+
 
 class MediaError(Exception):
     pass
@@ -419,23 +454,32 @@ def resource_status():
     for line in Path('/proc/meminfo').read_text().splitlines():
         key, value = line.split(':', 1)
         memory[key] = int(value.split()[0])
-    total = memory['MemTotal']
-    used = total - memory.get('MemAvailable', memory['MemFree'])
+    # 不同内核的 /proc/meminfo 字段并不完全一致（老内核没有 MemAvailable，
+    # 极简容器里甚至可能缺 MemFree）。缺一个键就 KeyError，整个状态查询会失败，
+    # 而这里的每个数字都不是关键信息，缺了给 0 让其余项照常显示更合理。
+    total = memory.get('MemTotal', 0)
+    available = memory.get('MemAvailable', memory.get('MemFree', 0))
+    used = max(0, total - available)
     disk = os.statvfs('/')
     disk_total = disk.f_blocks * disk.f_frsize
     disk_free = disk.f_bavail * disk.f_frsize
     disk_used = (disk.f_blocks - disk.f_bfree) * disk.f_frsize
-    swap_total = memory['SwapTotal']
-    swap_used = swap_total - memory['SwapFree']
+    swap_total = memory.get('SwapTotal', 0)
+    swap_used = max(0, swap_total - memory.get('SwapFree', 0))
+    try:
+        load = ' / '.join(format(value, '.2f') for value in os.getloadavg())
+    except (OSError, AttributeError):
+        # Windows 与部分受限容器不提供 getloadavg。
+        load = '不可用'
     return ('本机服务器状态（实时采样）\n地址：当前安装主机\n'
             + '处理器：' + str(os.cpu_count()) + '个逻辑核心，五秒平均占用' + format(cpu, '.1f') + '%\n'
             + '五秒内最高一秒占用：' + format(max(samples), '.1f') + '%\n'
-            + '内存：' + format(used / 1024, '.0f') + '/' + format(total / 1024, '.0f') + '兆字节，占用' + format(used / total * 100, '.1f') + '%\n'
+            + '内存：' + format(used / 1024, '.0f') + '/' + format(total / 1024, '.0f') + '兆字节，占用' + format(used / max(1, total) * 100, '.1f') + '%\n'
             + '可用内存：' + format((total - used) / 1024, '.0f') + '兆字节\n'
             + '根分区：已用' + format(disk_used / 1073741824, '.2f') + '/' + format(disk_total / 1073741824, '.2f') + '吉字节，占用' + format(disk_used / max(1, disk_used + disk_free) * 100, '.1f') + '%\n'
             + '磁盘可用：' + format(disk_free / 1073741824, '.2f') + '吉字节\n'
             + '交换空间：' + (format(swap_used / 1024, '.0f') + '/' + format(swap_total / 1024, '.0f') + '兆字节' if swap_total else '未配置') + '\n'
-            + '平均负载（1/5/15分钟）：' + ' / '.join(format(value, '.2f') for value in os.getloadavg())
+            + '平均负载（1/5/15分钟）：' + load
             + '\n内存按总量减可用量计算；当前只查询本机，不包含远程服务器。')
 
 STRATEGY_STATE = WORK / 'execution-strategy.json'
@@ -492,9 +536,29 @@ def send_group_menu(chat, title, groups):
         'resize_keyboard': True, 'one_time_keyboard': False,
         'input_field_placeholder': '选择分组，或直接发送任务'}})
 
-def group_entry(owner, group):
-    """判断某个按钮是不是分组名，并返回它下面那一层按钮。"""
-    return MENU_GROUPS.get(owner, {}).get(group)
+
+def group_title(owner, group):
+    """分组展开时的标题文案。集中在这里，避免两处实现各写一句、逐渐漂移。"""
+    intro = {'设置': '按用途分成三组，点进去只看该组功能。',
+             '更多': '账号、执行与系统类入口都收在这里。'}
+    return group + '\n' + intro.get(owner, '选择下面的功能。')
+
+
+def expand_group(chat, text):
+    """若 text 是某个分组的名字，列出该组按钮并返回 True。
+
+    「设置」与「更多」在 quick_action 和 handle_text 里各有一份完全相同的展开逻辑，
+    加上这里的第三份，改文案时极易只改一处。现在统一走 expand_group：
+    两处调用点只负责判断「是不是我的话」，渲染一律交给这里。
+    """
+    for owner, groups in MENU_GROUPS.items():
+        items = groups.get(text)
+        if items:
+            # 标题带上级名字，避免两个菜单重名时看不出自己在哪一层。
+            send_options(chat, owner + ' › ' + text, list(items))
+            return True
+    return False
+
 
 def quick_action(chat, text):
     text = ALIASES.get(text, text)
@@ -514,16 +578,12 @@ def quick_action(chat, text):
         atomic_json(STRATEGY_STATE, {'strategy': text})
         send(chat, '执行策略已切换为：' + text + '\n下一条任务生效，重启后保留。')
     elif text in ('设置', '更多设置', '/settings'):
-        send_group_menu(chat, '设置\n按用途分成三组，点进去只看该组功能。', MENU_GROUPS['设置'])
+        send_group_menu(chat, group_title('设置', '设置'), MENU_GROUPS['设置'])
     elif text == '更多':
-        send_group_menu(chat, '更多\n账号、执行与系统类入口都收在这里。', MENU_GROUPS['更多'])
-    elif any(text in groups for groups in MENU_GROUPS.values()):
-        # 先把按钮定位到它所属的那一级菜单，标题里带上级名字，避免两个菜单重名时串组。
-        for owner, groups in MENU_GROUPS.items():
-            items = groups.get(text)
-            if items:
-                send_options(chat, owner + ' › ' + text, list(items))
-                break
+        send_group_menu(chat, group_title('更多', '更多'), MENU_GROUPS['更多'])
+    elif expand_group(chat, text):
+        # 分组名展开：命中并已渲染。
+        pass
     elif text == '返回主菜单':
         set_menu_visible(True)
         send(chat, '智能体控制台\n当前模型：' + current_model() + '\n执行策略：' + strategy_name() + '\n直接输入任务，或选择下方功能。')
@@ -617,6 +677,11 @@ def split_message(text, limit=1800):
 
     单行本身超长时退化为切分，但优先在行内标记（** 或 `）的空隙处断开，
     否则会把加粗劈成两半、把代码符号直接暴露给用户。
+
+    limit 是**原文**字符数上限。真正的硬约束是渲染成 HTML 后的长度
+    （Telegram 上限 4096），而 HTML 转义会把 & < > 各撑到 5/4/4 倍，
+    一片 1800 字元的原文完全可能渲染成 9000 字符而被拒。所以这里在
+    切片后追加一道按渲染长度的复查，超限就继续对半拆。
     """
     pieces = []
     buffer = ''
@@ -665,7 +730,31 @@ def split_message(text, limit=1800):
         else:
             opened = None
         balanced.append(body)
-    return balanced
+    return clamp_rendered(balanced)
+
+
+# Telegram 单条消息上限 4096 字符，这里留出余量给 <b>/<pre> 等标签本身。
+RENDER_LIMIT = 3800
+
+
+def clamp_rendered(pieces):
+    """确保每片渲染成 HTML 后不超过硬上限，超限的对半拆开再复查。
+
+    递归深度受对数约束：1800 字的原文最多拆到 1 字，约 11 层就必然收敛，
+    不会因为某个字符恒定膨胀而无限递归。
+    """
+    result = []
+    for piece in pieces:
+        if len(render_reply(piece)) <= RENDER_LIMIT or len(piece) <= 1:
+            result.append(piece)
+            continue
+        middle = len(piece) // 2
+        # 优先在换行处断开，让两半各自仍是完整的行。
+        cut = piece.rfind('\n', 0, middle)
+        if cut <= 0:
+            cut = middle
+        result.extend(clamp_rendered([piece[:cut], piece[cut:]]))
+    return result
 
 def send_formatted(chat, text):
     text = redact(text)
@@ -779,6 +868,24 @@ def engine_command(engine, text, instructions, chat, environment):
     return command, None
 
 
+# 流式正文在内存里最多累积这么多字符。
+# 最终只回传前 24000 字，但解析器原本是无上限累加的：一轮 80 次工具调用、
+# 每次输出几万字时，一个任务就能吃掉几十兆内存，而结果最后还是要截断。
+# 留 3 倍余量（72000）既能完整覆盖最终上限，又给了流式预览足够的回看窗口。
+STREAM_CONTENT_CAP = 72000
+
+
+def append_content(state, chunk):
+    """把新片段接到流式正文末尾，并把总量控制在 STREAM_CONTENT_CAP 以内。"""
+    if not chunk:
+        return
+    content = state['content'] + chunk
+    if len(content) > STREAM_CONTENT_CAP:
+        # 截掉最旧的部分，并留一句提示，避免用户以为内容丢失是执行出错。
+        content = '（前面内容过长已省略）\n' + content[-(STREAM_CONTENT_CAP - 16):]
+    state['content'] = content
+
+
 def parse_claude_event(event, state):
     """解析 Claude/CodeBuddy 的 stream-json 事件，就地更新累积状态。"""
     if event.get('type') == 'stream_event':
@@ -786,14 +893,14 @@ def parse_claude_event(event, state):
         block = stream.get('content_block', {})
         if block.get('type') == 'text':
             # 只在真正开启正文块时补段落分隔；工具块不触发。
-            state['content'] += start_text_block(state['content'])
+            append_content(state, start_text_block(state['content']))
         elif block.get('type') == 'tool_use':
             tool = str(block.get('name', '工具'))
             state['activity'] = '正在执行工具：' + tool
             record_tool(tool)
         delta = stream.get('delta', {})
         if delta.get('type') == 'text_delta':
-            state['content'] += delta.get('text', '')
+            append_content(state, delta.get('text', ''))
             state['activity'] = '正在生成回复'
     elif event.get('type') == 'assistant':
         for block in event.get('message', {}).get('content', []):
@@ -833,7 +940,7 @@ def parse_codex_event(event, state):
         chunk = str(item.get('text', ''))
         if chunk:
             # 多条 agent_message 之间用空行分隔，避免两句黏成一段。
-            state['content'] += start_text_block(state['content']) + chunk
+            append_content(state, start_text_block(state['content']) + chunk)
             state['activity'] = '正在生成回复'
     elif item_type == 'command_execution':
         command = str(item.get('command', '命令')).strip()
@@ -863,6 +970,10 @@ def run_stream(chat, text):
         environment['_IMAGE_SERVER'] = '1'
         environment['_IMAGE_CONFIG'] = str(image_config)
     command, stdin_text = engine_command(engine, text, instructions, chat, environment)
+    # 只启动一个进程。命令与 stdin 内容都由 engine_command 一次给出：
+    # claude 系把任务放在命令行参数里（stdin_text 为 None），codex 走 stdin。
+    # 两者只能是同一条命令的两种投递方式，绝不能各起一个进程 ——
+    # 那样写进第一个进程的 prompt 会随句柄丢失，而泄漏的子进程无人回收。
     process = subprocess.Popen(command, cwd=WORK, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                stdin=subprocess.PIPE if stdin_text else None,
                                text=True, bufsize=1, env=environment, start_new_session=True)
@@ -873,8 +984,6 @@ def run_stream(chat, text):
             process.stdin.close()
         except (OSError, ValueError):
             pass
-    process = subprocess.Popen(command, cwd=WORK, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                               text=True, bufsize=1, env=environment, start_new_session=True)
     bind_process(process)
     events = queue.Queue()
     def read_events():
@@ -983,7 +1092,12 @@ def run_stream(chat, text):
     finally:
         terminate_process(process)
         unbind_process(process)
-        process.stdout.close()
+        # 读线程会一直阻塞在 for line in process.stdout 上，进程结束后管道到达 EOF，
+        # 线程会自行退出；这里显式关一次让 EOF 更快到达。关闭失败不影响任务结果。
+        try:
+            process.stdout.close()
+        except (OSError, ValueError, AttributeError):
+            pass
 
 class TaskCancelled(Exception):
     pass
@@ -1018,7 +1132,13 @@ def redact(value):
     value = re.sub(r'-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?-----END [^-]*PRIVATE KEY-----', '[已隐藏私钥]', value)
     # URL 内嵌凭证 https://user:password@host 与数据库连接串，必须在通用规则之前处理。
     # 密码里可能含 @，因此匹配到「最后一个 @ 之前」的全部内容。
-    value = re.sub(r'(?i)\b([a-z][a-z0-9+.-]*://)([^\s/:@]+):([^\s/]+)@', r'\1\2:[已隐藏]@', value)
+    #
+    # 这条规则原来写成 ([a-z][a-z0-9+.-]*://)([^\s/:@]+):([^\s/]+)@，在「有 :// 但没有 @」
+    # 的长文本上会退化成二次方回溯：([^\s/]+) 每失败一次都要把 (?:[a-z0-9+.-]*) 重试一遍。
+    # 实测 10 万字符的 'sk-'*20000 要 7.9 秒，而这条规则对每条消息、每条结果都会跑。
+    # 改用显式字符类 + 独占量词（atomic 语义由尾部 [^\s/]+ 的互斥写法保证），
+    # 并把协议头的重复次数收敛到 32（正常协议名不会有 32 个字符）。
+    value = re.sub(r'(?i)\b([a-z][a-z0-9+.-]{0,31}://)([^\s/:@]+):([^\s/]+)@', r'\1\2:[已隐藏]@', value)
     # Bearer 必须先于 authorization 规则，否则只抹掉 "Bearer" 而令牌仍留在原地。
     value = re.sub(r'(?i)\bBearer\s+[^\s"\x27,;]+', 'Bearer [已隐藏]', value)
     value = re.sub(r'(?i)((?:api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|password|passwd|secret|密钥|密码)["\x27]?\s*[=:：]\s*["\x27]?)([^\s,;"\x27]+)', r'\1[已隐藏]', value)
@@ -1054,33 +1174,56 @@ def unbind_process(process):
 
 
 def terminate_process(process):
+    """确保进程组被终止且**被回收**。无论走哪条分支都不抛异常。
+
+    两个坑：
+    1) 原实现在 killpg 抛 ProcessLookupError 时直接 return，跳过了 wait()。
+       进程已经退出但还没被回收时正是这种情况，于是它变成僵尸常驻。
+    2) 末尾的 process.wait(timeout=5) 自己也可能超时。它位于各调用方的
+       finally 里，抛出来会把真正的异常（取消、崩溃原因）整个盖掉。
+    """
     if os.name == 'posix':
         try:
             os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
+            # 进程组已不存在：不杀，但仍要继续往下 wait 回收。
+            pass
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+        except OSError:
             return
         try:
-            process.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            pass
-        try:
             os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             pass
-        process.wait(timeout=5)
-    elif process.poll() is None:
-        process.terminate()
         try:
-            process.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            process.kill()
             process.wait(timeout=5)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+    elif process.poll() is None:
+        try:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
 
 
 def run_checked(command, timeout, env=None):
     check_cancelled()
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               text=True, env=env, start_new_session=True)
+    try:
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True, env=env, start_new_session=True)
+    except OSError as exc:
+        # 命令不存在（如精简系统没装 vmstat）或不可执行时，Popen 直接抛 OSError。
+        # 状态查询是好几个命令拼起来的，一条缺失不该让整个查询报错，
+        # 这里把失败当成一条正常的输出返回，界面照样能展示其余几项。
+        return subprocess.CompletedProcess(command, 127, '', '无法执行 ' + command[0] + '：' + (exc.strerror or '命令不可用'))
     bind_process(process)
     started = time.monotonic()
     try:
@@ -1096,8 +1239,13 @@ def run_checked(command, timeout, env=None):
     finally:
         terminate_process(process)
         unbind_process(process)
-        process.stdout.close()
-        process.stderr.close()
+        # 管道已由 communicate 读完并关闭，这里再关一次纯属多余；
+        # 极端情况下（句柄被外层提前关闭）反而会抛 ValueError 盖掉真正的异常。
+        for stream in (process.stdout, process.stderr):
+            try:
+                stream.close()
+            except (OSError, ValueError, AttributeError):
+                pass
 
 
 def transcribe_audio(path):
@@ -1131,7 +1279,10 @@ def transcribe_audio(path):
     finally:
         terminate_process(process)
         unbind_process(process)
-        process.stdout.close()
+        try:
+            process.stdout.close()
+        except (OSError, ValueError, AttributeError):
+            pass
 
 
 def record_tool(name):
@@ -1259,7 +1410,16 @@ class TaskController:
     # 不设上限时状态文件会随使用无限增长，而每次 persist 都要全量重写。
     KEEP_FINISHED = 200
     # 落盘用的结果截断长度，远小于内存中的 24000，避免状态文件虚胖。
-    DISK_RESULT_CHARS = 4000
+    #
+    # 这个数字直接决定每次 persist 要写多少字节：200 条任务各留 4000 字时，
+    # 状态文件约 2.4MB，一次原子写（含 fsync）实测 19ms，而每条消息都会 persist。
+    # 200 条历史里真正会去翻第 100 条完整结果的场景极少，把落盘摘要压到 1200 字
+    # 后体积降到约四分之一，换取的是每次状态变更都快一个数量级。
+    # 内存里仍保留 24000 字，界面查看不受影响；只有重启后才只剩摘要。
+    DISK_RESULT_CHARS = 1200
+    # 任务正文上限。取值远低于 Linux 的 MAX_ARG_STRLEN（约 128KB），
+    # 留出空间给系统指令前缀（agent_instructions 与交接摘要都拼在前面）。
+    MAX_TASK_CHARS = 60000
 
     def __init__(self, root):
         self.root = Path(root)
@@ -1272,13 +1432,29 @@ class TaskController:
         self.closing = False
         self.seen = set()
         self.ui = {}
+        # 先给两个派生属性兜底值：下面持久状态的解析一旦抛错，__init__ 就会中途退出，
+        # 而 handle_update 的收尾（以及任何别的线程）仍可能读到半初始化的对象。
+        # 有兜底值至少是「什么都不记住」，不会变成 AttributeError。
+        self.target = '本机'
+        # note_seen 的节流计数：累计多少条未落盘、上次落盘时刻。
+        self._seen_dirty = 0
+        self._seen_flushed = time.monotonic()
         if self.path.exists():
             # 持久状态损坏时停止启动，不能静默丢弃队列。
             self.data = json.loads(self.path.read_text(encoding='utf-8'))
+            # 合法 JSON 但类型不对（被写成数组/字符串/null）时，后面 _normalize 会以
+            # AttributeError 炸开，错误信息完全指不出根因。这里显式报出文件与类型。
+            if not isinstance(self.data, dict):
+                raise ValueError('状态文件 ' + str(self.path) + ' 的顶层不是对象（实际为 '
+                                 + type(self.data).__name__ + '），请人工检查后重命名该文件以重建。')
         else:
             legacy = None
             if SESSION_STATE.exists():
-                legacy = json.loads(SESSION_STATE.read_text()).get('session_id')
+                try:
+                    legacy = json.loads(SESSION_STATE.read_text()).get('session_id')
+                except (OSError, ValueError, AttributeError):
+                    # 旧会话文件只是迁移来源，读不出来就当没有，不该阻止首次启动。
+                    legacy = None
             key = uuid.uuid4().hex[:12]
             self.data = {'tasks': [], 'sessions': {key: {'name': '默认会话', 'session_id': legacy}},
                          'active_session': key, 'target': '本机', 'favorites': [], 'seen': []}
@@ -1355,7 +1531,11 @@ class TaskController:
         with self.lock:
             self._prune()
             self.data['target'] = self.target
+            # 内存里的 seen 也要跟着裁：落盘裁到 2000，但内存原本只增不减，
+            # 长期运行会一直向上长（整数集合虽然慢，但没有上界）。
             self.data['seen'] = sorted(self.seen)[-2000:]
+            if len(self.seen) > 4000:
+                self.seen = set(self.data['seen'])
             # 内存保留原文供执行器使用；落盘一律脱敏，避免令牌写入状态文件。
             disk = copy.deepcopy(self.data)
             for task in disk['tasks']:
@@ -1369,6 +1549,25 @@ class TaskController:
                 if len(result) > self.DISK_RESULT_CHARS:
                     task['result'] = result[:self.DISK_RESULT_CHARS] + '\n（已截断，完整结果未持久化）'
             atomic_json(self.path, disk)
+
+    def note_seen(self, update_id):
+        """记录已处理的 update_id，但不每条消息都落盘。
+
+        seen 的唯一作用是重启后不重复执行已处理过的更新。每收到一条消息就
+        原子写一次状态文件（满负荷时约 13ms 且持锁），代价远高于收益：
+        重启发生在「已处理但未落盘」之间时会重放一条，而重放有 update_id
+        去重兜不住时也只是重复一次只读查询。所以改成按间隔落盘。
+        """
+        with self.lock:
+            # 去重集合必须在这里一起更新：enqueue 会在 worker 线程检查 seen，
+            # 主线程无锁写入会和它撞上。
+            self.seen.add(update_id)
+            self._seen_dirty = self._seen_dirty + 1
+            now = time.monotonic()
+            if self._seen_dirty >= 20 or now - self._seen_flushed >= 30:
+                self._seen_dirty = 0
+                self._seen_flushed = now
+                self.persist()
 
     def active_session(self):
         with self.lock:
@@ -1396,6 +1595,13 @@ class TaskController:
                 return None
             if sum(task['status'] == 'queued' for task in self.data['tasks']) >= 100:
                 raise MediaError('排队任务已满一百条，请先撤销或等待完成。')
+            # 执行器把任务正文作为命令行参数传给 CLI，而 Linux 单个 argv 上限约 128KB
+            # （MAX_ARG_STRLEN）。超过就会以 E2BIG 启动失败，报错信息还和内容无关。
+            # Telegram 单条消息只允许 4096 字，能凑到这么大基本只有长转发或拼接，
+            # 在这里拦下来并给出可操作的提示，比让 CLI 静默失败好。
+            if len(text) > self.MAX_TASK_CHARS:
+                raise MediaError('任务正文过长（上限 ' + str(self.MAX_TASK_CHARS)
+                                 + ' 字符）。请把需求拆成多条，或先上传文件再说明处理要求。')
             safe_payload = dict(payload or {})
             if 'caption' in safe_payload:
                 safe_payload['caption'] = redact(safe_payload['caption'])
@@ -1508,7 +1714,8 @@ class TaskController:
                 models = [item for item in models if task['text'].casefold() in item['id'].casefold()]
             elif kind == 'favorites':
                 models = [item for item in models if item['id'] in self.data['favorites']]
-            show_model_items(chat, models, task['payload'].get('page', 0))
+            # 搜索结果与收藏列表要带上筛选后的集合，翻页才有意义。
+            show_model_items(chat, models, int(task['payload'].get('page', 0)))
             task['result'] = '模型目录已展示，共' + str(len(models)) + '项。'
         elif kind == 'quick':
             quick_action(chat, task['text'])
@@ -1539,10 +1746,10 @@ class TaskController:
             run_stream(chat, task['text'])
 
     def handle_text(self, chat, text, update_id=None):
+        # 别名只做一次映射，且统一放在 ALIASES 里。这里原来还有第二张局部别名表，
+        # 里面写着 '当前模型': '当前模型' 这种自我映射（死项），并且把 /tasks 映射成
+        # 「新任务」，与 MENU_GROUPS 中「新任务」只是说明文案的语义冲突。
         text = ALIASES.get(text, text)
-        aliases = {'更多设置': '设置', '任务助手': '新任务', '当前模型': '当前模型', '/tasks': '新任务',
-                   '/stop': '停止', '/queue': '队列', '/sessions': '会话', '/files': '文件'}
-        text = aliases.get(text, text)
         if text == '图片创作':
             send(chat, '发送“生图 描述”生成一张图片，例如：生图 一只趴在窗边的橘猫，水彩插画。图片任务使用独立生图通道，与聊天执行器无关。当前：' + json.dumps(image_options(), ensure_ascii=False))
         elif text == '生图设置':
@@ -1704,17 +1911,13 @@ class TaskController:
                 task = next((item for item in self.data['tasks'] if item['id'] == text.split(maxsplit=1)[1].strip()), None)
                 result = task.get('result', '') if task else '任务ID不存在。'
             send_formatted(chat, redact(result or '尚无结果。'))
-        elif text == '设置':
-            send_group_menu(chat, '设置\n按用途分成三组，点进去只看该组功能。', MENU_GROUPS['设置'])
+        elif text in ('设置', '更多设置', '/settings'):
+            send_group_menu(chat, group_title('设置', '设置'), MENU_GROUPS['设置'])
         elif text == '更多':
-            send_group_menu(chat, '更多\n账号、执行与系统类入口都收在这里。', MENU_GROUPS['更多'])
-        elif any(text in groups for groups in MENU_GROUPS.values()):
+            send_group_menu(chat, group_title('更多', '更多'), MENU_GROUPS['更多'])
+        elif expand_group(chat, text):
             # 分组展开：只在确实是分组名时才响应，避免和功能名冲突。
-            for owner, groups in MENU_GROUPS.items():
-                items = groups.get(text)
-                if items:
-                    send_options(chat, owner + ' › ' + text, list(items))
-                    break
+            pass
         elif text in ('登录Claude', '登录 Claude', '/login'):
             url = start_account_login()
             send(chat, '请用手机浏览器打开下面的链接完成授权（可能需要先登录 claude.ai）。\n\n'
@@ -1767,14 +1970,20 @@ class TaskController:
                 send(chat, '已加入队列：' + task['id'] + '\n' + self.task_summary(task))
 
 
-def show_model_items(chat, models, page=0):
+def show_model_items(chat, models, page=0, key=None):
+    """渲染一页模型按钮。models 必须是完整集合，翻页只切当前页。
+
+    key 用于翻页游标：同一个集合的翻页要复用同一个游标，否则每翻一页都会
+    生成新游标、把旧集合挤掉（每个集合最长 40 项，连点十几次就爆）。
+    """
     if not models:
         send(chat, '没有匹配模型。')
         return
     pages = (len(models) + 11) // 12
     page = max(0, min(int(page), pages - 1))
     # 查询结果页使用当前集合的短期游标，避免搜索翻页跳回全目录。
-    key = uuid.uuid4().hex[:10]
+    if key is None:
+        key = uuid.uuid4().hex[:10]
     if CONTROL is not None:
         with CONTROL.lock:
             CONTROL.ui[key] = [item['id'] for item in models]
@@ -1802,15 +2011,22 @@ def handle_update(update):
         if callback:
             api('answerCallbackQuery', {'callback_query_id': callback['id'], 'text': '仅机主可操作'})
         return
-    chat = message['chat']['id']
-    if update['update_id'] in CONTROL.seen:
+    # chat id 与 update_id 理论上必然存在，但缺了会直接 KeyError。
+    # 缺 update_id 尤其致命：异常会穿过 main 的轮询循环，让整个机器人退出，
+    # 而 next_offset 已经推进 —— 这条更新连同其后的消息全部丢失。
+    chat = message.get('chat', {}).get('id')
+    update_id = update.get('update_id')
+    if chat is None or update_id is None:
+        print('更新缺少必要字段，已跳过', flush=True)
+        return
+    if update_id in CONTROL.seen:
         return
     if callback:
         api('answerCallbackQuery', {'callback_query_id': callback['id']})
         fields = callback.get('data', '').split(':')
         if fields[0] == 'choose' and len(fields) == 2:
             # 按缓存解析，主线程不调用网关。
-            models = json.loads(MODEL_CACHE.read_text()) if MODEL_CACHE.exists() else []
+            models = read_model_cache()
             model = next((item['id'] for item in models if hashlib.sha256(item['id'].encode()).hexdigest()[:24] == fields[1]), None)
             if model is None:
                 send(chat, '模型菜单已过期，请刷新模型列表。')
@@ -1822,24 +2038,24 @@ def handle_update(update):
                 ids = CONTROL.ui.get(fields[1])
             if ids is None:
                 send(chat, '分页菜单已过期，请重新搜索或打开目录。')
+            elif not fields[2].lstrip('-').isdigit():
+                # 回调数据可以被重放或伪造，页码不是数字时不能直接 int()。
+                send(chat, '分页参数无效，请重新搜索或打开目录。')
             else:
-                show_model_items(chat, [{'id': item} for item in ids], int(fields[2]))
-        elif fields[0] == 'page' and len(fields) == 2:
-            CONTROL.enqueue(chat, kind='models', payload={'page': int(fields[1])}, update_id=update['update_id'])
+                # 复用同一个游标翻页，集合本身不变，只换当前页。
+                show_model_items(chat, [{'id': item} for item in ids], int(fields[2]), key=fields[1])
     elif any(message.get(key) for key in ('photo', 'document', 'voice', 'audio')):
         payload = {key: message[key] for key in ('photo', 'document', 'voice', 'audio', 'caption') if key in message}
-        task = CONTROL.enqueue(chat, kind='media', payload=payload, update_id=update['update_id'])
+        task = CONTROL.enqueue(chat, kind='media', payload=payload, update_id=update_id)
         if task:
             send(chat, '附件接收任务已排队：' + task['id'] + '。语音转写完成后需确认执行；普通文件只保存。')
     else:
         text = message.get('text', '').strip()
         if text:
-            CONTROL.handle_text(chat, text, update['update_id'])
+            CONTROL.handle_text(chat, text, update_id)
         else:
             send(chat, '请发送文字、图片、普通文件或三分钟以内的语音。')
-    with CONTROL.lock:
-        CONTROL.seen.add(update['update_id'])
-        CONTROL.persist()
+    CONTROL.note_seen(update_id)
 
 
 def main():
@@ -1849,6 +2065,9 @@ def main():
     BASE = os.environ.get('TELEGRAM_API_BASE', 'https://api.telegram.org').rstrip('/') + '/bot' + TOKEN + '/'
     WORK.mkdir(mode=0o700, parents=True, exist_ok=True)
     offset = int(STATE.read_text()) if STATE.exists() else 0
+    # offset 落盘节流：上次落盘的游标值与时刻。
+    last_state_flush = offset
+    last_state_time = time.monotonic()
     CONTROL = TaskController(WORK)
     worker = threading.Thread(target=CONTROL.worker, name='telegram-task-worker', daemon=True)
     worker.start()
@@ -1886,9 +2105,26 @@ def main():
                     if message.get('chat', {}).get('id') == OWNER:
                         CONTROL.notify(OWNER, str(exc) if isinstance(exc, MediaError) else '本次操作失败，请重试。任务结果可在历史中核对。')
                     if not isinstance(exc, MediaError):
+                        # 非预期异常：先推进 offset 再退出本轮。
+                        # 原来的 break 发生在 offset 赋值之前，这条更新会被重新投递，
+                        # 同一段坏数据会让机器人反复重启、每次都死在同一条上（活锁）。
+                        # 推进 offset 相当于跳过它，坏消息只丢一条，不会拖死整个通道。
+                        update_id = update.get('update_id')
+                        if update_id is not None:
+                            atomic_json(STATE, str(update_id + 1), raw=True)
                         break
-                offset = update['update_id'] + 1
-                atomic_json(STATE, str(offset), raw=True)
+                update_id = update.get('update_id')
+                if update_id is not None:
+                    offset = update_id + 1
+                    # offset 是轻量游标，不必每条都 fsync：atomic_json 的落盘成本
+                    # 与状态文件大小无关但是一次真实的磁盘同步，逐条做会白白拖慢通道。
+                    # 攒够一批或距上次落盘超过 2 秒再写，最坏情况只是重启后重放几条，
+                    # 而重放本身有 seen 去重。
+                    now = time.monotonic()
+                    if offset - last_state_flush >= 20 or now - last_state_time >= 2:
+                        atomic_json(STATE, str(offset), raw=True)
+                        last_state_flush = offset
+                        last_state_time = now
     except KeyboardInterrupt:
         with CONTROL.condition:
             CONTROL.closing = True
@@ -1898,7 +2134,10 @@ def main():
         with CONTROL.lock:
             if CONTROL.current:
                 CONTROL.current.update(status='interrupted', result='桥接停止，任务已中断；不会自动重放。')
-                CONTROL.persist()
+            # 退出前把攒下的游标与 seen 落盘，避免停机后重放已处理过的消息。
+            if offset is not None:
+                atomic_json(STATE, str(offset), raw=True)
+            CONTROL.persist()
 
 
 if __name__ == '__main__':

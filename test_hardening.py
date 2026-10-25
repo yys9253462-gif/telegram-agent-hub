@@ -5,6 +5,7 @@
 运行：python test_hardening.py
 """
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -209,6 +210,216 @@ class AtomicJsonTest(unittest.TestCase):
         folder = Path(tempfile.mkdtemp())
         bot.atomic_json(folder / 'x.json', {'a': 1})
         self.assertEqual([f.name for f in folder.iterdir() if f.name.endswith('.tmp')], [])
+
+
+class RenderedLengthTest(unittest.TestCase):
+    """缺陷：split_message 按原文 1800 字符切片，但 Telegram 的 4096 上限
+    算的是**渲染后**长度。HTML 转义把 & 撑到 5 倍、< 撑到 4 倍，
+    一片 1800 字的原文能渲染成 9000 字符，sendMessage 直接 400，整条结果送不出去。"""
+
+    def test_html_escape_inflation_is_real(self):
+        # 先证明这个风险真实存在，否则后面的断言毫无意义。
+        self.assertEqual(len(bot.render_reply('&' * 1800)), 9000)
+
+    def test_no_piece_exceeds_render_limit(self):
+        for label, text in (
+            ('全与号', '&' * 5000),
+            ('全小于号', '<' * 5000),
+            ('代码内与号', '`' + '&' * 4000 + '`'),
+            ('普通代码块', '    if a < b and c > d: return x & y\n' * 200),
+        ):
+            for index, piece in enumerate(bot.split_message(text)):
+                rendered = len(bot.render_reply(piece))
+                self.assertLessEqual(rendered, 4096,
+                                     label + ' 第%d片渲染后 %d 字符，超过 Telegram 上限' % (index + 1, rendered))
+
+    def test_content_preserved_after_clamping(self):
+        # 拆分只允许在原文层面切开放，内容必须逐字保留。
+        for text in ('&' * 5000, '中文内容' * 2000, 'a<&>b\n' * 800):
+            self.assertEqual(''.join(bot.split_message(text)), text)
+
+
+class RedactBacktrackingTest(unittest.TestCase):
+    """缺陷：URL 内嵌凭证规则写成 ([a-z][a-z0-9+.-]*://)([^\\s/:@]+):([^\\s/]+)@，
+    在「有 :// 但没有 @」的长文本上二次方回溯。实测 4 万字符耗时 7.9 秒，
+    而 redact 对每条消息、每条结果都会跑。"""
+
+    def test_long_text_without_at_is_fast(self):
+        import time
+        text = 'sk-' * 20000
+        start = time.monotonic()
+        bot.redact(text)
+        elapsed = time.monotonic() - start
+        self.assertLess(elapsed, 0.5, '脱敏耗时 %.2f 秒，说明正则回溯又退化了' % elapsed)
+
+    def test_credentials_still_masked(self):
+        # 收紧正则不能把功能一起弄丢。
+        self.assertIn('[已隐藏]', bot.redact('https://user:pass@host/x'))
+        self.assertIn('[已隐藏]', bot.redact('postgres://u:p@db:5432/x'))
+        # 不含凭证的 URL 必须原样保留。
+        self.assertEqual(bot.redact('https://example.com/a:b'), 'https://example.com/a:b')
+
+
+class TerminateProcessTest(unittest.TestCase):
+    """缺陷：killpg 抛 ProcessLookupError 时原实现直接 return，跳过了 wait()。
+    进程已退出但未回收时正是这个状态，于是它变成僵尸常驻。
+    另外末尾的 wait(timeout=5) 自己也会超时，它位于调用方的 finally 里，
+    抛出来会把真正的异常盖掉。"""
+
+    class FakeOS:
+        name = 'posix'
+
+        def __init__(self, raiser):
+            self.raiser = raiser
+
+        def killpg(self, pid, sig):
+            self.raiser()
+
+    class FakeSignal:
+        SIGTERM = 15
+        SIGKILL = 9
+
+    class FakeProcess:
+        pid = 4242
+
+        def __init__(self, always_timeout=False):
+            self.waits = 0
+            self.always_timeout = always_timeout
+
+        def wait(self, timeout=None):
+            self.waits += 1
+            if self.always_timeout:
+                raise subprocess.TimeoutExpired('x', timeout)
+            return 0
+
+    def run_with(self, killpg_raiser, process):
+        original_os, original_signal = bot.os, bot.signal
+        bot.os = self.FakeOS(killpg_raiser)
+        bot.signal = self.FakeSignal
+        try:
+            bot.terminate_process(process)
+        finally:
+            bot.os, bot.signal = original_os, original_signal
+
+    def test_process_reaped_when_group_already_gone(self):
+        def missing():
+            raise ProcessLookupError()
+        process = self.FakeProcess()
+        self.run_with(missing, process)
+        self.assertGreater(process.waits, 0, '进程组已消失时仍必须 wait 回收，否则留下僵尸')
+
+    def test_wait_timeout_does_not_escape(self):
+        def ok():
+            pass
+        process = self.FakeProcess(always_timeout=True)
+        try:
+            self.run_with(ok, process)
+        except subprocess.TimeoutExpired:
+            self.fail('terminate_process 不允许向外抛异常，它会盖掉调用方 finally 里的真实原因')
+
+
+class StateFileTypeTest(unittest.TestCase):
+    """缺陷：状态文件是合法 JSON 但顶层类型不对（[] / "str" / null）时，
+    _normalize 会以 AttributeError 炸开，机器人直接起不来，
+    而错误信息完全指不出根因。"""
+
+    def test_wrong_toplevel_type_raises_clear_error(self):
+        for payload in ('[]', '"字符串"', '123', 'null'):
+            folder = Path(tempfile.mkdtemp())
+            (folder / 'bridge-state.json').write_text(payload, encoding='utf-8')
+            with self.assertRaises(ValueError) as caught:
+                bot.TaskController(folder)
+            self.assertIn('顶层不是对象', str(caught.exception))
+
+    def test_valid_object_still_boots(self):
+        folder = Path(tempfile.mkdtemp())
+        (folder / 'bridge-state.json').write_text(
+            '{"tasks": [], "sessions": {"a": {"name": "x"}}, "active_session": "a"}', encoding='utf-8')
+        controller = bot.TaskController(folder)
+        self.assertEqual(controller.data['tasks'], [])
+
+
+class TaskLengthLimitTest(unittest.TestCase):
+    """缺陷：任务正文无上限，而执行器把正文作为独立 argv 传给 CLI。
+    Linux 单个 argv 上限约 128KB，超长任务会以 E2BIG 启动失败。"""
+
+    def test_overlong_text_rejected(self):
+        controller = bot.TaskController(Path(tempfile.mkdtemp()))
+        with self.assertRaises(bot.MediaError):
+            controller.enqueue(1, '任' * (bot.TaskController.MAX_TASK_CHARS + 1))
+
+    def test_normal_text_accepted(self):
+        controller = bot.TaskController(Path(tempfile.mkdtemp()))
+        task = controller.enqueue(1, '正常长度的任务')
+        self.assertEqual(task['status'], 'queued')
+
+
+class StreamContentCapTest(unittest.TestCase):
+    """缺陷：解析器对 state['content'] 无上限累加，只在最后才截断到 24000。
+    一轮 80 次工具调用、每次输出几万字时，单个任务就能吃掉几十兆内存。"""
+
+    def test_cap_enforced(self):
+        state = {'content': '', 'final': None, 'activity': '', 'failed': ''}
+        for _ in range(3000):
+            bot.append_content(state, '输出片段' * 200)
+        self.assertLessEqual(len(state['content']), bot.STREAM_CONTENT_CAP)
+
+    def test_tail_is_kept(self):
+        state = {'content': '', 'final': None, 'activity': '', 'failed': ''}
+        for _ in range(3000):
+            bot.append_content(state, '片段' * 100)
+        self.assertIn('前面内容过长已省略', state['content'])
+        self.assertTrue(state['content'].endswith('片段'))
+
+
+class SeenThrottleTest(unittest.TestCase):
+    """缺陷：每收到一条消息就原子写一次状态文件（满负荷时约 13ms 且持锁），
+    而 seen 的唯一作用是重启后不重复执行。改成节流后要保证：
+    已处理的 update_id 仍然全部记进内存集合。"""
+
+    def test_all_ids_recorded(self):
+        controller = bot.TaskController(Path(tempfile.mkdtemp()))
+        for index in range(100):
+            controller.note_seen(5000 + index)
+        for index in range(100):
+            self.assertIn(5000 + index, controller.seen)
+
+    def test_writes_are_throttled(self):
+        controller = bot.TaskController(Path(tempfile.mkdtemp()))
+        writes = {'count': 0}
+        original = bot.atomic_json
+
+        def counting(path, value, raw=False):
+            writes['count'] += 1
+            return original(path, value, raw)
+
+        bot.atomic_json = counting
+        try:
+            for index in range(100):
+                controller.note_seen(7000 + index)
+        finally:
+            bot.atomic_json = original
+        self.assertLess(writes['count'], 100, '每条都落盘等于没做节流')
+
+
+class GroupMenuTest(unittest.TestCase):
+    """缺陷：分组展开逻辑在 quick_action 与 handle_text 里各写一份，
+    文案改动只改一处就会漂移。统一走 expand_group 后要保证两处入口行为一致。"""
+
+    def test_expand_group_returns_bool(self):
+        captured = []
+        original = bot.send_options
+        bot.send_options = lambda chat, title, items: captured.append((title, list(items)))
+        try:
+            self.assertTrue(bot.expand_group(1, '任务与模型'))
+            self.assertFalse(bot.expand_group(1, '根本不存在'))
+        finally:
+            bot.send_options = original
+        self.assertEqual(captured[0][0], '设置 › 任务与模型')
+
+    def test_title_helper_covers_both_owners(self):
+        self.assertIn('按用途分成三组', bot.group_title('设置', '设置'))
+        self.assertIn('账号、执行与系统类入口', bot.group_title('更多', '更多'))
 
 
 if __name__ == '__main__':

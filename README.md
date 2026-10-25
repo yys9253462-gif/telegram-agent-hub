@@ -88,10 +88,17 @@ git clone https://github.com/yys9253462-gif/telegram-agent-hub.git
 cd telegram-agent-hub
 sudo bash install.sh            # 交互式安装
 python3 test_project.py         # 源码回归测试
+python3 test_hardening.py       # 五轮排查修复项的反向验证用例
+python3 test_codex_engine.py    # Codex 执行器参数与环境变量映射
+python3 test_installer.py       # 安装器配置校验与代码生成
+python3 test_menu_layout.py     # 键盘按钮与分组菜单一致性
+python3 test_auth_channel.py    # 网关/账号双渠道切换
 python3 test_image_tool.py      # 生图 MCP 工具与协议测试
 python3 security_check.py       # 提交前的敏感信息扫描
 bash -n get.sh && bash -n install.sh
 ```
+
+`test_hardening.py` 里每个用例都对应一处真实缺陷，注释写明缺陷现象，并可用「把修复改回原写法、测试必须报红」的方式自检。**改完代码请先删掉 `__pycache__` 再跑测试**——陈旧的 `bot.cpython-*.pyc` 会让测试读到旧字节码，从而给出全绿的假象（本项目踩过）。
 
 `test_integration.py` 只提供绑定回环地址的假消息接口，必须配合独立运行用户与独立服务名使用，不能替代真实端到端验收，也禁止用于正式机器人。
 
