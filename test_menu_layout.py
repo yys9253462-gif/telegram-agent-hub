@@ -152,7 +152,7 @@ class HandlerCoverageTest(unittest.TestCase):
 
 
 class DuplicateTailTest(unittest.TestCase):
-    """send_options 会自动补「返回主菜单 / 收起菜单」，按钮里已有的不能再补一遍。"""
+    """消息内联按钮不应覆盖首页键盘或追加导航尾部。"""
 
     def test_no_placeholder_feature_in_menu(self):
         """「巡检配置」在通用版里只是「尚未启用」的占位回复，不能放进菜单误导用户。"""
@@ -160,12 +160,15 @@ class DuplicateTailTest(unittest.TestCase):
         self.assertNotIn('巡检配置', reachable,
                          '占位功能不应出现在菜单里')
 
-    def test_send_options_dedupes_hide_menu(self):
-        block = SOURCE.split('def send_options(', 1)
-        self.assertEqual(len(block), 2, '未找到 send_options')
-        body = block[1].split('\ndef ', 1)[0]
-        self.assertIn("'收起菜单' in labels", body,
-                      'send_options 必须在追加前判断是否已含「收起菜单」')
+    def test_send_options_keeps_home_keyboard_without_navigation_tail(self):
+        import bot
+        from unittest.mock import patch
+        with patch.object(bot, 'api') as api, patch.dict(bot.ACTION_UI, clear=True):
+            bot.send_options(123, '功能', ['模型', '返回主菜单', '收起菜单'])
+            markup = api.call_args.args[1]['reply_markup']
+            self.assertEqual(set(markup), {'inline_keyboard'})
+            buttons = [button for row in markup['inline_keyboard'] for button in row]
+            self.assertEqual([button['text'] for button in buttons], ['模型设置'])
 
     def test_no_group_lists_the_same_button_twice(self):
         for owner, groups in MENU_GROUPS.items():

@@ -41,6 +41,11 @@ STATE = WORK / 'telegram-offset'
 offset = 0
 TASK_LOCAL = threading.local()
 CONTROL = None
+ACTION_UI = {}
+ACTION_UI_SEEN = {}
+ACTION_UI_LOCK = threading.Lock()
+ACTION_UI_LIMIT = 512
+ACTION_UI_TTL = 300
 
 def api(method, payload):
     request = urllib.request.Request(BASE + method, data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json'})
@@ -51,7 +56,7 @@ def api(method, payload):
     return body['result']
 
 # 顶层只留高频操作：派任务、看进度、急停、看机器、两个二级入口。
-# 低频配置和查询收进「设置」与「更多」的分组菜单，避免十几行按钮糊住整个聊天界面。
+# 配置和授权入口使用消息内联按钮，首页底部键盘保持六项常用操作。
 KEYBOARD = {
     'keyboard': [
         ['新任务', '当前任务'],
@@ -64,7 +69,7 @@ KEYBOARD = {
     'input_field_placeholder': '点击功能按钮，或直接输入任务',
 }
 
-# 分组菜单：每组一个标题，点进分组后只显示该组的功能，不再平铺十几项。
+# 保留分组常量兼容旧入口，展示时直接平铺各组功能。
 MENU_GROUPS = {
     '设置': {
         '任务与模型': ['模型', '选择智能体'],
@@ -962,34 +967,35 @@ def agent_instructions():
             '当前执行策略：' + strategy_name() + '。' + STRATEGIES[strategy_name()])
 
 def send_options(chat, title, labels):
-    # 「收起菜单」可能已经在 labels 里（如系统分组），不再重复追加，否则同一个按钮会出现两次。
-    tail = ['返回主菜单'] + ([] if '收起菜单' in labels else ['收起菜单'])
-    api('sendMessage', {'chat_id': chat, 'text': title, 'reply_markup': {
-        'keyboard': [[MENU_LABELS.get(label, label) for label in labels[index:index + 2]]
-                     for index in range(0, len(labels), 2)]
-                    + [[MENU_LABELS.get(label, label) for label in tail]],
-        'resize_keyboard': True, 'is_persistent': True, 'one_time_keyboard': False,
-        'input_field_placeholder': '选择功能，或直接发送任务'}})
+    labels = [label for label in labels if label not in ('返回主菜单', '返回首页', '收起菜单')]
+    buttons = []
+    now = time.monotonic()
+    with ACTION_UI_LOCK:
+        for token, action in list(ACTION_UI.items()):
+            if action['expires'] <= now:
+                ACTION_UI.pop(token)
+        for item in labels:
+            label, command = item if isinstance(item, tuple) else (MENU_LABELS.get(item, item), item)
+            token = uuid.uuid4().hex
+            callback = 'ui:' + token
+            if len(callback.encode('utf-8')) > 64:
+                raise ValueError('菜单回调超过长度限制')
+            ACTION_UI[token] = {'chat': chat, 'command': command, 'expires': now + ACTION_UI_TTL}
+            buttons.append({'text': label, 'callback_data': callback})
+        while len(ACTION_UI) > ACTION_UI_LIMIT:
+            ACTION_UI.pop(next(iter(ACTION_UI)))
+    api('sendMessage', {'chat_id': chat, 'text': redact(title), 'reply_markup': {
+        'inline_keyboard': [buttons[index:index + 2] for index in range(0, len(buttons), 2)]}})
 
 def send_group_menu(chat, title, groups):
-    """渲染分组菜单。先只列分组名，点进分组才展开该组的具体功能。"""
-    if len(groups) == 1:
-        name, items = next(iter(groups.items()))
-        send_options(chat, name + '\n\n' + GROUP_DESCRIPTIONS.get(name, ''), list(items))
-        return
-    labels = list(groups)
-    overview = '\n\n'.join(name + '\n' + GROUP_DESCRIPTIONS.get(name, '选择功能继续。')
-                            for name in labels)
-    api('sendMessage', {'chat_id': chat, 'text': title + '\n\n' + overview, 'reply_markup': {
-        'keyboard': [labels[index:index + 2] for index in range(0, len(labels), 2)] + [['返回首页', '收起菜单']],
-        'resize_keyboard': True, 'is_persistent': True, 'one_time_keyboard': False,
-        'input_field_placeholder': '选择一个功能分组'}})
+    """直接列出入口下的功能，按钮保留在这条消息下方。"""
+    send_options(chat, title, [label for items in groups.values() for label in items])
 
 
 def group_title(owner, group):
     """分组展开时的标题文案。集中在这里，避免两处实现各写一句、逐渐漂移。"""
-    intro = {'设置': '把工作方式调成你习惯的样子。',
-             '更多': '连接平台、管理账号，查看系统与使用帮助。'}
+    intro = {'设置': '直接选择模型、智能体、会话或版本更新。',
+             '更多': '直接连接平台，查看或撤销授权。'}
     return MENU_LABELS.get(group, group) + '\n' + intro.get(owner, '选择下面的功能。')
 
 
@@ -2574,10 +2580,21 @@ class TaskController:
             with self.lock:
                 current = '\n\n'.join(self.task_summary(state['task']) for state in self.running.values()) or '当前没有运行中的任务。'
                 count = sum(item['status'] == 'queued' for item in self.data['tasks'])
-            send(chat, current + '\n排队：' + str(count) + '\n新任务设置：' + current_model() + ' / ' + self.target + ' / ' + strategy_name()
-                 + '\n运行和排队任务保留各自设置。实时系统资源请选择“服务器状态”。')
+                stops = [('停止 ' + task_id[:8], '停止任务 ' + task_id) for task_id, state in self.running.items()
+                         if state['task']['chat'] == chat]
+            title = current + '\n排队：' + str(count) + '\n新任务设置：' + current_model() + ' / ' + self.target + ' / ' + strategy_name() + '\n运行和排队任务保留各自设置。实时系统资源请选择“服务器状态”。'
+            if stops:
+                send_options(chat, title, stops)
+            else:
+                send(chat, title)
         elif text == '停止':
-            send(chat, self.stop())
+            with self.lock:
+                stops = [('停止 ' + task_id[:8], '停止任务 ' + task_id) for task_id, state in self.running.items()
+                         if state['task']['chat'] == chat]
+            if len(stops) > 1:
+                send_options(chat, '选择要停止的任务：', stops)
+            else:
+                send(chat, self.stop())
         elif text.startswith('停止任务 '):
             send(chat, self.stop(text.split(maxsplit=1)[1].strip()))
         elif text == '队列':
@@ -2645,8 +2662,11 @@ class TaskController:
             send(chat, '已新建并切换会话：' + key + '。已有任务继续使用原会话。')
         elif text == '会话列表':
             with self.lock:
-                lines = [('* ' if key == self.data['active_session'] else '') + key + '：' + value['name'] for key, value in self.data['sessions'].items()]
-            send(chat, '\n'.join(lines))
+                sessions = list(self.data['sessions'].items())[-10:][::-1]
+                buttons = [(('当前 · ' if key == self.data['active_session'] else '')
+                            + value['name'][:32] + ' · ' + key[:8], '切换会话 ' + key)
+                           for key, value in sessions]
+            send_options(chat, '最近创建的10个会话，点击直接切换。', buttons)
         elif text.startswith('命名会话 '):
             name = text.split(maxsplit=1)[1].strip()[:80]
             with self.lock:
@@ -2829,6 +2849,8 @@ def handle_update(update):
         if callback:
             api('answerCallbackQuery', {'callback_query_id': callback['id'], 'text': '仅机主可操作'})
         return
+    if callback:
+        api('answerCallbackQuery', {'callback_query_id': callback['id']})
     # chat id 与 update_id 理论上必然存在，但缺了会直接 KeyError。
     # 缺 update_id 尤其致命：异常会穿过 main 的轮询循环，让整个机器人退出，
     # 而 next_offset 已经推进 —— 这条更新连同其后的消息全部丢失。
@@ -2840,9 +2862,36 @@ def handle_update(update):
     if update_id in CONTROL.seen:
         return
     if callback:
-        api('answerCallbackQuery', {'callback_query_id': callback['id']})
-        fields = callback.get('data', '').split(':')
-        if fields[0] == 'choose' and len(fields) == 2:
+        data = callback.get('data', '')
+        if not isinstance(data, str) or len(data.encode('utf-8')) > 64:
+            CONTROL.note_seen(update_id)
+            return
+        fields = data.split(':')
+        if fields[0] == 'ui' and len(fields) == 2:
+            now = time.monotonic()
+            with ACTION_UI_LOCK:
+                for seen_id, expires in list(ACTION_UI_SEEN.items()):
+                    if expires <= now:
+                        ACTION_UI_SEEN.pop(seen_id)
+                if update_id in ACTION_UI_SEEN:
+                    return
+                ACTION_UI_SEEN[update_id] = now + ACTION_UI_TTL
+                while len(ACTION_UI_SEEN) > ACTION_UI_LIMIT:
+                    ACTION_UI_SEEN.pop(next(iter(ACTION_UI_SEEN)))
+                action = ACTION_UI.get(fields[1])
+                if action is not None and action['chat'] == chat:
+                    action = ACTION_UI.pop(fields[1])
+                else:
+                    action = None
+            try:
+                if action is None or action['expires'] <= now:
+                    send(chat, '操作按钮已失效或已使用，请重新打开菜单。')
+                else:
+                    CONTROL.handle_text(chat, action['command'], update_id)
+            finally:
+                CONTROL.note_seen(update_id)
+            return
+        elif fields[0] == 'choose' and len(fields) == 2:
             # 按缓存解析，主线程不调用网关。
             models = read_model_cache()
             model = next((item['id'] for item in models if hashlib.sha256(item['id'].encode()).hexdigest()[:24] == fields[1]), None)

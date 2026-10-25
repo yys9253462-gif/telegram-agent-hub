@@ -61,8 +61,11 @@ class ConcurrencyTests(unittest.TestCase):
         self.assertIsNot(events[0], events[1])
         messages = []
         self.b.send = lambda chat, text: messages.append(text)
-        self.c.handle_text(1, '当前任务')
-        self.assertTrue(all(task['id'] in messages[-1] for task in tasks))
+        with patch.object(self.b, 'send_options') as options:
+            self.c.handle_text(1, '当前任务')
+        self.assertTrue(all(task['id'] in options.call_args.args[1] for task in tasks))
+        self.assertEqual([command for label, command in options.call_args.args[2]],
+                         ['停止任务 ' + task['id'] for task in tasks])
         response = self.c.stop()
         self.assertIn('停止任务 ID', response)
         self.assertTrue(all(task['id'] in response for task in tasks))
