@@ -742,6 +742,9 @@ def reply_footer(engine=None, started=None, force=False):
 # 用它就能在到期前自动续期，不必每次重新授权。
 CREDENTIAL_RENEW_AHEAD = 1800      # 提前半小时续期，留出失败重试的余量
 CREDENTIAL_RENEW_INTERVAL = 300    # 每五分钟查一次到期时间
+# 真失效（没有刷新令牌 / 续期失败）时的提醒间隔。这是需要机主动手的事，
+# 提醒频率不能太高：每五分钟一次会把聊天刷爆，一小时一次足够。
+CREDENTIAL_RENEW_ALERT_GAP = 3600
 CREDENTIAL_RENEW_LOCK = threading.Lock()
 CREDENTIAL_RENEW_WARNED = {}
 
@@ -812,35 +815,50 @@ def renew_credential(provider, force=False, store=None):
         return value
 
 
+def renew_check_once(provider):
+    """对一家提供方做一次到期检查与必要的续期，返回是否发了提醒。
+
+    单独抽出来是为了能测：「成功静默、失败才提醒」这条规则必须可验证，
+    塞在 while True 里就没法断言。
+    """
+    record, needed = renewal_needed(provider)
+    if not record or not needed:
+        return False
+    label = PROVIDERS[provider]['label']
+    if not record.get('refresh'):
+        # 没有刷新令牌就没有自动续期能力，到期后只能重新授权。
+        reason = 'no_refresh'
+    else:
+        reason = '' if renew_credential(provider) else 'failed'
+    if not reason:
+        # 续期成功：清掉告警状态并静默记一笔日志，不发消息。
+        CREDENTIAL_RENEW_WARNED[provider] = {'at': time.time(), 'reason': ''}
+        print(label + ' 令牌已自动续期，到期时间已顺延。', flush=True)
+        return False
+    last = (CREDENTIAL_RENEW_WARNED.get(provider) or {}).get('at') or 0
+    if time.time() - last < CREDENTIAL_RENEW_ALERT_GAP:
+        return False
+    CREDENTIAL_RENEW_WARNED[provider] = {'at': time.time(), 'reason': reason}
+    if reason == 'no_refresh':
+        notify(OWNER, label + ' 令牌即将到期，且没有可用于自动续期的刷新令牌，'
+                      '到期后请重新发一次「授权' + label + '」。')
+    else:
+        notify(OWNER, label + ' 令牌自动续期失败，请重新发一次「授权' + label + '」。')
+    return True
+
+
 def credential_renew_worker():
-    """后台续期。到期前静默换新令牌，失败才提醒机主重新授权。"""
+    """后台续期。到期前静默换新令牌，只有真失效了才提醒机主。
+
+    成功不发消息（2026-10-26 机主要求：刷新直接后台静默，只在失效时通知）。
+    自动续期本来就是设计上该成功的事，每天一条「已续期，无需处理」只是噪音；
+    真正需要机主动手的只有两种情况：没有刷新令牌、续期失败。
+    """
     while True:
         time.sleep(CREDENTIAL_RENEW_INTERVAL)
         for provider in ('github', 'cloudflare'):
             try:
-                record, needed = renewal_needed(provider)
-                if not record or not needed:
-                    continue
-                label = PROVIDERS[provider]['label']
-                if not record.get('refresh'):
-                    # 没有刷新令牌就没有自动续期能力，到期后只能重新授权。
-                    # 这类情况每小时提醒一次，不要刷屏。
-                    reason = 'no_refresh'
-                else:
-                    reason = '' if renew_credential(provider) else 'failed'
-                if not reason:
-                    CREDENTIAL_RENEW_WARNED[provider] = {'at': time.time(), 'reason': ''}
-                    notify(OWNER, label + ' 令牌已自动续期，到期时间已顺延，无需重新授权。')
-                    continue
-                last = (CREDENTIAL_RENEW_WARNED.get(provider) or {}).get('at') or 0
-                if time.time() - last < 3600:
-                    continue
-                CREDENTIAL_RENEW_WARNED[provider] = {'at': time.time(), 'reason': reason}
-                if reason == 'no_refresh':
-                    notify(OWNER, label + ' 令牌即将到期，且没有可用于自动续期的刷新令牌，'
-                                  '到期后请重新发一次「授权' + label + '」。')
-                else:
-                    notify(OWNER, label + ' 令牌自动续期失败，请重新发一次「授权' + label + '」。')
+                renew_check_once(provider)
             except Exception:
                 pass
 
