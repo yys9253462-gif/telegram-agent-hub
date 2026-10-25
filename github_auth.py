@@ -409,6 +409,35 @@ class LoginManager:
             return self._codex_logout()
         return self._codebuddy_logout()
 
+    def logout_target_present(self, provider):
+        """退出要动的凭据还在不在 —— 只回答「在不在」，不读内容。
+
+        用来和官方状态互相校验。官方状态有时会「假未登录」：
+        CodeBuddy 的状态是靠跑一段临时对话探的，那一段会因为超时、
+        网络抖动或模型侧排队而失败，被误判成没登录；Codex 的状态
+        也可能因为二进制缺失等环境问题读不出来。这时凭据其实还在，
+        若只信官方状态，退出会被错误地拦下。
+
+        Claude 不在此列：它没有固定凭据文件，退出走官方 auth logout，
+        官方说没登录就是不没登录。
+        """
+        if provider == 'codex':
+            return CODEX_AUTH.exists()
+        if provider == 'codebuddy':
+            folder = CODEBUDDY_AUTH_DIR
+            try:
+                for path in folder.glob('*.info'):
+                    try:
+                        data = json.loads(path.read_text(encoding='utf-8'))
+                    except (OSError, ValueError):
+                        continue
+                    if isinstance(data, dict) and (data.get('auth') or data.get('account')):
+                        return True
+            except OSError:
+                return False
+            return False
+        return False
+
     def _claude_logout(self, binary, env):
         try:
             result = subprocess.run([binary, 'auth', 'logout'], capture_output=True,
@@ -1173,12 +1202,62 @@ def claude_identity(text):
     return {'email': email, 'plan': plan.lower(), 'plan_label': plan or '订阅账号'}
 
 
+def codebuddy_identity(folder=None):
+    """从 CodeBuddy 的 *.info 里取展示身份。
+
+    只读 account 段里的展示字段（displayName / enterpriseUserName /
+    enterpriseName），**不读 auth 段**，令牌与 refresh 原文都不离开本函数。
+    实测真实文件里 account 段有 displayName=李静、enterpriseName=某企业版，
+    这些足够让机主认得出是谁在登录，不必编造邮箱（它确实没有邮箱字段）。
+
+    拿不到任何展示字段时返回 None，由调用方显示「已登录（身份未显示）」，
+    绝不把状态词当身份标签用 —— 那样会渲染出「已登录 · 已登录」这种废话。
+    """
+    root = folder or CODEBUDDY_AUTH_DIR
+    try:
+        candidates = sorted(Path(root).glob('*.info'))
+    except OSError:
+        return None
+    for path in candidates:
+        try:
+            data = json.loads(path.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        account = data.get('account')
+        if not isinstance(account, dict) or not account:
+            continue
+        name = str(account.get('displayName') or account.get('enterpriseUserName')
+                   or account.get('nickname') or '').strip()
+        org = str(account.get('enterpriseName') or '').strip()
+        # nickname 是机器生成的随机串（实测形如 mex6tjwvq4cp），
+        # 拿来当身份只会让人更糊涂，所以只在没有别的名字时才用，
+        # 而且不把它当成真名。
+        if name and name == str(account.get('nickname') or '').strip():
+            name = ''
+        if not name and not org:
+            continue
+        return {'email': '', 'name': name, 'plan': '', 'plan_label': org or '登录'}
+    return None
+
+
 def account_identity_label(identity, fallback='已登录'):
-    """身份的可读标签：优先「邮箱 · 套餐」，都没拿到才退回一句状态。"""
+    """身份的可读标签：优先「名字 · 组织」，其次「邮箱 · 套餐」。
+
+    名字（name）是 CodeBuddy 这类没有邮箱字段的执行器用的。
+    plan_label 兜底值可能是状态词（如「已登录」），必须挡掉，
+    否则会渲染成「已登录 · 已登录」。
+    """
     if not identity:
         return fallback
-    parts = [identity.get('email') or '', identity.get('plan_label') or '']
-    parts = [part for part in parts if part]
+    name = str(identity.get('name') or '').strip()
+    email = str(identity.get('email') or '').strip()
+    plan = str(identity.get('plan_label') or '').strip()
+    if plan in ('已登录', '登录', fallback):
+        plan = ''
+    who = name or email
+    parts = [part for part in (who, plan) if part]
     return ' · '.join(parts) if parts else fallback
 
 
