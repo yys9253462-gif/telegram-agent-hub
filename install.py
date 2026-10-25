@@ -99,9 +99,27 @@ def boolean(label, default=False):
         print('请输入 y、n、是或否。')
 
 
+def interactive_available():
+    """判断能否进行交互问答：需要可读的标准输入且能控制回显。"""
+    try:
+        if not sys.stdin.isatty():
+            return False
+        import termios
+        termios.tcgetattr(sys.stdin.fileno())
+        return True
+    except Exception:
+        return False
+
+
 def collect_config(old, yes=False):
     c = dict(old)
     if not yes:
+        if not interactive_available():
+            raise InstallError(
+                '当前没有可交互的终端，无法完成问答安装。\n'
+                '请在真正的终端里执行安装命令（不要用 nohup、重定向或 CI 管道），\n'
+                '或者准备好 JSON 配置后加 --yes --config /路径/config.json 无人值守安装。\n'
+                '配置模板见仓库中的 install.example.json。')
         if not old:
             welcome()
         for key, label, secret in [
