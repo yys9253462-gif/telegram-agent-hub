@@ -76,9 +76,7 @@ def menu_visible():
         return True
 
 def set_menu_visible(value):
-    temp = MENU_STATE.with_suffix('.tmp')
-    temp.write_text(json.dumps({'visible': value}))
-    temp.replace(MENU_STATE)
+    atomic_json(MENU_STATE, {'visible': value})
 
 def send(chat, text):
     text = redact(text)
@@ -116,9 +114,7 @@ def save_session(value):
         task = getattr(TASK_LOCAL, 'task', None)
         CONTROL.update_session(value, task['snapshot']['session_key'] if task else None)
         return
-    temp = SESSION_STATE.with_suffix('.tmp')
-    temp.write_text(json.dumps({'session_id': value}))
-    temp.replace(SESSION_STATE)
+    atomic_json(SESSION_STATE, {'session_id': value})
 
 MODEL_STATE = WORK / 'selected-model.json'
 MODEL_CACHE = WORK / 'model-catalog.json'
@@ -149,9 +145,7 @@ def catalog(refresh=False):
                    'tools': item.get('supports_tool_call')} for item in data['data']}.values())
     if not models:
         raise ValueError('模型列表为空')
-    temp = MODEL_CACHE.with_suffix('.tmp')
-    temp.write_text(json.dumps(models, ensure_ascii=False))
-    temp.replace(MODEL_CACHE)
+    atomic_json(MODEL_CACHE, models)
     return models
 
 def show_models(chat, page=0):
@@ -322,9 +316,7 @@ def quick_action(chat, text):
     elif text in ('执行策略', '/mode'):
         send_options(chat, '当前策略：' + strategy_name() + '\n均衡执行：边查边做并验收。\n深入分析：加强证据核验。\n先出方案：仅检查和规划。\n策略是模型行为指引，不是系统权限隔离。', list(STRATEGIES))
     elif text in STRATEGIES:
-        temp = STRATEGY_STATE.with_suffix('.tmp')
-        temp.write_text(json.dumps({'strategy': text}))
-        temp.replace(STRATEGY_STATE)
+        atomic_json(STRATEGY_STATE, {'strategy': text})
         send(chat, '执行策略已切换为：' + text + '\n下一条任务生效，重启后保留。')
     elif text == '更多设置':
         send_options(chat, '设置与帮助\n常用操作放在主页，其余功能集中在这里。', ['刷新模型', '工作目录', '权限状态', '任务说明'])
@@ -416,10 +408,55 @@ def render_reply(text):
         output.append('<pre>' + html.escape('\n'.join(code)) + '</pre>')
     return '\n'.join(output).strip() or '正在生成…'
 
+def split_message(text, limit=1800):
+    """按行切分长消息，尽量不切断代码围栏与行内标记。
+
+    硬按字符数切会把 **加粗** 劈成两半、把 ``` 代码块截断，渲染后既丢格式
+    又把标记符号直接暴露给用户。策略优先级：换行 > 标记边界 > 空格 > 硬切。
+    """
+    if len(text) <= limit:
+        return [text]
+    pieces = []
+    rest = text
+    while len(rest) > limit:
+        cut = rest.rfind('\n', 0, limit)
+        if cut <= limit // 2:
+            # 超长单行：退一步在行内标记的空隙处断开，避免劈开 **` 等符号。
+            for pattern in (r'\*\*', r'`'):
+                positions = [m.start() for m in re.finditer(pattern, rest[:limit]) if m.start() > limit // 2]
+                if positions:
+                    cut = positions[-1]
+                    break
+        if cut <= 0:
+            space = rest.rfind(' ', 0, limit)
+            cut = space if space > limit // 2 else limit
+        piece = rest[:cut] if rest[cut:cut + 1] == '\n' else rest[:cut]
+        pieces.append(piece)
+        rest = rest[len(piece):]
+    if rest:
+        pieces.append(rest)
+    # 逐片检查围栏是否成对；未闭合则在本片末尾补上收尾，并在下一片开头重新打开。
+    balanced = []
+    opened = None
+    for piece in pieces:
+        body = piece if opened is None else opened + '\n' + piece
+        fences = [line.lstrip()[:3] for line in body.splitlines()
+                  if line.lstrip().startswith(('```', '~~~'))]
+        state = None
+        for mark in fences:
+            state = mark if state is None else (None if mark == state else state)
+        if state is not None:
+            body = body + '\n' + state
+            opened = state
+        else:
+            opened = None
+        balanced.append(body)
+    return balanced
+
+
 def send_formatted(chat, text):
     text = redact(text)
-    for start in range(0, len(text), 1800):
-        piece = text[start:start + 1800]
+    for piece in split_message(text):
         payload = {'chat_id': chat, 'text': render_reply(piece), 'parse_mode': 'HTML',
                    'reply_markup': KEYBOARD if menu_visible() else {'remove_keyboard': True}}
         try:
@@ -572,14 +609,16 @@ def run_stream(chat, text):
             task['result'] = redact(answer[:24000])
             task['execution_error'] = process.returncode != 0 or bool((final or {}).get('is_error'))
         answer = redact(answer[:24000])
+        pieces = split_message(answer)
+        head = pieces[0] if pieces else answer
         if time.monotonic() < update_after:
+            # 上一次编辑被限流，直接按分片整段发送，避免重复编辑再被拒。
             send_formatted(chat, answer)
         else:
-            edit(answer[:1800])
-            if shown != answer[:1800]:
-                send_formatted(chat, answer)
-            elif len(answer) > 1800:
-                send_formatted(chat, answer[1800:])
+            edit(head)
+            # 首片已通过编辑消息呈现，其余分片补发；不论首片是否编辑成功都要补。
+            for piece in pieces[1:]:
+                send_formatted(chat, piece)
     finally:
         terminate_process(process)
         unbind_process(process)
@@ -589,12 +628,20 @@ class TaskCancelled(Exception):
     pass
 
 
-def atomic_json(path, value):
+def atomic_json(path, value, raw=False):
+    """原子写入 JSON；raw=True 时 value 视为已序列化的文本。
+
+    所有状态文件都走这里：显式 600 权限、fsync 落盘、排他创建临时文件。
+    散落各处的 write_text + replace 不具备这些保证，且只改一处容易漏。
+    """
     temp = path.with_suffix(path.suffix + '.' + uuid.uuid4().hex + '.tmp')
     try:
         with temp.open('x', encoding='utf-8') as handle:
             os.chmod(temp, 0o600)
-            json.dump(value, handle, ensure_ascii=False)
+            if raw:
+                handle.write(str(value))
+            else:
+                json.dump(value, handle, ensure_ascii=False)
             handle.flush()
             os.fsync(handle.fileno())
         temp.replace(path)
@@ -604,10 +651,21 @@ def atomic_json(path, value):
 
 
 def redact(value):
-    value = re.sub(r'-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?-----END [^-]*PRIVATE KEY-----', '[已隐藏私钥]', str(value))
-    value = re.sub(r'(?i)((?:api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|password|passwd|secret|密钥|密码)["\x27]?\s*[=:：]\s*["\x27]?)([^\s,;"\x27]+)', r'\1[已隐藏]', value)
+    """抹掉文本里的凭证。顺序有讲究：先处理更长、更具体的形态，
+    否则宽泛规则会先吃掉前缀，让后面的规则再也匹配不到令牌本体。"""
+    value = str(value)
+    value = re.sub(r'-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?-----END [^-]*PRIVATE KEY-----', '[已隐藏私钥]', value)
+    # URL 内嵌凭证 https://user:password@host 与数据库连接串，必须在通用规则之前处理。
+    # 密码里可能含 @，因此匹配到「最后一个 @ 之前」的全部内容。
+    value = re.sub(r'(?i)\b([a-z][a-z0-9+.-]*://)([^\s/:@]+):([^\s/]+)@', r'\1\2:[已隐藏]@', value)
+    # Bearer 必须先于 authorization 规则，否则只抹掉 "Bearer" 而令牌仍留在原地。
     value = re.sub(r'(?i)\bBearer\s+[^\s"\x27,;]+', 'Bearer [已隐藏]', value)
+    value = re.sub(r'(?i)((?:api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|password|passwd|secret|密钥|密码)["\x27]?\s*[=:：]\s*["\x27]?)([^\s,;"\x27]+)', r'\1[已隐藏]', value)
     value = re.sub(r'\b(?:sk-[A-Za-z0-9_-]{12,}|\d{6,}:[A-Za-z0-9_-]{25,})\b', '[已隐藏令牌]', value)
+    # 常见云厂商与代码托管平台的固定前缀密钥。
+    value = re.sub(r'\b(?:AKIA|ASIA)[0-9A-Z]{16}\b', '[已隐藏令牌]', value)
+    value = re.sub(r'\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b', '[已隐藏令牌]', value)
+    value = re.sub(r'\bxox[baprs]-[A-Za-z0-9-]{10,}', '[已隐藏令牌]', value)
     return value
 
 
@@ -754,9 +812,18 @@ def send_file(chat, raw_path):
         if len(content) > 45 * 1024 * 1024:
             raise MediaError('文件超过大小上限。')
     check_cancelled()
-    # 即使文件被重命名，也阻止常见私钥和认证内容外传。
-    sample = content.decode('utf-8', errors='ignore')
-    if re.search(r'-----BEGIN [^-]*PRIVATE KEY-----|(?i:api[_-]?key|access[_-]?token|refresh[_-]?token|password|passwd|secret)\s*["\x27]?\s*[:=]\s*[^\s]', sample):
+    # 即使文件被重命名，也阻止常见私钥和认证内容外传。只扫前 256KB，
+    # 凭证通常出现在文件开头，全量扫描大文件会白耗内存与时间。
+    sample = content[:256 * 1024].decode('utf-8', errors='ignore')
+    credential_patterns = (
+        r'-----BEGIN [^-]*PRIVATE KEY-----',
+        r'(?i:api[_-]?key|access[_-]?token|refresh[_-]?token|password|passwd|secret|token|credential)\s*["\x27]?\s*[:=]\s*[^\s]',
+        # URL / 连接串里内嵌的用户名密码
+        r'(?i)\b[a-z][a-z0-9+.-]*://[^\s/:@]+:[^\s/@]+@',
+        # 常见平台固定前缀的令牌
+        r'\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9]{20,}|(?:AKIA|ASIA)[0-9A-Z]{16})\b',
+    )
+    if any(re.search(pattern, sample) for pattern in credential_patterns):
         raise MediaError('文件包含疑似凭证，已阻止发送。')
     boundary = 'bridge' + uuid.uuid4().hex
     filename = re.sub(r'[^\w. -]', '_', path.name)
@@ -827,6 +894,11 @@ def generate_image(task):
 
 class TaskController:
     TERMINAL = ('completed', 'failed', 'cancelled', 'interrupted')
+    # 已结束任务只保留最近这么多条。每条 result 最多 24000 字符，
+    # 不设上限时状态文件会随使用无限增长，而每次 persist 都要全量重写。
+    KEEP_FINISHED = 200
+    # 落盘用的结果截断长度，远小于内存中的 24000，避免状态文件虚胖。
+    DISK_RESULT_CHARS = 4000
 
     def __init__(self, root):
         self.root = Path(root)
@@ -849,23 +921,92 @@ class TaskController:
             key = uuid.uuid4().hex[:12]
             self.data = {'tasks': [], 'sessions': {key: {'name': '默认会话', 'session_id': legacy}},
                          'active_session': key, 'target': '本机', 'favorites': [], 'seen': []}
+        self._normalize()
         self.target = self.data.get('target', '本机')
         self.seen = set(self.data.get('seen', []))
         for task in self.data['tasks']:
-            if task['status'] == 'running':
+            if task.get('status') == 'running':
                 task.update(status='interrupted', finished=time.time(), result='桥接进程重启，任务已中断；不会自动重放。已发生的操作请人工核对。')
         self.persist()
 
+    def _normalize(self):
+        """补齐缺失字段。状态文件可能被老版本或人工编辑改坏，
+        缺一个键就让 snapshot() 抛 KeyError，会让机器人彻底无法接任务。"""
+        data = self.data
+        if not isinstance(data.get('tasks'), list):
+            data['tasks'] = []
+        if not isinstance(data.get('sessions'), dict) or not data['sessions']:
+            data['sessions'] = {uuid.uuid4().hex[:12]: {'name': '默认会话', 'session_id': None}}
+        for key, session in list(data['sessions'].items()):
+            if not isinstance(session, dict):
+                data['sessions'][key] = {'name': '会话 ' + str(key), 'session_id': None}
+                continue
+            session.setdefault('name', '会话 ' + str(key))
+            session.setdefault('session_id', None)
+            if not isinstance(session.get('engine_sessions'), dict):
+                session['engine_sessions'] = {}
+        if data.get('active_session') not in data['sessions']:
+            data['active_session'] = next(iter(data['sessions']))
+        if not isinstance(data.get('favorites'), list):
+            data['favorites'] = []
+        if not isinstance(data.get('seen'), list):
+            data['seen'] = []
+        kept = []
+        for task in data['tasks']:
+            if not isinstance(task, dict) or 'id' not in task:
+                continue
+            task.setdefault('status', 'interrupted')
+            task.setdefault('kind', 'agent')
+            task.setdefault('text', '')
+            task.setdefault('payload', {})
+            task.setdefault('created', time.time())
+            task.setdefault('tools', [])
+            task.setdefault('result', '')
+            task.setdefault('chat', 0)
+            snapshot = task.get('snapshot')
+            if not isinstance(snapshot, dict):
+                snapshot = {}
+            snapshot.setdefault('session_key', data['active_session'])
+            snapshot.setdefault('model', os.environ.get('ANTHROPIC_MODEL', 'auto'))
+            snapshot.setdefault('target', data.get('target', '本机'))
+            snapshot.setdefault('strategy', '均衡执行')
+            snapshot.setdefault('engine', 'claude')
+            snapshot.setdefault('session_id', data['sessions'][snapshot['session_key']].get('session_id'))
+            if snapshot['session_key'] not in data['sessions']:
+                snapshot['session_key'] = data['active_session']
+            task['snapshot'] = snapshot
+            kept.append(task)
+        data['tasks'] = kept
+
+    def _prune(self):
+        """丢弃过多的已结束任务，只保留最近 KEEP_FINISHED 条。调用方须持锁。"""
+        finished = [index for index, task in enumerate(self.data['tasks'])
+                    if task['status'] in self.TERMINAL]
+        excess = len(finished) - self.KEEP_FINISHED
+        if excess <= 0:
+            return
+        # 按时间顺序丢弃最早的，不能依赖列表下标（运行中任务会穿插其中）。
+        for index in set(finished[:excess]):
+            self.data['tasks'][index] = None
+        self.data['tasks'] = [task for task in self.data['tasks'] if task is not None]
+
     def persist(self):
         with self.lock:
+            self._prune()
             self.data['target'] = self.target
             self.data['seen'] = sorted(self.seen)[-2000:]
             # 内存保留原文供执行器使用；落盘一律脱敏，避免令牌写入状态文件。
             disk = copy.deepcopy(self.data)
             for task in disk['tasks']:
-                task['text'] = redact(task.get('text', ''))
+                task['text'] = redact(task.get('text', ''))[:self.DISK_RESULT_CHARS]
                 if task.get('payload', {}).get('caption'):
-                    task['payload']['caption'] = redact(task['payload']['caption'])
+                    task['payload'] = {'caption': redact(task['payload']['caption'])}
+                else:
+                    task['payload'] = {}
+                # 内存里可能是 24000 字符，落盘只留摘要，历史仍可通过界面查看。
+                result = task.get('result', '')
+                if len(result) > self.DISK_RESULT_CHARS:
+                    task['result'] = result[:self.DISK_RESULT_CHARS] + '\n（已截断，完整结果未持久化）'
             atomic_json(self.path, disk)
 
     def active_session(self):
@@ -884,8 +1025,9 @@ class TaskController:
     def snapshot(self):
         with self.lock:
             key = self.data['active_session']
+            session = self.data['sessions'].get(key) or {}
             return {'model': current_model(), 'target': self.target, 'strategy': strategy_name(), 'engine': current_engine(),
-                    'session_key': key, 'session_id': self.data['sessions'][key]['session_id']}
+                    'session_key': key, 'session_id': session.get('session_id')}
 
     def enqueue(self, chat, text='', kind='agent', payload=None, update_id=None, snapshot=None):
         with self.condition:
@@ -1312,8 +1454,14 @@ def main():
             started = time.monotonic()
             try:
                 updates = api('getUpdates', {'offset': offset, 'timeout': 25, 'allowed_updates': ['message', 'callback_query']})
-            except Exception:
-                print('获取消息失败，稍后重试', flush=True)
+            except Exception as exc:
+                # 记录异常类型和简要原因；完整报文可能带令牌，只写类型与限长文本。
+                reason = type(exc).__name__
+                if isinstance(exc, urllib.error.HTTPError):
+                    reason += ' ' + str(exc.code)
+                elif isinstance(exc, OSError) and exc.strerror:
+                    reason += ' ' + exc.strerror[:60]
+                print('获取消息失败（' + reason + '），稍后重试', flush=True)
                 time.sleep(3)
                 continue
             # 正常长轮询至少要挂起一段时间。若上游立刻返回空结果（网关异常、
@@ -1334,9 +1482,7 @@ def main():
                     if not isinstance(exc, MediaError):
                         break
                 offset = update['update_id'] + 1
-                temp = STATE.with_suffix('.tmp')
-                temp.write_text(str(offset))
-                temp.replace(STATE)
+                atomic_json(STATE, str(offset), raw=True)
     except KeyboardInterrupt:
         with CONTROL.condition:
             CONTROL.closing = True
