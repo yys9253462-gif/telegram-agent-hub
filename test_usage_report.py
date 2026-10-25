@@ -80,6 +80,20 @@ class UsageParseTests(unittest.TestCase):
         self.assertEqual(windows[1]['resets_at'], 1793519304)
         # 用满时剩余必须是 0，不能因为 100 看着像「满格」就显示成 100%。
         self.assertEqual(gh.usage_remaining(windows[0]), 0.0)
+        # 服务端已明确拒绝时要标「额度已用尽」，否则机主会以为还能凑合跑。
+        self.assertTrue(windows[0]['limit_reached'])
+        self.assertFalse(windows[1]['limit_reached'])
+
+    def test_codex_not_limited_has_no_exhausted_wording(self):
+        payload = {'rate_limit': {'limit_reached': False,
+                                  'primary_window': {'used_percent': 40,
+                                                     'limit_window_seconds': 18000,
+                                                     'reset_at': 1792953411}}}
+        windows = gh.usage_parse_codex(payload)
+        self.assertFalse(windows[0]['limit_reached'])
+        line = gh.usage_line(windows[0], now=1792950300)
+        self.assertNotIn('用尽', line)
+        self.assertIn('剩余 60%', line)
 
     def test_codex_label_follows_window_minutes_not_slot(self):
         # 服务端会把 5 小时窗口放在 primary 或 secondary，按位置写死标签迟早标错。

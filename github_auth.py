@@ -646,11 +646,12 @@ def _usage_reset(value):
     return int(parsed.timestamp())
 
 
-def usage_window(key, label, percent, reset):
+def usage_window(key, label, percent, reset, reached=False):
     """构造一个窗口读数；字段名固定，调用方不必记住来源差异。"""
     return {'key': key, 'label': label,
             'used_percent': _usage_percent(percent),
-            'resets_at': _usage_reset(reset)}
+            'resets_at': _usage_reset(reset),
+            'limit_reached': bool(reached)}
 
 
 def usage_parse_claude(payload):
@@ -721,6 +722,9 @@ def usage_parse_codex(payload):
     if block is None:
         block = payload
     windows = []
+    # limit_reached 是整份响应的结论（服务端拒绝调用），不是单窗口的；
+    # 照实传给「谁已经用满」的那个窗口，让展示能明确说「额度已用尽」。
+    reached = bool(block.get('limit_reached'))
     for slot, fallback in (('primary', '5小时'), ('secondary', '7天')):
         item = block.get(slot) or block.get(slot + '_window')
         if not isinstance(item, dict):
@@ -745,7 +749,8 @@ def usage_parse_codex(payload):
                     reset = time.time() + float(reset)
                 except (TypeError, ValueError):
                     reset = None
-        reading = usage_window(str(slot), label, item.get('used_percent'), reset)
+        reading = usage_window(str(slot), label, item.get('used_percent'), reset,
+                               reached and (item.get('used_percent') or 0) >= 99)
         if reading['used_percent'] is None and reading['resets_at'] is None:
             continue
         windows.append(reading)
@@ -826,6 +831,12 @@ def usage_line(item, now=None):
         return ''
     text = item.get('label', '窗口') + ' 剩余 ' + usage_percent_text(usage_remaining(item))
     left = usage_format_reset(item.get('resets_at'), now)
+    if item.get('limit_reached'):
+        # 服务端已经明确拒绝（limit_reached=true）时，光写「剩余 0%」不够，
+        # 机主会以为还能凑合跑，实际发任务会直接被拒。
+        if left and left != '已到刷新点':
+            return text + '（额度已用尽，' + left + '后恢复）'
+        return text + '（额度已用尽）'
     if left == '已到刷新点':
         return text + '（已到刷新点，重新拉取即可看到新窗口）'
     if left:
