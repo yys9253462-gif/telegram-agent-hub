@@ -1,0 +1,14 @@
+{
+  "telegram_bot_token": "123456:FAKE_FORMAT_EXAMPLE_ONLY",
+  "telegram_owner_id": "123456",
+  "chat_base_url": "https://gateway.example.com",
+  "chat_api_key": "FAKE_FORMAT_EXAMPLE_ONLY",
+  "default_model": "your-model-id",
+  "enable_claude": true,
+  "enable_codebuddy": true,
+  "voice_enabled": true,
+  "image_enabled": false,
+  "remote_enabled": false,
+  "sudo_nopasswd": false,
+  "local_label": "本机"
+}
