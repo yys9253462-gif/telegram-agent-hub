@@ -22,6 +22,14 @@ OFFICIAL_INSTALLERS = {
     'claude': 'https://claude.ai/install.sh',
     'codebuddy': 'https://www.codebuddy.cn/cli/install.sh',
 }
+# Codex 官方只发 npm 包，没有可校验哈希的安装脚本，所以走单独的 npm 安装路径。
+# 版本钉死：npm 的 latest 标签随时可能变，回归时排查不到是代码还是上游变的问题。
+CODEX_PACKAGE = '@openai/codex'
+CODEX_VERSION = '0.164.0'
+APT_DEPENDENCIES = ['python3', 'python3-venv', 'python3-pip', 'ca-certificates', 'curl', 'git',
+                    'openssh-client', 'sudo', 'ffmpeg', 'util-linux']
+# 执行器顺序即机器人菜单里的顺序，也是 ENABLED_AGENTS 的排列依据；首个启用项成为默认执行器。
+ENGINES_ORDER = ('claude', 'codebuddy', 'codex')
 # 官方脚本变动时拒绝执行，由维护者重新审阅并更新哈希。
 INSTALLER_SHA256 = {
     'claude': '3a68d3406cf674e17bed1733a4dcf37805e2e47d87417700007d7e1aa766a944',
@@ -132,6 +140,7 @@ def collect_config(old, yes=False):
             c[key] = ask(label, c.get(key, ''), secret)
         c['enable_claude'] = boolean('启用 Claude Code', c.get('enable_claude', True))
         c['enable_codebuddy'] = boolean('启用 CodeBuddy Code', c.get('enable_codebuddy', True))
+        c['enable_codex'] = boolean('启用 Codex CLI（走 npm，需要能访问 npm registry）', c.get('enable_codex', False))
         c['voice_enabled'] = boolean('启用语音转写（下载 faster-whisper tiny 模型）', c.get('voice_enabled', True))
         c['image_enabled'] = boolean('配置图片生成', c.get('image_enabled', False))
         if c['image_enabled']:
@@ -148,7 +157,9 @@ def collect_config(old, yes=False):
         c['memory_bundle'] = ask('可选私有记忆技能包路径（不迁移则留空）', c.get('memory_bundle', ''))
     for key in ('enable_claude', 'enable_codebuddy', 'voice_enabled'):
         c.setdefault(key, True)
-    for key in ('image_enabled', 'remote_enabled', 'sudo_nopasswd'):
+    for key in ('image_enabled', 'remote_enabled', 'sudo_nopasswd', 'enable_codex'):
+        # 前三个是「高风险默认关」，enable_codex 是「新增组件默认关」：Codex 走 npm 装系统级包，
+        # 老用户升级时不该因为多了一个字段就被动多装一个执行器。两种理由不同，结论一致。
         c.setdefault(key, False)
     c.setdefault('default_model', 'auto')
     c.setdefault('local_label', '本机')
@@ -164,10 +175,11 @@ def validate_config(c):
         raise InstallError('Telegram bot token 格式无效')
     if not re.fullmatch(r'[1-9][0-9]*', str(c['telegram_owner_id'])):
         raise InstallError('owner ID 必须是正整数')
-    for key in ('enable_claude', 'enable_codebuddy', 'voice_enabled', 'image_enabled', 'remote_enabled', 'sudo_nopasswd'):
+    for key in ('enable_claude', 'enable_codebuddy', 'enable_codex', 'voice_enabled', 'image_enabled', 'remote_enabled', 'sudo_nopasswd'):
         if not isinstance(c.get(key), bool):
             raise InstallError('配置字段必须是布尔值：' + key)
-    if not c['enable_claude'] and not c['enable_codebuddy']:
+    engines = [name for name in ENGINES_ORDER if c.get('enable_' + name)]
+    if not engines:
         raise InstallError('至少启用一个智能体')
     base = validate_url(c['chat_base_url'])
     c['chat_base_url'] = base[:-3] if base.endswith('/v1') else base
@@ -224,7 +236,7 @@ def json_text(value):
 
 
 def runtime_environment(c, home):
-    engines = [name for name in ('claude', 'codebuddy') if c['enable_' + name]]
+    engines = [name for name in ENGINES_ORDER if c['enable_' + name]]
     values = {
         'HOME': str(home), 'AGENT_HOME': str(home), 'APP_DIR': str(APP), 'CONFIG_DIR': str(CONFIG),
         'PATH': str(home / '.local/bin') + ':' + str(APP / '.venv/bin') + ':/usr/local/bin:/usr/bin:/bin',
@@ -324,6 +336,71 @@ def install_cli(name, user, home):
         target.unlink(missing_ok=True)
 
 
+def ensure_node_runtime():
+    """Codex CLI 需要 node/npm。
+
+    apt 的 nodejs 包在 Debian 12 上是 18.x、Ubuntu 22.04 上是 12.x 起，都低于 Codex 要求的
+    最低版本，所以 apt 那条路只当兜底；真正可靠的是 NodeSource 的 22.x 源。
+    这里显式检查大版本，不合格就直接换源，不靠「装上了就算成功」。
+    """
+    if shutil.which('npm') and shutil.which('node'):
+        version = subprocess.run(['node', '--version'], text=True, stdout=subprocess.PIPE,
+                                 stderr=subprocess.DEVNULL).stdout.strip()
+        match = re.fullmatch(r'v(\d+)\.', version + '.')
+        if match and int(match.group(1)) >= 20:
+            return
+    # NodeSource 安装脚本同样先下载再执行；它只负责配源，包本身仍走 apt 的签名校验。
+    run(['apt-get', 'install', '-y', 'ca-certificates', 'curl', 'gnupg'], quiet=True)
+    run(['bash', '-c', 'curl -fsSL https://deb.nodesource.com/setup_22.x | bash -'], quiet=True)
+    run(['apt-get', 'install', '-y', 'nodejs'], quiet=True)
+    if not (shutil.which('npm') and shutil.which('node')):
+        raise InstallError('Node.js 安装失败，无法继续安装 Codex CLI')
+
+
+def install_codex_cli():
+    """用 npm 安装 Codex CLI。
+
+    这条路和 Claude/CodeBuddy 的「下载官方脚本 + 校验 SHA256」不是一回事：Codex 没有安装脚本，
+    只有 npm 包。所以这里不假装有哈希校验，改成三件事守住边界：
+    版本钉死、包名固定、装完立刻用 --version 自检。
+    """
+    if not shutil.which('node') or not shutil.which('npm'):
+        raise InstallError('未找到 node/npm，无法安装 Codex CLI（启用 Codex 时安装器会自动配置 Node.js）')
+    # 以 root 装到系统级 node_modules，机器人用户直接可用，不依赖它自己的 npm 前缀。
+    run(['npm', 'install', '-g', '--no-fund', '--no-audit', CODEX_PACKAGE + '@' + CODEX_VERSION], quiet=True)
+    if not shutil.which('codex'):
+        raise InstallError('npm 安装完成但未找到 codex 命令，请检查 npm 全局 bin 目录是否在 PATH 中')
+    # 版本自检：确认装上的确实是钉死的那个版本，而不是镜像源上的其它构建。
+    actual = run(['codex', '--version'], capture=True).strip()
+    if CODEX_VERSION not in actual:
+        raise InstallError('Codex 版本不符，期望 ' + CODEX_VERSION + '，实际 ' + (actual or '无输出'))
+
+
+def codex_config_text(base_url, model):
+    """生成 Codex 的 provider 配置。
+
+    base_url 必须写到 /v1（不能写 /v1/responses），wire_api 用 responses；
+    requires_openai_auth 关掉，否则 Codex 会坚持走 ChatGPT 账号登录而不是 API key。
+    凭据不落在这个文件里，运行时由 bot.env 的 OPENAI_API_KEY 提供。
+    """
+    base = base_url.rstrip('/')
+    if not base.endswith('/v1'):
+        base += '/v1'
+    return (
+        '# Codex 指向安装时填写的模型网关。\n'
+        '# 凭据由 systemd EnvironmentFile 注入 OPENAI_API_KEY，不写在这里。\n'
+        'model = ' + json.dumps(str(model)) + '\n'
+        'model_provider = "gateway"\n'
+        '\n'
+        '[model_providers.gateway]\n'
+        'name = "Model Gateway"\n'
+        'base_url = ' + json.dumps(base) + '\n'
+        'wire_api = "responses"\n'
+        'env_key = "OPENAI_API_KEY"\n'
+        'requires_openai_auth = false\n'
+    )
+
+
 def configure_ssh(c, user, home, uid, gid, yes):
     if not c['remote_enabled']:
         return
@@ -415,7 +492,7 @@ def shared_memory(source, home, uid, gid):
     skills = memory / 'skills'
     skills.mkdir(exist_ok=True)
     os.chown(skills, uid, gid)
-    for agent in ('.claude', '.codebuddy'):
+    for agent in ('.claude', '.codebuddy', '.codex'):
         folder = home / agent
         folder.mkdir(mode=0o700, exist_ok=True)
         os.chown(folder, uid, gid)
@@ -425,8 +502,9 @@ def shared_memory(source, home, uid, gid):
     instructions = memory / 'AGENTS.md'
     if not instructions.exists():
         atomic_write(instructions, '所有任务在授权范围内执行；共享记忆位于 ' + str(memory) + '。\n', 0o600, uid, gid)
+    # Codex 读的是 AGENTS.md，Claude/CodeBuddy 读各自命名的文件，三个都指向同一份共享记忆。
     for directory in (home, home / 'tasks'):
-        for name in ('CLAUDE.md', 'CODEBUDDY.md'):
+        for name in ('CLAUDE.md', 'CODEBUDDY.md', 'AGENTS.md'):
             link = directory / name
             if not link.exists() and not link.is_symlink():
                 link.symlink_to(instructions)
@@ -471,8 +549,11 @@ def install(args, c):
     source = Path(__file__).resolve().parent
     unit = Path('/etc/systemd/system') / (args.service_name + '.service')
     if not args.no_deps:
+        dependencies = list(APT_DEPENDENCIES)
         run(['apt-get', 'update'], quiet=True)
-        run(['apt-get', 'install', '-y', 'python3', 'python3-venv', 'python3-pip', 'ca-certificates', 'curl', 'git', 'openssh-client', 'sudo', 'ffmpeg', 'util-linux'], quiet=True)
+        run(['apt-get', 'install', '-y'] + dependencies, quiet=True)
+        if c['enable_codex']:
+            ensure_node_runtime()
     try:
         account = pwd.getpwnam(user)
         if account.pw_uid == 0 or Path(account.pw_dir) != home:
@@ -490,7 +571,7 @@ def install(args, c):
     os.chown(CONFIG, 0, gid)
     backup = CONFIG / ('backup-' + time.strftime('%Y%m%d-%H%M%S') + '-' + str(os.getpid()))
     backup.mkdir(mode=0o700)
-    tracked = [unit, CONFIG / 'bot.env', CONFIG / 'config.json', CONFIG / 'image.json', home / '.codebuddy/models.json', home / '.claude/settings.json', home / '.ssh/config', home / '.ssh/known_hosts', home / '.ssh/telegram-agent-ed25519', Path('/etc/sudoers.d') / args.service_name]
+    tracked = [unit, CONFIG / 'bot.env', CONFIG / 'config.json', CONFIG / 'image.json', home / '.codebuddy/models.json', home / '.claude/settings.json', home / '.codex/config.toml', home / '.ssh/config', home / '.ssh/known_hosts', home / '.ssh/telegram-agent-ed25519', Path('/etc/sudoers.d') / args.service_name]
     tracked += [APP / p.name for p in source.glob('*.py')]
     saved = []
     for index, path in enumerate(tracked):
@@ -505,8 +586,13 @@ def install(args, c):
     was_enabled = subprocess.run(['systemctl', 'is-enabled', '--quiet', args.service_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
     try:
         models = gateway_models(c) if c['enable_codebuddy'] else None
-        for name in ('claude', 'codebuddy'):
-            if c['enable_' + name]:
+        for name in ENGINES_ORDER:
+            if not c['enable_' + name]:
+                continue
+            # Codex 没有官方安装脚本，走 npm；另两个走带哈希校验的官方脚本。
+            if name == 'codex':
+                install_codex_cli()
+            else:
                 install_cli(name, user, home)
         if was_active:
             run(['systemctl', 'stop', args.service_name], quiet=True)
@@ -535,6 +621,8 @@ def install(args, c):
         if models:
             atomic_write(home / '.codebuddy/models.json', json_text(models), 0o600, uid, gid)
         atomic_write(home / '.claude/settings.json', json_text({'env': {'ANTHROPIC_BASE_URL': c['chat_base_url'], 'ANTHROPIC_API_KEY': c['chat_api_key'], 'ANTHROPIC_MODEL': c['default_model'], 'DISABLE_AUTOUPDATER': '1'}}), 0o600, uid, gid)
+        if c['enable_codex']:
+            atomic_write(home / '.codex/config.toml', codex_config_text(c['chat_base_url'], c['default_model']), 0o600, uid, gid)
         sudo_path = Path('/etc/sudoers.d') / args.service_name
         if c['sudo_nopasswd']:
             atomic_write(sudo_path, user + ' ALL=(ALL) NOPASSWD: ALL\n', 0o440)
@@ -640,7 +728,7 @@ def main(argv=None):
         print('隔离测试模式：Telegram 请求发送至本机假 API，禁止用于正式部署。')
     if args.dry_run:
         print(json_text({'app_dir': str(APP), 'config_dir': str(CONFIG), 'user': args.user, 'service': args.service_name,
-                         'agents': [n for n in ('claude', 'codebuddy') if c['enable_' + n]],
+                         'agents': [n for n in ENGINES_ORDER if c['enable_' + n]],
                          'voice_enabled': c['voice_enabled'], 'remote_enabled': c['remote_enabled'],
                          'sudo_nopasswd': c['sudo_nopasswd'], 'apt_dependencies': not args.no_deps}))
         return 0

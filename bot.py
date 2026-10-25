@@ -745,8 +745,10 @@ def engine_command(engine, text, instructions, chat, environment):
         # 这里按需映射一份，不动全局环境，避免影响 Claude 渠道。
         if not environment.get('OPENAI_API_KEY') and environment.get('ANTHROPIC_API_KEY'):
             environment['OPENAI_API_KEY'] = environment['ANTHROPIC_API_KEY']
-        if environment.get('ANTHROPIC_BASE_URL') and not os.environ.get('OPENAI_BASE_URL'):
-            environment['OPENAI_BASE_URL'] = environment['ANTHROPIC_BASE_URL'] + '/v1'
+        if environment.get('ANTHROPIC_BASE_URL') and not environment.get('OPENAI_BASE_URL'):
+            # 判断依据必须是传进来的 environment，不是进程全局环境：否则运维在配置里
+            # 显式指定的 OPENAI_BASE_URL 会被网关地址覆盖，Codex 指不到自己想要的地址。
+            environment['OPENAI_BASE_URL'] = environment['ANTHROPIC_BASE_URL'].rstrip('/') + '/v1'
         command += ['exec', '--json', '--skip-git-repo-check',
                     '--sandbox', 'danger-full-access', '--cd', str(WORK)]
         if current_model():

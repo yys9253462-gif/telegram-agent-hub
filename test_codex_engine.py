@@ -185,6 +185,72 @@ class CodexEventParseTest(unittest.TestCase):
         self.assertEqual(state['failed'], '')
 
 
+class CodexEnvironmentMappingTest(unittest.TestCase):
+    """Codex 只认 OPENAI_* 变量，本站凭据存在 ANTHROPIC_* 下。
+
+    这一段做过真实对照实验：只映射 KEY 恰好也能跑通，因为本站网关同时是 OpenAI 兼容端点；
+    但换成只对别的域名开放 OpenAI 协议的网关就会静默打到官方地址。所以两条映射都必须有。
+    这里真实调用 engine_command，验证 environment 字典的最终内容。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('botmod_env_test', Path(__file__).with_name('bot.py'))
+        module = importlib.util.module_from_spec(spec)
+        os.environ.setdefault('TELEGRAM_BOT_TOKEN', 'TEST-ONLY-0000')
+        os.environ.setdefault('CLAUDE_BOT_WORKDIR', '.testwork')
+        try:
+            spec.loader.exec_module(module)
+        except SystemExit:
+            raise unittest.SkipTest('bot.py 在导入期退出，跳过环境映射测试')
+        cls.module = module
+
+    def build(self, environment):
+        # 关掉会话续接与模型覆盖，让命令只受 environment 影响。
+        original_session, original_model = self.module.session_id, self.module.current_model
+        self.module.session_id = lambda: None
+        self.module.current_model = lambda: ''
+        try:
+            command, prompt = self.module.engine_command('codex', '任务正文', '指令', 1, environment)
+        finally:
+            self.module.session_id, self.module.current_model = original_session, original_model
+        return command, prompt, environment
+
+    def test_api_key_is_mapped(self):
+        env = {'ANTHROPIC_API_KEY': 'FAKE-TEST-KEY'}
+        self.build(env)
+        self.assertEqual(env.get('OPENAI_API_KEY'), 'FAKE-TEST-KEY',
+                         'codex 只读 OPENAI_API_KEY，缺映射就等于没凭据')
+
+    def test_base_url_is_mapped_with_v1(self):
+        env = {'ANTHROPIC_BASE_URL': 'https://gateway.example.com', 'ANTHROPIC_API_KEY': 'FAKE'}
+        self.build(env)
+        self.assertEqual(env.get('OPENAI_BASE_URL'), 'https://gateway.example.com/v1',
+                         '网关地址也必须映射，否则 codex 会退回官方 endpoint')
+
+    def test_base_url_does_not_double_slash(self):
+        env = {'ANTHROPIC_BASE_URL': 'https://gateway.example.com/'}
+        self.build(env)
+        self.assertNotIn('//v1', env.get('OPENAI_BASE_URL', ''), '末尾斜杠要归一，不能拼成 //v1')
+
+    def test_existing_openai_vars_win(self):
+        """运维显式配了 OPENAI_* 时不能被覆盖，否则无法把 Codex 指到别的网关。"""
+        env = {'ANTHROPIC_API_KEY': 'FAKE-A', 'ANTHROPIC_BASE_URL': 'https://a.example.com',
+               'OPENAI_API_KEY': 'FAKE-O', 'OPENAI_BASE_URL': 'https://b.example.com/v1'}
+        self.build(env)
+        self.assertEqual(env['OPENAI_API_KEY'], 'FAKE-O')
+        self.assertEqual(env['OPENAI_BASE_URL'], 'https://b.example.com/v1')
+
+    def test_command_uses_mapped_environment(self):
+        env = {'ANTHROPIC_API_KEY': 'FAKE-TEST-KEY', 'ANTHROPIC_BASE_URL': 'https://gateway.example.com'}
+        command, prompt, _ = self.build(env)
+        self.assertEqual(command[0].split('/')[-1], 'codex')
+        self.assertEqual(command[1], 'exec')
+        self.assertIn('指令', prompt)
+        self.assertIn('任务正文', prompt)
+
+
 class FailureJudgementTest(unittest.TestCase):
     def test_failed_state_counts_as_error(self):
         """turn.failed 时退出码可能仍是 0，必须把 state 的失败标记算进来。
