@@ -1309,12 +1309,20 @@ def main():
     signal.signal(signal.SIGTERM, shutdown)
     try:
         while True:
+            started = time.monotonic()
             try:
                 updates = api('getUpdates', {'offset': offset, 'timeout': 25, 'allowed_updates': ['message', 'callback_query']})
             except Exception:
                 print('获取消息失败，稍后重试', flush=True)
                 time.sleep(3)
                 continue
+            # 正常长轮询至少要挂起一段时间。若上游立刻返回空结果（网关异常、
+            # 代理伪装成接口等），本循环会毫无间隔地空转并吃满一个核，
+            # 这里补一个下限，保证任何情况下都不会变成忙等。
+            if not updates:
+                elapsed = time.monotonic() - started
+                if elapsed < 1.0:
+                    time.sleep(1.0 - elapsed)
             for update in updates:
                 try:
                     handle_update(update)
