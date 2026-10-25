@@ -634,10 +634,13 @@ def subscription_identity(engine):
             return identity
         return {'email': '', 'plan': '', 'plan_label': '订阅账号'} if claude_oauth_token() else None
     if engine == 'codebuddy':
-        # CodeBuddy 没有身份查询命令，也没有稳定的凭据文件位置。
-        # 只能确认「已登录」，不编造邮箱。
+        # CodeBuddy 没有身份查询命令。凭据文件里 account 段有展示名与企业名，
+        # 取到就用，取不到只报「已登录」，不编造邮箱。
+        identity = github_auth.codebuddy_identity()
+        if identity:
+            return identity
         ok, _ = account_authorized('codebuddy')
-        return {'email': '', 'plan': '', 'plan_label': '已登录'} if ok else None
+        return {'email': '', 'name': '', 'plan': '', 'plan_label': '已登录'} if ok else None
     return None
 
 
@@ -3405,8 +3408,13 @@ class TaskController:
             label = engine_spec(engine)['label']
             # 退出前先确认它确实登录着，否则「退出成功」只会让机主误以为
             # 自己刚删掉了一份并不存在的凭据。
+            #
+            # 但判据不能只看官方状态：CodeBuddy 的状态靠跑一段临时对话来探，
+            # 那一段会因为超时或网络抖动失败，把「探测没成功」误判成「没登录」，
+            # 于是凭据明明还在，退出却被拦下来。所以官方说没登录时，
+            # 再看一眼退出要动的凭据文件在不在 —— 在，就允许退出。
             ok, detail = account_authorized(engine)
-            if not ok:
+            if not ok and not CLI_LOGINS.logout_target_present(engine):
                 raise MediaError(label + ' 当前没有确认的账号登录（' + detail.strip()
                                  + '），不需要退出。')
             result = CLI_LOGINS.logout(engine, engine_binary(engine),

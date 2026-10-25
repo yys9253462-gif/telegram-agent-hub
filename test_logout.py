@@ -221,6 +221,8 @@ class ChannelAfterLogoutTest(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.sent = []
+        self.codex_auth = self.root / '.codex' / 'auth.json'
+        self.cb_dir = self.root / 'codebuddy-auth'
         self.controller = bot.TaskController(self.root)
         self.patches = [
             patch.object(bot, 'CONTROL', self.controller),
@@ -231,6 +233,12 @@ class ChannelAfterLogoutTest(unittest.TestCase):
                 or {'message_id': 1}),
             patch.object(bot, 'AUTH_STATE', self.root / 'auth-channel.json'),
             patch.object(bot, 'WORK', self.root),
+            # 🔴 凭据路径必须一起重定向。退出流程会检查「凭据文件在不在」，
+            # 不 patch 就会读到本机真实的 ~/.codex/auth.json 并把它删掉
+            # （2026-10-26 真实踩过：test_logout_when_not_logged_in_is_refused
+            # 删掉了开发机的 codex 登录凭据，靠 .logout-*.bak 备份才恢复）。
+            patch.object(github_auth, 'CODEX_AUTH', self.codex_auth),
+            patch.object(github_auth, 'CODEBUDDY_AUTH_DIR', self.cb_dir),
             patch.dict(bot.os.environ, {'ENABLED_AGENTS': 'claude,codebuddy,codex'}, clear=False),
         ]
         for item in self.patches:
@@ -298,6 +306,30 @@ class ChannelAfterLogoutTest(unittest.TestCase):
         replies = self.press('退出账号 不存在的执行器')
         self.assertTrue(any('未知执行器' in text for text in replies), replies)
 
+    def test_stale_status_does_not_block_logout_when_credential_exists(self):
+        """官方状态「假未登录」时，凭据还在就该允许退出。
+
+        CodeBuddy 的状态靠跑一段临时对话来探，那一段会因为超时或网络抖动
+        失败，被误判成没登录。这时若只信官方状态，凭据明明还在却退不掉。
+        """
+        path = make_codebuddy_auth(self.cb_dir)
+        self.assertTrue(path.exists())
+        with patch.object(bot, 'account_authorized', return_value=(False, '尚未登录或无法确认官方登录状态。')), \
+             patch.object(bot.CLI_LOGINS, 'logout_target_present', return_value=True, create=True), \
+             patch.object(bot.CLI_LOGINS, 'logout', return_value={'ok': True, 'state': 'logged_out', 'removed': '已清空'}) as logout:
+            replies = self.press('退出账号 codebuddy')
+        self.assertTrue(logout.called, '凭据还在却拒绝退出：' + '\n'.join(replies))
+        self.assertFalse(any('没有确认的账号登录' in text for text in replies), replies)
+
+    def test_no_credential_and_no_status_is_refused(self):
+        """两边都没有凭据时仍应拒绝，别给一个假的「已退出」。"""
+        with patch.object(bot, 'account_authorized', return_value=(False, '尚未登录。')), \
+             patch.object(bot.CLI_LOGINS, 'logout_target_present', return_value=False, create=True), \
+             patch.object(bot.CLI_LOGINS, 'logout', return_value={'ok': True, 'state': 'logged_out', 'removed': ''}) as logout:
+            replies = self.press('退出账号 codebuddy')
+        self.assertFalse(logout.called, '什么都没登录却执行了退出')
+        self.assertTrue(any('没有确认的账号登录' in text for text in replies), replies)
+
     def test_logout_message_warns_about_gateway_switch(self):
         bot.set_auth_channel('account', 'codex')
         with patch.object(bot, 'account_authorized', return_value=(True, '已登录。')), \
@@ -307,6 +339,187 @@ class ChannelAfterLogoutTest(unittest.TestCase):
         self.assertIn('接口密钥', joined)
         self.assertIn('已删除 x', joined)
 
+
+class LogoutTargetPresentTest(LogoutBase):
+    """logout_target_present 只回答「凭据在不在」，不读内容、不改文件。"""
+
+    def test_codex_true_when_auth_file_exists(self):
+        make_codex_auth(self.codex_auth)
+        self.assertTrue(self.manager.logout_target_present('codex'))
+
+    def test_codex_false_when_missing(self):
+        self.assertFalse(self.manager.logout_target_present('codex'))
+
+    def test_codebuddy_true_when_auth_section_present(self):
+        make_codebuddy_auth(self.cb_dir)
+        self.assertTrue(self.manager.logout_target_present('codebuddy'))
+
+    def test_codebuddy_false_after_logout(self):
+        make_codebuddy_auth(self.cb_dir)
+        self.manager.logout('codebuddy', 'codebuddy', {})
+        self.assertFalse(self.manager.logout_target_present('codebuddy'),
+                         '退出后仍认为有凭据，会导致重复退出')
+
+    def test_codebuddy_false_when_file_has_no_auth_section(self):
+        self.cb_dir.mkdir(parents=True, exist_ok=True)
+        (self.cb_dir / 'other.info').write_text(json.dumps({'other': {'keep': 'me'}}), encoding='utf-8')
+        self.assertFalse(self.manager.logout_target_present('codebuddy'))
+
+    def test_claude_has_no_fixed_credential_file(self):
+        """Claude 走官方命令，没有固定凭据文件可查。"""
+        self.assertFalse(self.manager.logout_target_present('claude'))
+
+    def test_unknown_provider_is_false(self):
+        self.assertFalse(self.manager.logout_target_present('nobody'))
+
+
+class IdentityLabelTest(LogoutBase):
+    """身份标签不能把状态词当身份，否则菜单会渲染成「已登录 · 已登录」。"""
+
+    def test_status_word_is_not_used_as_plan(self):
+        label = github_auth.account_identity_label(
+            {'email': '', 'name': '', 'plan_label': '已登录'})
+        self.assertEqual(label, '已登录', '渲染出了重复的状态词')
+
+    def test_label_has_no_duplicate_segments(self):
+        """「已登录 · 已登录」这种废话标签，逐段检查才能抓住。
+
+        只断言整串等值不够：兜底值本身就叫「已登录」，两者撞在一起时
+        整串看起来还是对的。必须拆开看有没有重复段。
+        """
+        cases = [
+            {'email': '', 'name': '', 'plan_label': '已登录'},
+            {'email': '', 'name': '李静', 'plan_label': '已登录'},
+            {'email': 'a@b.c', 'name': '', 'plan_label': '登录'},
+            {'email': '', 'name': '', 'plan_label': '订阅账号'},
+        ]
+        for identity in cases:
+            label = github_auth.account_identity_label(identity, fallback='订阅账号')
+            segments = [part.strip() for part in label.split('·')]
+            self.assertEqual(len(segments), len(set(segments)),
+                             '标签里有重复段：' + label)
+            status_words = {'已登录', '登录'}
+            self.assertFalse(status_words & set(segments) and len(segments) > 1,
+                             '把状态词当身份段用了：' + label)
+
+    def test_name_is_preferred_over_email(self):
+        label = github_auth.account_identity_label(
+            {'email': 'a@b.c', 'name': '李静', 'plan_label': 'WorkBuddy教育公益版'})
+        self.assertEqual(label, '李静 · WorkBuddy教育公益版')
+
+    def test_email_used_when_no_name(self):
+        label = github_auth.account_identity_label(
+            {'email': 'a@b.c', 'plan_label': 'Pro'})
+        self.assertEqual(label, 'a@b.c · Pro')
+
+    def test_empty_identity_falls_back(self):
+        self.assertEqual(github_auth.account_identity_label(None), '已登录')
+
+    def test_codebuddy_identity_reads_display_name(self):
+        self.cb_dir.mkdir(parents=True, exist_ok=True)
+        (self.cb_dir / 'Tencent-Cloud.coding-copilot.info').write_text(json.dumps({
+            'account': {'displayName': '李静', 'enterpriseName': '某教育公益版',
+                        'nickname': 'mex6tjwvq4cp'},
+            'auth': {'accessToken': 'at-' + 'x' * 40},
+        }), encoding='utf-8')
+        identity = github_auth.codebuddy_identity()
+        self.assertIsNotNone(identity, '有展示名却取不到身份')
+        self.assertEqual(identity['name'], '李静')
+        self.assertEqual(identity['plan_label'], '某教育公益版')
+
+    def test_codebuddy_identity_ignores_random_nickname(self):
+        """nickname 是随机串，拿来当身份只会让人更糊涂。"""
+        self.cb_dir.mkdir(parents=True, exist_ok=True)
+        (self.cb_dir / 'x.info').write_text(json.dumps({
+            'account': {'nickname': 'mex6tjwvq4cp'},
+            'auth': {'accessToken': 'at-' + 'x' * 40},
+        }), encoding='utf-8')
+        self.assertIsNone(github_auth.codebuddy_identity())
+
+    def test_codebuddy_identity_never_leaks_token(self):
+        self.cb_dir.mkdir(parents=True, exist_ok=True)
+        secret = 'at-SECRET-THIS-MUST-NOT-LEAK'
+        (self.cb_dir / 'x.info').write_text(json.dumps({
+            'account': {'displayName': '机主'},
+            'auth': {'accessToken': secret, 'refreshToken': secret},
+        }), encoding='utf-8')
+        identity = github_auth.codebuddy_identity()
+        self.assertNotIn(secret, json.dumps(identity, ensure_ascii=False))
+
+    def test_codebuddy_identity_missing_folder_is_none(self):
+        self.assertIsNone(github_auth.codebuddy_identity())
+
+    def test_codebuddy_identity_survives_corrupt_file(self):
+        self.cb_dir.mkdir(parents=True, exist_ok=True)
+        (self.cb_dir / 'broken.info').write_text('{not json', encoding='utf-8')
+        (self.cb_dir / 'good.info').write_text(json.dumps({
+            'account': {'displayName': '机主'}, 'auth': {'accessToken': 'x'}}), encoding='utf-8')
+        identity = github_auth.codebuddy_identity()
+        self.assertIsNotNone(identity, '一个坏文件不该让整份身份读不到')
+        self.assertEqual(identity['name'], '机主')
+
+
+
+class CredentialSafetyGuardTest(unittest.TestCase):
+    """守卫：任何测试都不许让凭据路径指向真实 HOME。
+
+    2026-10-26 的真实事故：退出流程新增「凭据文件在不在」的判据后，
+    test_logout_when_not_logged_in_is_refused 没有重定向凭据路径，
+    于是读到了本机真实的 ~/.codex/auth.json 并把它删掉。
+    那次靠退出前的 .logout-*.bak 备份才恢复，但「靠备份兜底」不是设计。
+
+    这个用例把「凭据路径必须落在临时目录」变成硬约束：
+    在真实代码里跑一遍登录态查询与退出目标检查，路径若指向 HOME 就报红。
+    """
+
+    REAL_PATHS = (
+        os.path.join(os.path.expanduser('~'), '.codex', 'auth.json'),
+        os.path.join(os.path.expanduser('~'), '.local', 'share',
+                     'CodeBuddyExtension', 'Data', 'Public', 'auth'),
+    )
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.codex_auth = self.root / '.codex' / 'auth.json'
+        self.cb_dir = self.root / 'codebuddy-auth'
+        # 先确认临时目录本身与真实 HOME 无关，免得这条守卫自己失效。
+        for real in self.REAL_PATHS:
+            self.assertFalse(str(self.root).startswith(os.path.dirname(real)),
+                             '临时目录竟然落在真实凭据目录下：' + str(self.root))
+        self.patches = [
+            patch.object(github_auth, 'CODEX_AUTH', self.codex_auth),
+            patch.object(github_auth, 'CODEBUDDY_AUTH_DIR', self.cb_dir),
+        ]
+        for item in self.patches:
+            item.start()
+        self.addCleanup(self._teardown)
+
+    def _teardown(self):
+        for item in reversed(self.patches):
+            item.stop()
+        self.temp.cleanup()
+
+    def test_module_paths_point_into_temp_dir(self):
+        self.assertTrue(str(github_auth.CODEX_AUTH).startswith(str(self.root)))
+        self.assertTrue(str(github_auth.CODEBUDDY_AUTH_DIR).startswith(str(self.root)))
+
+    def test_logout_writes_only_inside_temp_dir(self):
+        """真跑一次退出，确认真实凭据路径一个字节都没动过。"""
+        before = {}
+        for real in self.REAL_PATHS:
+            if os.path.exists(real):
+                st = os.stat(real)
+                before[real] = (st.st_size, st.st_mtime)
+        make_codex_auth(self.codex_auth)
+        make_codebuddy_auth(self.cb_dir)
+        manager = github_auth.LoginManager()
+        manager.logout('codex', 'codex', {})
+        manager.logout('codebuddy', 'codebuddy', {})
+        for real, snapshot in before.items():
+            st = os.stat(real)
+            self.assertEqual((st.st_size, st.st_mtime), snapshot,
+                             '真实凭据被测试改动了：' + real)
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
