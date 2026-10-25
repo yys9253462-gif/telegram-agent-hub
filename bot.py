@@ -2235,7 +2235,16 @@ def redact(value):
     value = re.sub(r'(?i)\b([a-z][a-z0-9+.-]{0,31}://)([^\s/:@]+):([^\s/]+)@', r'\1\2:[已隐藏]@', value)
     # Bearer 必须先于 authorization 规则，否则只抹掉 "Bearer" 而令牌仍留在原地。
     value = re.sub(r'(?i)\bBearer\s+[^\s"\x27,;]+', 'Bearer [已隐藏]', value)
-    value = re.sub(r'(?i)((?:api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|password|passwd|secret|密钥|密码)["\x27]?\s*[=:：]\s*["\x27]?)([^\s,;"\x27]+)', r'\1[已隐藏]', value)
+    # 「密钥」「密码」这两个中文词既出现在真正的凭证赋值里（密钥=sk-xxx），
+    # 也大量出现在正常说明里（接口密钥：使用已配置的网关与密钥）。
+    # 原来把它们和 api_key 写在同一组，说明句会被整段抹成「接口密钥：[已隐藏]」。
+    # 因此中文词单独一条，并要求右边确实像一个凭证：无空格的长串且含数字。
+    value = re.sub(r'(?i)((?:api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|password|passwd|secret)["\x27]?\s*[=:：]\s*["\x27]?)([^\s,;"\x27]+)', r'\1[已隐藏]', value)
+    value = re.sub(r'((?:密钥|密码|口令)["\x27]?\s*[=:：]\s*["\x27]?)'
+                   r'((?=[A-Za-z0-9_\-]*\d)[A-Za-z0-9_\-]{8,})', r'\1[已隐藏]', value)
+    # 纯数字口令（如「密码：123456」）上面那条不命中，单独兜一次：
+    # 六位以上的纯数字在说明句里几乎不会跟在「密钥：」后面，误伤面很小。
+    value = re.sub(r'((?:密钥|密码|口令)["\x27]?\s*[=:：]\s*["\x27]?)(\d{6,})', r'\1[已隐藏]', value)
     value = re.sub(r'\b(?:sk-[A-Za-z0-9_-]{12,}|\d{6,}:[A-Za-z0-9_-]{25,})\b', '[已隐藏令牌]', value)
     # 常见云厂商与代码托管平台的固定前缀密钥。
     value = re.sub(r'\b(?:AKIA|ASIA)[0-9A-Z]{16}\b', '[已隐藏令牌]', value)

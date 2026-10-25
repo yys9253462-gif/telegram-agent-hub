@@ -69,6 +69,17 @@ class RedactTest(unittest.TestCase):
         for text in safe:
             self.assertEqual(bot.redact(text), text)
 
+    def test_chinese_word_for_key_does_not_swallow_normal_sentences(self):
+        """缺陷：「密钥：」这类中文词曾和 api_key 写在同一组规则里，
+        于是「接口密钥：使用已配置的网关与密钥。」被整段抹成「接口密钥：[已隐藏]」。
+        说明句必须原样保留，真正的密钥仍要抹掉。"""
+        for text in ('接口密钥：使用已配置的网关与密钥。', '接口密钥：已就绪',
+                     '当前渠道：接口密钥', '密钥：共 2 个'):
+            self.assertEqual(bot.redact(text), text, text)
+        for text in ('密钥：sk-abcdef1234567890', '密码：Abc12345678xyz',
+                     '口令：123456', '密钥=ghp_abcdefghijklmnopqrstuvwxyz01'):
+            self.assertIn('[已隐藏]', bot.redact(text), text)
+
 
 class CredentialBlockTest(unittest.TestCase):
     """缺陷：文件外发只按文件名拦截，改个名字就能把含密码的连接串发出去。"""
