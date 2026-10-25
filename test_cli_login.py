@@ -56,13 +56,23 @@ class LoginPromptTests(unittest.TestCase):
         self.assertNotIn('secretvalue', prompt['url'])
         self.assertIn('state=[已隐藏]', prompt['url'])
 
-    def test_codebuddy_prompt_uses_official_host_only(self):
+    def test_codebuddy_prompt_keeps_state_so_the_link_actually_works(self):
+        """state 是 CLI 会话标识，抹掉它链接就废了：能打开，但登完回不来。
+        2026-10-26 真实反馈：用户拿到的链接是 state=[已隐藏]，无法登录。"""
         text = 'Browser didn\'t open? Use the url below to sign in:\n' \
-               'https://copilot.tencent.com/login?platform=x&state=secret\n'
+               'https://copilot.tencent.com/login?platform=x&state=7bc0f169-8f51-464d-9e9e-421000fdd18d&version=2.176.0\n'
         prompt = codebuddy_login_prompt(text)
         self.assertEqual(prompt['url'],
-                         'https://copilot.tencent.com/login?platform=x&state=[已隐藏]')
+                         'https://copilot.tencent.com/login?platform=x'
+                         '&state=7bc0f169-8f51-464d-9e9e-421000fdd18d&version=2.176.0')
         self.assertIsNone(codebuddy_login_prompt('https://evil.test/login?state=x'))
+
+    def test_codebuddy_prompt_still_hides_real_secrets(self):
+        text = 'https://copilot.tencent.com/login?platform=x&state=abc-123&code=SECRETCODE&access_token=SECRETTOKEN'
+        url = codebuddy_login_prompt(text)['url']
+        self.assertIn('state=abc-123', url)
+        self.assertNotIn('SECRETCODE', url)
+        self.assertNotIn('SECRETTOKEN', url)
 
     def test_clean_environment_keeps_home_and_drops_gateway(self):
         environment = login_clean_env({'HOME': '/home/account', 'PATH': '/bin',
@@ -145,7 +155,7 @@ class LoginManagerTests(unittest.TestCase):
             b'Do you trust the files in this folder?\nSelect login method:\n'
             b'Log in via Chinese Site\nGenerating login URL...\n'
             b'Browser didn\'t open? Use the url below to sign in:\n'
-            b'https://copilot.tencent.com/login?platform=x&state=secret\n'
+            b'https://copilot.tencent.com/login?platform=x&state=SESSION-STATE-1\n'
             b'Waiting for auth...\n', None)
         writes = []
         with patch('github_auth.os.name', 'posix'), \
@@ -164,7 +174,8 @@ class LoginManagerTests(unittest.TestCase):
             self.done.wait(2)
         self.assertEqual(writes[:2], [b'\r', b'\r'])
         ready_event = next(event for event in self.events if event['state'] == 'ready')
-        self.assertNotIn('secret', ready_event['url'])
+        # state 必须完整送到用户手上，否则浏览器登完 CLI 认不回来。
+        self.assertIn('state=SESSION-STATE-1', ready_event['url'])
         self.assertIn('copilot.tencent.com/login', ready_event['url'])
 
     def test_submit_is_rejected_for_both_providers(self):

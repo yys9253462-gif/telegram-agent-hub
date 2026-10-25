@@ -179,6 +179,11 @@ LOGIN_DEVICE_CODE = re.compile(r'(?<![A-Za-z0-9_-])([A-Z0-9]{4,6}-[A-Z0-9]{4,6})
 LOGIN_CODEX_HOSTS = ('auth.openai.com', 'chatgpt.com')
 LOGIN_CODEBUDDY_HOST = 'copilot.tencent.com'
 LOGIN_SECRET_QUERY = re.compile(r'(^|[?&])(state|code|token|access_token)=([^&\s]*)', re.IGNORECASE)
+# CodeBuddy 的登录链接必须整条给用户，`state` 是 CLI 生成的会话标识（UUID），
+# 用来把浏览器里的登录结果对回本机等待的那个进程，本身不是凭证也不是权限。
+# 抹掉它等于把链接废掉：用户点进去登不回来（2026-10-26 真实反馈）。
+# 所以这里只过滤真正像秘密的参数，`state` 保留。
+CODEBUDDY_KEEP_QUERY = re.compile(r'(^|[?&])(code|token|access_token)=([^&\s]*)', re.IGNORECASE)
 LOGIN_GATEWAY_PREFIX = ('OPENAI_', 'ANTHROPIC_', 'CODEBUDDY_')
 LOGIN_TRUST_PROMPT = 'Do you trust the files in this folder?'
 LOGIN_METHOD_PROMPT = 'Select login method:'
@@ -192,12 +197,16 @@ def login_clean_env(env):
             if not key.upper().startswith(LOGIN_GATEWAY_PREFIX)}
 
 
-def login_sanitize_url(url):
-    """只保留官方主机与路径，登录状态参数一律遮盖。"""
+def login_sanitize_url(url, pattern=LOGIN_SECRET_QUERY):
+    """只保留官方主机与路径，登录状态参数按给定规则遮盖。
+
+    默认把 state/code/token 全遮掉（设备码流程的保守做法）；
+    需要把 state 交给用户去点链接的流程（CodeBuddy）传 CODEBUDDY_KEEP_QUERY。
+    """
     parsed = urlsplit(url)
     if parsed.scheme != 'https' or not parsed.netloc:
         return None
-    query = LOGIN_SECRET_QUERY.sub(
+    query = pattern.sub(
         lambda found: found.group(1) + found.group(2) + '=[已隐藏]', parsed.query)
     return parsed.scheme + '://' + parsed.netloc + parsed.path + (('?' + query) if query else '')
 
@@ -217,13 +226,18 @@ def codex_login_prompt(text):
 
 
 def codebuddy_login_prompt(text):
-    """从官方界面取浏览器登录链接。"""
+    """从官方界面取浏览器登录链接。
+
+    链接里的 state 必须原样保留：它是 CLI 会话标识，
+    用户拿这条链接在浏览器里完成登录，CLI 靠它把结果对回本机进程。
+    抹掉 state 后链接照样能打开，但登完回不来，等于白登一次。
+    """
     clean = LOGIN_ANSI.sub('', text)
     for match in LOGIN_URL.finditer(clean):
         url = match.group(0).rstrip('.,);')
         parsed = urlsplit(url)
         if parsed.netloc == LOGIN_CODEBUDDY_HOST and parsed.path == '/login':
-            return {'url': login_sanitize_url(url)}
+            return {'url': login_sanitize_url(url, CODEBUDDY_KEEP_QUERY)}
     return None
 
 
