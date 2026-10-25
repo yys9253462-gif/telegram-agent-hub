@@ -168,13 +168,23 @@ import hashlib
 import os
 import queue
 import re
+import shutil
 import signal
 import subprocess
 import threading
 import time
+from pathlib import Path
 from urllib.parse import urlsplit
 
 LOGIN_PROVIDERS = ('codex', 'codebuddy')
+
+# 退出登录要动的两处路径。都跟随 HOME，测试里改 HOME 即可重定向。
+CODEX_AUTH = Path(os.environ.get('CODEX_AUTH_FILE')
+                  or os.path.join(os.path.expanduser('~'), '.codex', 'auth.json'))
+# CodeBuddy 把账号凭据放在这个目录下的 *.info 的 auth 段里。
+CODEBUDDY_AUTH_DIR = Path(os.environ.get('CODEBUDDY_AUTH_DIR')
+                          or os.path.join(os.path.expanduser('~'), '.local', 'share',
+                                          'CodeBuddyExtension', 'Data', 'Public', 'auth'))
 LOGIN_ANSI = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]')
 LOGIN_URL = re.compile(r'https://[^\s<>"\']+')
 LOGIN_DEVICE_CODE = re.compile(r'(?<![A-Za-z0-9_-])([A-Z0-9]{4,6}-[A-Z0-9]{4,6})(?![A-Za-z0-9_-])')
@@ -358,6 +368,119 @@ class LoginManager:
         """官方没有授权码回填入口，明确拒绝而不是假装支持。"""
         return {'ok': False, 'state': 'unsupported',
                 'message': '官方登录流程不提供授权码回填，请在浏览器完成授权。'}
+
+    def logout(self, provider, binary, env):
+        """退出某个执行器的账号登录。
+
+        三家 CLI 的退出机制完全不同，全部实测过，不能套用同一套：
+
+        - Claude：官方给了 `claude auth logout`，直接调，最干净。
+        - Codex：`codex login` 只有 status 子命令，**没有 logout**。
+          登录态是 ~/.codex/auth.json 整份文件（受控实验：只把文件改名，
+          `codex login status` 立刻变成 Not logged in；恢复即回来）。
+          所以必须整份移除，**不能只把里面的 tokens 置空** ——
+          实测置空 tokens、甚至把 auth_mode 也写成 null，状态照样报
+          「Logged in using ChatGPT」，只看文件在不在。
+          移除前先备份，因为同一个文件里可能还有网关的 OPENAI_API_KEY。
+        - CodeBuddy：也没有 logout。登录态在
+          ~/.local/share/CodeBuddyExtension/Data/Public/auth/*.info 的 auth 段
+          （accessToken / refreshToken / sessionState）。实测清空 auth 段后
+          官方命令立刻回「Authentication required」，恢复即正常。
+          这里只清 auth 与 account 两段，保留同一个文件里的其它设置。
+
+        三种做法都只影响账号登录态，不动网关密钥与任务数据。
+        """
+        # 注意这里不能用 LOGIN_PROVIDERS：那张表是「走本管理器登录流程」的执行器，
+        # 只有 codex 与 codebuddy。Claude 的登录由 bot.py 自己起进程（它要拿到
+        # 授权链接让机主回填），但**退出**走的是官方 `claude auth logout`，
+        # 完全可以在这里统一收口。用错表会让 Claude 的退出永远进不来。
+        if provider not in ('claude', 'codex', 'codebuddy'):
+            return {'ok': False, 'state': 'unsupported',
+                    'message': '这个执行器没有账号登录。'}
+        with self._lock:
+            if provider in self._sessions:
+                # 登录进行到一半就退出，两件事会互相覆盖：登录进程最后一步
+                # 会把刚拿到的凭据再写回去，用户看到「已退出」却还是登录着的。
+                return {'ok': False, 'state': 'login_running',
+                        'message': '这个执行器正在登录中，请先取消登录再退出账号。'}
+        if provider == 'claude':
+            return self._claude_logout(binary, env)
+        if provider == 'codex':
+            return self._codex_logout()
+        return self._codebuddy_logout()
+
+    def _claude_logout(self, binary, env):
+        try:
+            result = subprocess.run([binary, 'auth', 'logout'], capture_output=True,
+                                    text=True, timeout=self.status_timeout,
+                                    env=login_clean_env(dict(env)))
+        except (OSError, subprocess.SubprocessError):
+            return {'ok': False, 'state': 'failed',
+                    'message': '无法执行 claude auth logout。'}
+        if result.returncode != 0:
+            detail = ((result.stdout or '') + (result.stderr or '')).strip()[:200]
+            return {'ok': False, 'state': 'failed',
+                    'message': '官方退出命令失败' + ('：' + detail if detail else '。')}
+        return {'ok': True, 'state': 'logged_out', 'removed': '官方 auth logout'}
+
+    def _codex_logout(self):
+        path = CODEX_AUTH
+        if not path.exists():
+            return {'ok': True, 'state': 'not_logged_in', 'removed': ''}
+        backup = self._backup(path)
+        try:
+            path.unlink()
+        except OSError as exc:
+            return {'ok': False, 'state': 'failed',
+                    'message': '删除登录凭据失败：' + type(exc).__name__}
+        detail = '已删除 ' + str(path)
+        if backup:
+            detail += '（原文件备份在 ' + str(backup) + '，确认不需要可自行删除）'
+        return {'ok': True, 'state': 'logged_out', 'removed': detail}
+
+    def _codebuddy_logout(self):
+        folder = CODEBUDDY_AUTH_DIR
+        if not folder.is_dir():
+            return {'ok': True, 'state': 'not_logged_in', 'removed': ''}
+        cleared = []
+        for path in sorted(folder.glob('*.info')):
+            try:
+                data = json.loads(path.read_text(encoding='utf-8'))
+            except (OSError, ValueError):
+                # 读不出来的文件不属于我们该动的东西，跳过并如实报告。
+                continue
+            if not isinstance(data, dict) or ('auth' not in data and 'account' not in data):
+                continue
+            backup = self._backup(path)
+            data.pop('auth', None)
+            data['account'] = {}
+            try:
+                temp = path.with_suffix(path.suffix + '.tmp')
+                with temp.open('w', encoding='utf-8') as handle:
+                    json.dump(data, handle, ensure_ascii=False)
+                os.chmod(temp, 0o600)
+                temp.replace(path)
+            except OSError as exc:
+                return {'ok': False, 'state': 'failed',
+                        'message': '清理登录态失败：' + type(exc).__name__}
+            cleared.append(path.name + ('（备份 ' + str(backup) + '）' if backup else ''))
+        if not cleared:
+            return {'ok': True, 'state': 'not_logged_in', 'removed': ''}
+        return {'ok': True, 'state': 'logged_out',
+                'removed': '已清空 ' + '、'.join(cleared)}
+
+    def _backup(self, path):
+        """退出前留一份备份。删掉的东西里可能混着网关密钥，得能拿回来。"""
+        stamp = time.strftime('%Y%m%d-%H%M%S')
+        target = path.with_name(path.name + '.logout-' + stamp + '.bak')
+        try:
+            shutil.copy2(path, target)
+            # copy2 会连权限一起复制。源文件若因为历史原因就是 666，
+            # 备份里那枚令牌也就跟着人人可读，所以这里强制收紧。
+            os.chmod(target, 0o600)
+            return target
+        except OSError:
+            return None
 
     def status(self, provider, binary, env):
         """查询官方登录状态。只执行官方命令，不读凭据文件。"""

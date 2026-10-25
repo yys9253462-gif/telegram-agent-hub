@@ -97,6 +97,26 @@ sudo python3 /opt/telegram-agent-hub/install.py --uninstall
 
 工具审计只记录工具名称和任务结果，不提供完整文件差异或一键回滚。
 
+## 账号登录与退出
+
+「设置 → 账号登录」里可以登录 Claude、CodeBuddy、Codex 三个执行器的账号，用订阅额度代替接口密钥跑任务。渠道是**按执行器独立**的，切换某一个不会影响另外两个。
+
+退出账号走「设置 → 账号登录 → 退出账号」，列表里只列**当前确实登录着**的执行器，并显示身份，避免退错。退出后：
+
+- 该执行器的渠道若正处于「账号」，会自动切回接口密钥——账号没了还留在账号渠道，任务会拿不到任何凭据直接失败。
+- 正在运行的任务不受影响；正在登录中的执行器不允许退出（登录进程最后一步会把凭据写回来）。
+- 只清除账号登录态，接口密钥、任务数据、会话记录都不动。
+
+三家 CLI 的退出机制**完全不同**，这里按各家的真实行为实现，不能想当然：
+
+| 执行器 | 官方退出命令 | 实际做法 |
+|---|---|---|
+| Claude | 有 `claude auth logout` | 直接调用官方命令 |
+| Codex | **没有** logout 子命令 | 移除整个 `~/.codex/auth.json` |
+| CodeBuddy | **没有** logout 子命令 | 清空 `~/.local/share/CodeBuddyExtension/Data/Public/auth/*.info` 里的 `auth` 段 |
+
+Codex 那条最容易写错：只把文件里的 `tokens` 置空、甚至把 `auth_mode` 也写成 null，`codex login status` **仍然报已登录**——它只看文件在不在。所以必须整份移除。移除前会备份成 `auth.json.logout-<时间>.bak`（权限 600），因为同一个文件里可能还有网关的 `OPENAI_API_KEY`。
+
 ## 外部平台授权（GitHub / Cloudflare）
 
 让机器人在任务里代替你操作 GitHub 与 Cloudflare。入口在「更多 → 平台授权」。
