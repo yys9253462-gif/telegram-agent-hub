@@ -2607,7 +2607,8 @@ class TaskController:
                 raise MediaError('格式：提交CodeBuddy授权码 CODE')
             result = CLI_LOGINS.submit('codebuddy', chat, code)
             if not result.get('ok'):
-                raise MediaError('当前没有可提交授权码的 CodeBuddy 登录，请先发送“登录CodeBuddy”。')
+                # 官方 CodeBuddy 登录没有授权码回填入口，这里给出真实原因。
+                raise MediaError(result.get('message') or '当前没有进行中的 CodeBuddy 登录，请先点击“登录CodeBuddy账号”。')
             send(chat, 'CodeBuddy 授权码已提交，正在等待官方登录结果。')
             return
         if text in ('检查版本', '更新机器人', '确认更新机器人'):
