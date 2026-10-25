@@ -39,27 +39,35 @@ class SafeRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def fetch_archive(repo, commit):
-    """公开仓库匿名下载归档；不发送 Authorization。"""
-    url = 'https://api.github.com/repos/' + repo + '/tarball/' + commit
-    request = urllib.request.Request(url, headers={
-        'Accept': 'application/vnd.github+json',
-        'X-GitHub-Api-Version': '2022-11-28',
-        'User-Agent': 'telegram-agent-hub-bootstrap',
-    })
-    try:
-        with urllib.request.build_opener(SafeRedirect()).open(request, timeout=90) as response:
-            body = response.read(MAX_ARCHIVE + 1)
-    except urllib.error.HTTPError as exc:
-        if exc.code == 404:
-            raise BootstrapError('仓库或提交不存在；若仓库为私有，请改为手动克隆后执行 bash install.sh') from None
-        if exc.code == 403:
-            raise BootstrapError('GitHub 拒绝匿名访问（可能触发限流），请稍后重试') from None
-        raise BootstrapError('下载失败，状态码 ' + str(exc.code)) from None
-    except urllib.error.URLError:
-        raise BootstrapError('无法连接 GitHub，请检查网络或代理设置') from None
-    if len(body) > MAX_ARCHIVE:
-        raise BootstrapError('仓库归档超过大小限制')
-    return body
+    """公开仓库匿名下载归档；不发送 Authorization。按顺序尝试多个源。"""
+    last = None
+    for url in (
+        'https://api.github.com/repos/' + repo + '/tarball/' + commit,
+        'https://ghproxy.net/https://api.github.com/repos/' + repo + '/tarball/' + commit,
+        'https://gh-proxy.com/https://api.github.com/repos/' + repo + '/tarball/' + commit,
+    ):
+        try:
+            request = urllib.request.Request(url, headers={
+                'Accept': 'application/vnd.github+json',
+                'X-GitHub-Api-Version': '2022-11-28',
+                'User-Agent': 'telegram-agent-hub-bootstrap',
+            })
+            with urllib.request.build_opener(SafeRedirect()).open(request, timeout=90) as response:
+                body = response.read(MAX_ARCHIVE + 1)
+        except urllib.error.HTTPError as exc:
+            last = 'HTTP ' + str(exc.code)
+            if exc.code == 404:
+                raise BootstrapError('仓库或提交不存在；若为私有仓库，请克隆后执行 bash install.sh') from None
+            if exc.code == 403:
+                last = 'GitHub 限流'
+            continue
+        except urllib.error.URLError:
+            last = '网络不可达'
+            continue
+        if len(body) > MAX_ARCHIVE:
+            raise BootstrapError('仓库归档超过大小限制')
+        return body
+    raise BootstrapError('所有下载源均失败（' + str(last) + '），请检查网络或改用镜像安装命令')
 
 
 def extract_archive(data, destination):
