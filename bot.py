@@ -3248,14 +3248,16 @@ class TaskController:
                          + '\n可发送“账号模型”选择具体模型。')
             else:
                 extra = '\n已回到接口密钥渠道，模型沿用“模型设置”里的网关模型。'
+            # 不自动改当前执行器：切渠道只改「用哪个身份」，
+            # 顺手把执行器也换掉，等于替用户做了另一件事。
+            switching = engine != current_engine()
+            if switching:
+                extra += ('\n当前执行器仍是 ' + engine_spec(current_engine())['label']
+                          + '，要先换到 ' + label + ' 才用得上这个渠道。')
             send(chat, label + ' 已切换到：' + channel_label(engine) + extra + '\n仅影响该执行器的新任务。')
-            if engine != current_engine():
-                # 不自动改当前执行器：切渠道只改「用哪个身份」，
-                # 顺手把执行器也换掉，等于替用户做了另一件事。
-                switches = engine_spec(engine)
-                send_options(chat, '当前执行器仍是 ' + engine_spec(current_engine())['label']
-                                   + '。要换到 ' + label + ' 执行任务，点下面这个。',
-                             [(switches['button'], switches['button'])])
+            if switching:
+                send_options(chat, '要把执行器换成 ' + label + ' 吗？',
+                             [(engine_spec(engine)['button'], engine_spec(engine)['button'])])
         elif text == '账号模型':
             engine = current_engine()
             label = engine_spec(engine)['label']

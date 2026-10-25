@@ -268,7 +268,8 @@ class ChannelSwitchPageTests(unittest.TestCase):
         with patch.object(bot, 'account_authorized', return_value=(True, '已登录。')):
             send, options = self.send('使用账号 codex')
         # 切渠道只改身份，不替用户切执行器；这一点必须在回复里说清。
-        self.assertIn('当前执行器仍是', self.page_text(options))
+        self.assertIn('当前执行器仍是', send.call_args.args[1])
+        self.assertIn('要把执行器换成 Codex 吗', self.page_text(options))
         self.assertEqual(self.page_commands(options), [bot.ENGINES['codex']['button']])
         self.assertEqual(bot.auth_channel('codex'), 'account')
         self.assertEqual(bot.current_engine(), 'claude')
