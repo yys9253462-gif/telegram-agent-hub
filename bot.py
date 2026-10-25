@@ -103,6 +103,24 @@ def menu_visible():
 def set_menu_visible(value):
     atomic_json(MENU_STATE, {'visible': value})
 
+def send_rich(chat, html):
+    """发一条带 HTML 的消息，用于需要可点击元素的少数场景（目前只有设备码授权）。
+
+    绝不复用 send()：send 走纯文本、按字符数硬切，对含标签的文本切片会把标签劈开，
+    Telegram 直接返回 400。这里短消息一次发完，不做切片。
+    """
+    html = redact(html)
+    markup = KEYBOARD if menu_visible() else {'remove_keyboard': True}
+    payload = {'chat_id': chat, 'text': html, 'parse_mode': 'HTML', 'reply_markup': markup,
+               'disable_web_page_preview': True}
+    try:
+        api('sendMessage', payload)
+    except RuntimeError:
+        # HTML 解析失败时退回纯文本，至少保证设备码能送达，不让授权彻底卡住。
+        plain = re.sub(r'<[^>]+>', '', html)
+        api('sendMessage', {'chat_id': chat, 'text': plain, 'reply_markup': markup})
+
+
 def send(chat, text):
     text = redact(text)
     task = getattr(TASK_LOCAL, 'task', None)
@@ -337,7 +355,11 @@ def looks_like_login_code(text):
 # 两者共用「发链接—回填—后台等待」的交互形态，但凭据去向完全不同。
 
 CREDENTIALS = WORK / 'credentials.json'
-GITHUB_CLIENT_ID = os.environ.get('GITHUB_CLIENT_ID', '')
+# 设备码流程只需要 client_id，不需要 client_secret（GitHub 官方文档明确写着）。
+# client_id 本身就是公开标识，不构成机密，所以这里预置一个公共 App 的 client_id：
+# 开箱即用，不必让机主先去注册一个 OAuth App。
+# 想独享每小时 50 次的设备码配额，或换成自己名下的 App，用 GITHUB_CLIENT_ID 覆盖即可。
+GITHUB_CLIENT_ID = os.environ.get('GITHUB_CLIENT_ID') or 'Iv1.b231c327f1eaa229'
 # 申请的权限：repo 用于仓库读写，read:org 用于确认组织成员身份，gist 用于片段。
 # 刻意不申请 workflow 与 delete_repo —— 默认给最小集合，需要时再用 scope 追加。
 GITHUB_SCOPE = os.environ.get('GITHUB_SCOPE', 'repo read:org gist')
@@ -410,16 +432,21 @@ def auth_status_text():
 
 
 def start_github_device_flow(chat):
-    """申请设备码并在后台开始轮询。返回给机主看的说明文本。"""
+    """申请设备码并在后台开始轮询。返回给机主看的 HTML 文本。
+
+    client_id 已内置默认值，正常情况不会再走到「未配置」分支；
+    留这个判断是为了环境变量被显式设成空串时给出明确提示，而不是抛一个费解的 404。
+    """
     if not GITHUB_CLIENT_ID:
-        raise MediaError('未配置 GitHub client_id。请到 GitHub 注册 OAuth App 并勾选 Enable Device Flow，'
-                         '然后把 client_id 填进配置文件后重启服务。')
+        raise MediaError('GitHub client_id 被配置成了空值。删掉配置文件里的 GITHUB_CLIENT_ID 即可用内置默认值，'
+                         '或填入你自己 OAuth App 的 client_id 后重启服务。')
     running = DEVICE_FLOW.get('thread')
     if running is not None and running.is_alive():
         # 设备码接口对同一 OAuth App 有每小时 50 次上限，重复发起很快就会打满。
         # 已有等待中的授权时直接复用，不再申请新码。
-        return ('已有一轮授权在等待。请打开 ' + DEVICE_FLOW['verification_uri']
-                + ' 输入：' + DEVICE_FLOW['user_code'] + '\n有效期十分钟，过期后再发一次“授权GitHub”。')
+        return device_code_message(DEVICE_FLOW['verification_uri'], DEVICE_FLOW['user_code'],
+                                   int(DEVICE_FLOW.get('expires_at', 0) - time.time()),
+                                   reused=True)
     try:
         body = github_auth.start(GITHUB_CLIENT_ID, GITHUB_SCOPE)
     except github_auth.DeviceFlowError as exc:
@@ -432,10 +459,27 @@ def start_github_device_flow(chat):
                               daemon=True, name='github-device-poll')
     DEVICE_FLOW['thread'] = thread
     thread.start()
-    return ('请在任意设备的浏览器打开 ' + body['verification_uri']
-            + '\n输入设备码：' + body['user_code']
-            + '\n\n授权完成后我会自动收到通知，不需要你再回填任何东西。'
-            '\n有效期 ' + str(int(body.get('expires_in') or 900) // 60) + ' 分钟。')
+    return device_code_message(body['verification_uri'], body['user_code'],
+                               int(body.get('expires_in') or 900))
+
+
+def device_code_message(uri, user_code, seconds, reused=False):
+    """把设备码渲染成「点得动」的样子。
+
+    机主在手机上看这条消息，所以：
+    - 登录地址做成可点链接，点一下直接进授权页，不用长按复制；
+    - 8 位码用 <code> 包起来，点一下就复制到剪贴板；
+    - 码本身单独一行、前后留空，避免和别的字粘在一起被选错。
+    """
+    minutes = max(1, int(seconds) // 60)
+    head = '已有一轮 GitHub 授权在等你完成，设备码还是：' if reused else '请在浏览器打开下面这个地址（点一下就进去）：'
+    return ('<b>GitHub 授权</b>\n\n'
+            + head + '\n'
+            '<a href="' + html.escape(uri) + '">' + html.escape(uri) + '</a>\n\n'
+            '页面里要填的设备码（点一下就能复制）：\n'
+            '<code>' + html.escape(user_code) + '</code>\n\n'
+            '授权完成后我会自动收到通知，不需要你回来做任何事。\n'
+            '这个码 ' + str(minutes) + ' 分钟内有效，过期就再发一次「授权GitHub」。')
 
 
 def github_poll_worker(chat, snapshot):
@@ -2182,7 +2226,7 @@ class TaskController:
             MODEL_CACHE.unlink(missing_ok=True)
             send(chat, '已切换到：' + AUTH_CHANNELS[auth_channel()] + '\n下一条任务生效。')
         elif text == '授权GitHub':
-            send(chat, start_github_device_flow(chat))
+            send_rich(chat, start_github_device_flow(chat))
         elif text == '授权Cloudflare':
             # 用两步确认而不是直接进「等待令牌」态：否则机主点错按钮之后，
             # 下一条正常任务描述就会被当成令牌去校验，白跑一次还报错。

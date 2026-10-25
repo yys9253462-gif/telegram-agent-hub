@@ -79,7 +79,9 @@ sudo python3 /opt/telegram-agent-hub/install.py --uninstall
 
 让机器人在任务里代替你操作 GitHub 与 Cloudflare。入口在「更多 → 平台授权」。
 
-**GitHub 走设备码流程**，不需要回调地址，也不需要 client secret。先在 GitHub 注册一个 OAuth App（Settings → Developer settings → OAuth Apps → New OAuth App），**务必勾选 Enable Device Flow**，把 client_id 填到安装配置的 `github_client_id`。之后在电报里点「授权GitHub」，机器人给出 8 位设备码，你在任意设备的浏览器打开 `github.com/login/device` 输入即可，机器人会自己等到授权完成并通知你，**不需要回填任何东西**。
+**GitHub 走设备码流程**，不需要回调地址，也不需要 client secret。**开箱即用：不用注册任何 OAuth App。** 点「授权GitHub」后机器人直接给一条消息，里面是「点一下就进授权页」的链接和「点一下就复制」的 8 位码，你点链接、粘贴码、确认，机器人自己等到授权完成并通知你，不需要回填任何东西。
+
+之所以能免注册：设备码流程只要 client_id（GitHub 官方文档明确写着不需要 secret），而 client_id 本身就是公开标识，所以代码里预置了一个公共 App 的 client_id 作为默认值。想独享每小时 50 次的设备码配额，或换成自己名下的 App，注册一个 OAuth App 并勾选 **Enable Device Flow**，把 client_id 填到安装配置的 `github_client_id` 覆盖即可。
 
 **Cloudflare 走 API 令牌**。Cloudflare 对第三方应用只开放授权码流程，不支持设备码，而授权码流程要求一个真实的 HTTPS 回调地址——机器人跑在没有公网回调的服务端，所以这里改为粘贴令牌。点「授权Cloudflare」后到控制台创建令牌，按需只勾要用的站点与权限，整段发给机器人即可。不接受账号密码和 Global API Key。
 

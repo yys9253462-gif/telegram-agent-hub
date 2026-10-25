@@ -331,6 +331,18 @@ class StartFlowGuardTest(unittest.TestCase):
         finally:
             bot.GITHUB_CLIENT_ID = original
 
+    def test_client_id_has_usable_default(self):
+        """开箱即用：不配环境变量时也必须有一个非空 client_id。
+
+        原实现默认空串，导致机主必须先自己去注册 OAuth App 才能用，
+        点了按钮只得到一句「未配置」。设备码流程只需要 client_id、不需要 secret，
+        且 client_id 本身是公开标识，所以内置一个默认值是安全的。
+        """
+        import subprocess
+        source = Path(bot.__file__).read_text(encoding='utf-8')
+        self.assertIn("os.environ.get('GITHUB_CLIENT_ID') or 'Iv1.", source,
+                      'GITHUB_CLIENT_ID 必须有内置默认值，否则又要机主先注册 App')
+
     def test_running_flow_is_reused_not_restarted(self):
         """缺陷：重复发起会打满 GitHub 每小时 50 次的设备码上限。"""
 
@@ -340,7 +352,7 @@ class StartFlowGuardTest(unittest.TestCase):
 
         bot.DEVICE_FLOW.update({'provider': 'github', 'thread': Alive(),
                                 'verification_uri': 'https://github.com/login/device',
-                                'user_code': 'ABCD-1234'})
+                                'user_code': 'ABCD-1234', 'expires_at': time.time() + 600})
         original = bot.GITHUB_CLIENT_ID
         bot.GITHUB_CLIENT_ID = 'cid'
         try:
@@ -349,7 +361,63 @@ class StartFlowGuardTest(unittest.TestCase):
             bot.GITHUB_CLIENT_ID = original
             bot.DEVICE_FLOW.update({'provider': '', 'thread': None})
         self.assertIn('ABCD-1234', text)
-        self.assertIn('已有一轮授权在等待', text)
+        self.assertIn('CD-1234', text)
+        self.assertIn('设备码还是', text)
+
+
+class DeviceCodeMessageTest(unittest.TestCase):
+    """机主要的是「点开就能授权」，所以消息必须是可点链接 + 可点复制的码。"""
+
+    def render(self, seconds=900, **kwargs):
+        return bot.device_code_message('https://github.com/login/device', 'WDJB-MJHT',
+                                       seconds, **kwargs)
+
+    def test_link_is_clickable_anchor(self):
+        text = self.render()
+        self.assertIn('<a href="https://github.com/login/device">', text)
+
+    def test_code_is_tappable_to_copy(self):
+        """<code> 包起来点一下就复制；裸文本在手机上只能长按选中。"""
+        text = self.render()
+        self.assertIn('<code>WDJB-MJHT</code>', text)
+
+    def test_uses_html_parse_mode(self):
+        """必须走 HTML 发送，纯文本发出的标签会原样显示成一堆尖括号。"""
+        self.assertIn("'parse_mode': 'HTML'", Path(bot.__file__).read_text(encoding='utf-8'))
+        self.assertIn("'disable_web_page_preview': True", Path(bot.__file__).read_text(encoding='utf-8'))
+
+    def test_expiry_is_shown_in_minutes(self):
+        self.assertIn('15 分钟', self.render())
+
+    def test_zero_seconds_still_reads_as_one_minute(self):
+        """剩余时间为 0 或负数时不能显示「0 分钟有效」，那看着像已经过期。"""
+        self.assertIn('1 分钟内有效', self.render(seconds=0))
+
+    def test_redact_keeps_html_tags(self):
+        """redact 会先把消息过一遍脱敏，它不能把标签也抹掉，否则链接和码就废了。"""
+        cleaned = bot.redact(self.render())
+        self.assertIn('<a href="https://github.com/login/device">', cleaned)
+        self.assertIn('<code>WDJB-MJHT</code>', cleaned)
+
+    def test_falls_back_to_plain_text_when_html_rejected(self):
+        """缺陷：HTML 解析失败时整条消息丢掉，机主拿不到设备码，授权彻底卡死。"""
+        calls = []
+
+        def fake_api(method, payload):
+            calls.append(dict(payload))
+            if len(calls) == 1:
+                raise RuntimeError('Bad Request: can not parse entities')
+
+        original = bot.api
+        bot.api = fake_api
+        try:
+            bot.send_rich(1, '<b>标题</b>\n<code>WDJB-MJHT</code>')
+        finally:
+            bot.api = original
+        self.assertEqual(len(calls), 2, '失败后必须重发一次纯文本')
+        self.assertIsNone(calls[1].get('parse_mode'))
+        self.assertIn('WDJB-MJHT', calls[1]['text'])
+        self.assertNotIn('<b>', calls[1]['text'])
 
 
 class TokenIntakeTest(TempStoreMixin):
