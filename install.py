@@ -154,6 +154,10 @@ def collect_config(old, yes=False):
             c['ssh_import_path'] = ask('可选：导入专门给机器人的现有私钥路径（空则生成专用密钥）', c.get('ssh_import_path', ''))
         c['sudo_nopasswd'] = boolean('明确授权：允许运行用户 sudo NOPASSWD: ALL（等同本机管理员权限）', c.get('sudo_nopasswd', True))
         c['sudo_authorized'] = True
+        # 平台授权是可选能力：不填 client_id 时，机器人的「授权GitHub」会提示未配置，
+        # 其余功能不受影响。所以这里允许留空，不强制交互。
+        c['github_client_id'] = ask('可选：GitHub OAuth App 的 client_id（用于设备码授权，留空则关闭该功能）',
+                                    c.get('github_client_id', ''))
         c['memory_bundle'] = ask('可选私有记忆技能包路径（不迁移则留空）', c.get('memory_bundle', ''))
     for key in ('enable_claude', 'enable_codebuddy', 'voice_enabled'):
         c.setdefault(key, True)
@@ -163,6 +167,7 @@ def collect_config(old, yes=False):
         c.setdefault(key, False)
     c.setdefault('default_model', 'auto')
     c.setdefault('local_label', '本机')
+    c.setdefault('github_client_id', '')
     validate_config(c)
     return c
 
@@ -252,6 +257,9 @@ def runtime_environment(c, home):
         'AGENT_TOOL_PYTHON': '/usr/bin/python3',
         'IMAGE_MODEL': c.get('image_model', '') if c['image_enabled'] else '',
         'IMAGE_MODELS': c.get('image_model', '') if c['image_enabled'] else '',
+        # GitHub 设备码授权只需 client_id（公开值，无 secret）。
+        # 留空则该功能在机器人里提示「未配置」，不会报错也不会误发请求。
+        'GITHUB_CLIENT_ID': c.get('github_client_id', ''),
         'DISABLE_AUTOUPDATER': '1', 'HF_HOME': str(home / '.cache/huggingface'),
     }
     if c.get('_test_api_base'):

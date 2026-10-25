@@ -75,6 +75,24 @@ sudo python3 /opt/telegram-agent-hub/install.py --uninstall
 
 工具审计只记录工具名称和任务结果，不提供完整文件差异或一键回滚。
 
+## 外部平台授权（GitHub / Cloudflare）
+
+让机器人在任务里代替你操作 GitHub 与 Cloudflare。入口在「更多 → 平台授权」。
+
+**GitHub 走设备码流程**，不需要回调地址，也不需要 client secret。先在 GitHub 注册一个 OAuth App（Settings → Developer settings → OAuth Apps → New OAuth App），**务必勾选 Enable Device Flow**，把 client_id 填到安装配置的 `github_client_id`。之后在电报里点「授权GitHub」，机器人给出 8 位设备码，你在任意设备的浏览器打开 `github.com/login/device` 输入即可，机器人会自己等到授权完成并通知你，**不需要回填任何东西**。
+
+**Cloudflare 走 API 令牌**。Cloudflare 对第三方应用只开放授权码流程，不支持设备码，而授权码流程要求一个真实的 HTTPS 回调地址——机器人跑在没有公网回调的服务端，所以这里改为粘贴令牌。点「授权Cloudflare」后到控制台创建令牌，按需只勾要用的站点与权限，整段发给机器人即可。不接受账号密码和 Global API Key。
+
+凭据去向：
+
+- 只存在 `~/tasks/credentials.json`，权限 0600，不进 git、不进任务记录、不进日志。
+- 只在**新任务启动时**以子进程环境变量注入：GitHub → `GH_TOKEN`，Cloudflare → `CLOUDFLARE_API_TOKEN`。任务结束即消失，不写进任何 shell 启动文件。
+- 未授权的平台会把它那一族环境变量一起剔除（含 `GITHUB_TOKEN`、`CLOUDFLARE_API_KEY` 等），避免任务静默用到服务器上残留的别人的令牌。
+- 「授权状态」只显示指纹与作用范围，任何情况下都不显示令牌原文。
+- 「撤销授权」只删本地那份，**平台侧的授权仍然存在**，需要在 GitHub 的 Authorized OAuth Apps 或 Cloudflare 的令牌列表里另行撤销。
+
+边界说明：设备码有效期 15 分钟，过期需重新发起；同一 OAuth App 每小时最多申请 50 次设备码。注入的是长期令牌，机器人侧无法感知它被平台吊销，只会在下次调用时失败——所以「授权状态」显示的是**有没有保存**，不是**现在一定能用**。
+
 ## 仓库里没有什么
 
 为了安全，这个仓库**不包含**任何个人记忆、运行日志、原生会话、SSH 私钥、模型配置、桌面登录态或真实主机地址。装完之后所有配置都在你自己的机器上。
@@ -93,10 +111,13 @@ python3 test_codex_engine.py    # Codex 执行器参数与环境变量映射
 python3 test_installer.py       # 安装器配置校验与代码生成
 python3 test_menu_layout.py     # 键盘按钮与分组菜单一致性
 python3 test_auth_channel.py    # 网关/账号双渠道切换
+python3 test_platform_auth.py   # GitHub/Cloudflare 授权、凭据存取与注入
 python3 test_image_tool.py      # 生图 MCP 工具与协议测试
 python3 security_check.py       # 提交前的敏感信息扫描
 bash -n get.sh && bash -n install.sh
 ```
+
+`verify_platform_auth.py` 是授权功能的**反向验证脚本**：它把 8 处保护逐条故意改坏，确认 `test_platform_auth.py` 真的报红。永远绿的测试等于没有测试，改动授权相关代码后请跑一遍。
 
 `test_hardening.py` 里每个用例都对应一处真实缺陷，注释写明缺陷现象，并可用「把修复改回原写法、测试必须报红」的方式自检。**改完代码请先删掉 `__pycache__` 再跑测试**——陈旧的 `bot.cpython-*.pyc` 会让测试读到旧字节码，从而给出全绿的假象（本项目踩过）。
 

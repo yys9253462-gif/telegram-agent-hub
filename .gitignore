@@ -10,6 +10,9 @@ venv/
 *.pfx
 *credentials*
 *secrets*
+# 但存放凭据的模块本身是源码，必须入库 —— 否则安装后缺文件，
+# 而 .gitignore 挡住的提交不会报任何错，只在运行时报 ImportError。
+!credentials.py
 config.json
 image.json
 models.json
