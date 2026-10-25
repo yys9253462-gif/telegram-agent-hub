@@ -19,9 +19,9 @@ REPO="yys9253462-gif/telegram-agent-hub"
 REF="${AGENT_REF:-}"
 SHA256="${AGENT_ARCHIVE_SHA256:-}"
 VERSION_URLS=(
-    "https://cdn.jsdelivr.net/gh/$REPO@main/version.txt"
     "https://raw.githubusercontent.com/$REPO/main/version.txt"
     "https://ghproxy.net/https://raw.githubusercontent.com/$REPO/main/version.txt"
+    "https://cdn.jsdelivr.net/gh/$REPO@main/version.txt"
 )
 
 say() { printf '%s\n' "$*"; }
@@ -57,7 +57,8 @@ if [ -z "$REF" ]; then
         version="$(curl --proto '=https' --proto-redir '=https' -fsSL --max-time 30 "$url" 2>/dev/null || true)"
         ref_line="$(printf '%s' "$version" | tr -d '\r' | grep -E '^[0-9a-f]{40}$' | head -1 || true)"
         sha_line="$(printf '%s' "$version" | tr -d '\r' | grep -E '^sha256:[0-9a-f]{64}$' | head -1 | cut -d: -f2 || true)"
-        # jsdelivr 缓存刷新最快，排在最前；拿到首个合法版本即采用。
+        # raw 最先取（无缓存滞后）；jsdelivr 作最后兜底，但它对 main 分支有数小时缓存，
+        # 可能返回旧版本号，所以只在其他源都不通时才用。
         if [ -n "$ref_line" ]; then
             REF="$ref_line"
             [ -n "$sha_line" ] && SHA256="$sha_line"
