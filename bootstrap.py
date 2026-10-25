@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""从 GitHub 私有仓库固定提交下载源码，安全解包后执行安装器。"""
+"""从 GitHub 公开仓库的固定提交下载源码，安全解包后执行安装器。
+
+公开仓库不需要任何访问令牌；脚本不使用、不请求、不保存 GitHub 凭据。
+固定提交（完整 40 字符 SHA）由发布者给出，避免默认分支被改动后静默升级。
+"""
 import argparse
-import getpass
 import io
-import json
 import os
 import re
 import shutil
@@ -17,7 +19,7 @@ import urllib.request
 from pathlib import Path, PurePosixPath
 
 # 发布者应填入实际仓库和经过审阅的完整提交 SHA；不使用浮动默认分支。
-DEFAULT_REPO = ''
+DEFAULT_REPO = 'yys9253462-gif/telegram-agent-hub'
 DEFAULT_REF = ''
 MAX_ARCHIVE = 64 * 1024 * 1024
 MAX_EXTRACTED = 128 * 1024 * 1024
@@ -32,35 +34,29 @@ class SafeRedirect(urllib.request.HTTPRedirectHandler):
         target = urllib.parse.urlsplit(newurl)
         if target.scheme != 'https' or target.hostname != 'codeload.github.com' or target.port not in (None, 443) or target.username or target.password:
             raise BootstrapError('拒绝非 GitHub codeload HTTPS 重定向')
-        # 新请求从零创建，不复制 Authorization、Cookie 或其他身份信息。
+        # 新请求从零创建，不携带任何身份信息。
         return urllib.request.Request(newurl, headers={'User-Agent': 'telegram-agent-hub-bootstrap'})
 
 
-def github_token():
-    supplied = os.environ.pop('AGENT_GITHUB_TOKEN', '')
-    if supplied:
-        return supplied
-    if shutil.which('gh'):
-        result = subprocess.run(['gh', 'auth', 'token', '--hostname', 'github.com'], stdout=subprocess.PIPE,
-                                stderr=subprocess.DEVNULL, text=True)
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip()
-    token = getpass.getpass('GitHub 私有仓库只读 PAT（只在内存使用，不保存）: ').strip()
-    if not token or any(ord(c) < 33 or ord(c) > 126 for c in token):
-        raise BootstrapError('GitHub token 无效')
-    return token
-
-
-def fetch_archive(repo, commit, token):
+def fetch_archive(repo, commit):
+    """公开仓库匿名下载归档；不发送 Authorization。"""
     url = 'https://api.github.com/repos/' + repo + '/tarball/' + commit
     request = urllib.request.Request(url, headers={
-        'Authorization': 'Bearer ' + token,
         'Accept': 'application/vnd.github+json',
         'X-GitHub-Api-Version': '2022-11-28',
         'User-Agent': 'telegram-agent-hub-bootstrap',
     })
-    with urllib.request.build_opener(SafeRedirect()).open(request, timeout=60) as response:
-        body = response.read(MAX_ARCHIVE + 1)
+    try:
+        with urllib.request.build_opener(SafeRedirect()).open(request, timeout=90) as response:
+            body = response.read(MAX_ARCHIVE + 1)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            raise BootstrapError('仓库或提交不存在；若仓库为私有，请改为手动克隆后执行 bash install.sh') from None
+        if exc.code == 403:
+            raise BootstrapError('GitHub 拒绝匿名访问（可能触发限流），请稍后重试') from None
+        raise BootstrapError('下载失败，状态码 ' + str(exc.code)) from None
+    except urllib.error.URLError:
+        raise BootstrapError('无法连接 GitHub，请检查网络或代理设置') from None
     if len(body) > MAX_ARCHIVE:
         raise BootstrapError('仓库归档超过大小限制')
     return body
@@ -91,9 +87,10 @@ def extract_archive(data, destination):
             target = destination / relative
             if not target.resolve().is_relative_to(destination):
                 raise BootstrapError('归档路径越界')
-            if str(relative) in seen:
+            key = str(relative)
+            if key in seen:
                 raise BootstrapError('归档包含重复路径')
-            seen.add(str(relative))
+            seen.add(key)
             total += member.size
             if member.size < 0 or total > MAX_EXTRACTED:
                 raise BootstrapError('归档解包大小超出限制')
@@ -114,21 +111,19 @@ def extract_archive(data, destination):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--repo', default=DEFAULT_REPO, help='owner/repository')
-    parser.add_argument('--ref', default=DEFAULT_REF, help='完整的 40 字符 commit SHA')
+    parser = argparse.ArgumentParser(description='从公开仓库固定提交安装电报双智能体工作台')
+    parser.add_argument('--repo', default=DEFAULT_REPO, help='owner/repository，默认官方仓库')
+    parser.add_argument('--ref', default=DEFAULT_REF, help='完整的 40 字符 commit SHA，默认使用内置固定版本')
     parser.add_argument('--download-only', action='store_true', help='仅解包，不执行安装器')
     parser.add_argument('--output', type=Path, help='仅下载时使用，目标目录必须不存在')
     args, installer_args = parser.parse_known_args(argv)
     if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', args.repo):
-        raise BootstrapError('请通过 --repo 指定真实仓库 owner/repository')
+        raise BootstrapError('仓库名必须是 owner/repository 形式')
     if not re.fullmatch(r'[0-9a-fA-F]{40}', args.ref):
-        raise BootstrapError('--ref 必须是审阅过的完整 40 字符 commit SHA')
+        raise BootstrapError('缺少固定提交；请使用发布页给出的完整 40 字符 commit SHA')
     if args.output and not args.download_only:
         raise BootstrapError('--output 仅用于 --download-only')
-    token = github_token()
-    data = fetch_archive(args.repo, args.ref, token)
-    token = None
+    data = fetch_archive(args.repo, args.ref)
     if args.download_only:
         destination = args.output or Path(tempfile.mkdtemp(prefix='telegram-agent-hub-download-')) / 'source'
         destination.mkdir(mode=0o700, parents=False, exist_ok=False)
@@ -151,5 +146,5 @@ if __name__ == '__main__':
     try:
         sys.exit(main())
     except (BootstrapError, OSError, ValueError, tarfile.TarError) as exc:
-        print('引导失败：' + (str(exc) if isinstance(exc, BootstrapError) else type(exc).__name__) + '。认证信息不会写入文件或日志。', file=sys.stderr)
+        print('引导失败：' + (str(exc) if isinstance(exc, BootstrapError) else type(exc).__name__) + '。', file=sys.stderr)
         sys.exit(1)

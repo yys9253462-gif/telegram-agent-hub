@@ -23,3 +23,6 @@ backups/
 *.tar.gz
 *.zip
 *.log
+
+# 生产定版含真实主机地址与内部信息，只在本机保留，绝不入库。
+bot_prod.py

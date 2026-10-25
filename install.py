@@ -70,6 +70,23 @@ def ask(label, default='', secret=False):
     return (getpass.getpass(prompt) if secret else input(prompt)).strip() or default
 
 
+def welcome():
+    """首次安装给出一句话说明与获取凭据的路径，避免用户卡在第一步。"""
+    print('''
+============================================================
+ 电报双智能体工作台 · 安装向导
+============================================================
+安装过程会询问少量必填配置，密钥输入时不回显。
+开始前请准备好：
+  1. 电报机器人令牌：在对 Telegram 的 @BotFather 发送 /newbot 获取
+  2. 你自己的数字用户编号：对 @userinfobot 发送任意消息即可看到
+  3. 模型网关地址与密钥：任何兼容 Anthropic 或 OpenAI 协议的网关
+  4. （可选）生图接口地址、密钥与模型名
+按 Ctrl+C 可随时中止，不会留下半成品服务。
+============================================================
+''')
+
+
 def boolean(label, default=False):
     while True:
         answer = input(label + (' [Y/n，是/否]: ' if default else ' [y/N，是/否]: ')).strip().lower()
@@ -85,6 +102,8 @@ def boolean(label, default=False):
 def collect_config(old, yes=False):
     c = dict(old)
     if not yes:
+        if not old:
+            welcome()
         for key, label, secret in [
             ('telegram_bot_token', 'Telegram Bot Token', True),
             ('telegram_owner_id', 'Telegram owner 数字 ID', False),
@@ -151,13 +170,15 @@ def validate_config(c):
             env_quote(value)
 
 
-def run(command, *, user=None, home=None, capture=False, quiet=False):
+def run(command, *, user=None, home=None, capture=False, quiet=False, stdin_text=None):
     env = os.environ.copy()
     if home:
         env.update(HOME=str(home), PATH=str(home / '.local/bin') + ':' + os.environ.get('PATH', '/usr/bin:/bin'))
     if user:
         command = ['runuser', '-u', user, '--', 'env', 'HOME=' + str(home), 'PATH=' + env['PATH']] + list(command)
-    result = subprocess.run(command, env=env, text=True, stdout=subprocess.PIPE if capture or quiet else None,
+    result = subprocess.run(command, env=env, text=True, stdin=subprocess.PIPE if stdin_text is not None else None,
+                            input=stdin_text,
+                            stdout=subprocess.PIPE if capture or quiet else None,
                             stderr=subprocess.PIPE if capture or quiet else None)
     if result.returncode:
         raise InstallError('命令失败：' + Path(command[0]).name + '（输出已隐藏，避免泄露认证信息）')
@@ -198,6 +219,7 @@ def runtime_environment(c, home):
         'REMOTE_LABEL': c.get('remote_label', '远程服务器'), 'ENABLED_AGENTS': ','.join(engines),
         'VOICE_ENABLED': '1' if c['voice_enabled'] else '0', 'WHISPER_MODEL': 'tiny',
         'IMAGE_CONFIG': str(CONFIG / 'image.json'), 'IMAGE_CONFIG_FILE': str(CONFIG / 'image.json'),
+        'AGENT_TOOL_PYTHON': '/usr/bin/python3',
         'IMAGE_MODEL': c.get('image_model', '') if c['image_enabled'] else '',
         'IMAGE_MODELS': c.get('image_model', '') if c['image_enabled'] else '',
         'DISABLE_AUTOUPDATER': '1', 'HF_HOME': str(home / '.cache/huggingface'),
@@ -506,6 +528,10 @@ def install(args, c):
             atomic_write(CONFIG / 'image.json', json_text(image), 0o640, 0, gid)
         else:
             (CONFIG / 'image.json').unlink(missing_ok=True)
+        # 生图工具与桥接程序同目录，缺一即视为通道未启用。
+        tool_path = APP / 'image_tool.py'
+        if c['image_enabled'] and not tool_path.exists():
+            raise InstallError('生图工具缺失：' + str(tool_path))
         atomic_write(CONFIG / 'bot.env', environment_text(runtime_environment(c, home)), 0o640, 0, gid)
         # 导入路径只是安装输入，避免保存调用者的本机路径。
         stored = {k: v for k, v in c.items() if k != 'ssh_import_path' and not k.startswith('_')}
@@ -520,6 +546,12 @@ def install(args, c):
         restarts = run(['systemctl', 'show', args.service_name, '--property=NRestarts', '--value'], capture=True).strip()
         if restarts != '0':
             raise InstallError('服务启动后发生自动重启，已触发安装回滚')
+        if c['image_enabled']:
+            # 用桥接程序的环境跑一次协议握手，确认生图工具真的可用。
+            probe = run([str(APP / '.venv/bin/python'), str(tool_path)], user=user, home=home, capture=True,
+                        stdin_text=json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/list', 'params': {}}) + '\n')
+            if 'generate_image' not in probe:
+                raise InstallError('生图工具协议自检失败，已触发安装回滚')
     except BaseException:
         subprocess.run(['systemctl', 'stop', args.service_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if not was_enabled:

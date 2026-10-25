@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# 已克隆仓库时使用：bash install.sh
+# 未克隆时用一条命令：curl -fsSL https://raw.githubusercontent.com/yys9253462-gif/telegram-agent-hub/main/get.sh | bash
 set -euo pipefail
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 if ! command -v python3 >/dev/null 2>&1; then
