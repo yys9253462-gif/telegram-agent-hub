@@ -10,6 +10,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -852,6 +853,86 @@ class OAuthTokenShapedCredentialTest(unittest.TestCase):
         """放开形态不能把正常任务描述也放进来 —— 那会在等待态里被误吞成令牌。"""
         for value in ('这是一句普通的任务描述', '幫我把这个仓库的 CI 修一下', 'please deploy it now'):
             self.assertFalse(looks_like('cloudflare', value), value)
+
+
+class CloudflareScopeTest(unittest.TestCase):
+    """缺陷：申请的权限里没有 user:read，/user 校验返回 403，令牌被误判为不可用。
+
+    官方（wrangler）可申请的权限只有 account:read、user:read、workers:write、
+    workers_kv:write、workers_routes:write、workers_scripts:write、
+    workers_tail:read、zone:read 这几项。
+    """
+
+    def test_scope_includes_user_read(self):
+        self.assertIn('user:read', cloudflare_auth.DEFAULT_SCOPE.split())
+
+    def test_scope_uses_only_official_scopes(self):
+        official = {'account:read', 'user:read', 'workers:write', 'workers_kv:write',
+                    'workers_routes:write', 'workers_scripts:write', 'workers_tail:read',
+                    'zone:read', 'offline_access'}
+        for scope in cloudflare_auth.DEFAULT_SCOPE.split():
+            self.assertIn(scope, official, '不是官方有效的权限名：' + scope)
+
+
+class FakeResponse:
+    def __init__(self, body):
+        self.body = body
+
+    def read(self):
+        return json.dumps(self.body).encode()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+class CloudflareWhoamiTest(unittest.TestCase):
+    """whoami 的三种结果：读到身份、没权限但令牌可用、令牌真的不行。"""
+
+    def call(self, user_status, user_body, zones_body=None, accounts_body=None):
+        import urllib.error
+
+        def fake_urlopen(request, timeout=None):
+            url = request.full_url
+            if '/user' in url and '/tokens/' not in url:
+                if user_status == 200:
+                    return FakeResponse(user_body)
+                raise urllib.error.HTTPError(url, user_status, 'x', None, None)
+            if '/zones' in url:
+                if zones_body is None:
+                    raise urllib.error.HTTPError(url, 403, 'x', None, None)
+                return FakeResponse(zones_body)
+            if '/accounts' in url:
+                if accounts_body is None:
+                    raise urllib.error.HTTPError(url, 403, 'x', None, None)
+                return FakeResponse(accounts_body)
+            raise urllib.error.HTTPError(url, 404, 'x', None, None)
+
+        with patch('cloudflare_auth.urllib.request.urlopen', side_effect=fake_urlopen):
+            return cloudflare_auth.whoami('cfut_' + 'Xy9' * 8)
+
+    def test_identity_is_reported_when_user_read_granted(self):
+        result = self.call(200, {'success': True, 'result': {'email': 'a@b.test', 'id': 'uid'}})
+        self.assertTrue(result['identity'])
+        self.assertEqual(result['email'], 'a@b.test')
+
+    def test_missing_user_read_still_accepts_working_token(self):
+        """令牌可用但没有账号信息权限时，必须照常通过校验，不能让人以为令牌被撤销。"""
+        result = self.call(403, None, zones_body={'success': True, 'result': []})
+        self.assertFalse(result['identity'])
+        self.assertEqual(result['email'], '')
+
+    def test_revoked_token_is_rejected(self):
+        with self.assertRaises(cloudflare_auth.CloudflareError) as caught:
+            self.call(401, None)
+        self.assertIn('失效', str(caught.exception))
+
+    def test_token_without_any_scope_is_rejected(self):
+        with self.assertRaises(cloudflare_auth.CloudflareError) as caught:
+            self.call(403, None)
+        self.assertIn('权限', str(caught.exception))
 
 
 class SensitiveFileTest(unittest.TestCase):

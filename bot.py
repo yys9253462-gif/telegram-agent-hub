@@ -753,6 +753,14 @@ def cloudflare_poll_worker(chat, snapshot):
         expire_note = ('\n注意：这是 OAuth 访问令牌，约 '
                        + str(max(1, int(body['expires_in']) // 86400)) + ' 天后过期，'
                        '过期后重新发「授权Cloudflare」即可。')
+    if not who.get('identity', True):
+        # 令牌没有 user:read 权限：能用但读不到账号信息，要讲清楚，不能让人误以为被撤销。
+        notify(chat, 'Cloudflare 授权成功（令牌可用，但没有读取账号信息的权限，因此不显示账号）。'
+                  + '\n范围：' + (scope or '未返回')
+                  + '\n凭据已写入本机，仅在新任务启动时以 CLOUDFLARE_API_TOKEN 注入执行器。'
+                  + expire_note
+                  + '\n查询状态：「授权状态」；撤销：「撤销Cloudflare」。')
+        return
     notify(chat, 'Cloudflare 授权成功，账号：' + (who['email'] or who['id'] or '（未返回）')
                   + '\n范围：' + (scope or '未返回')
                   + '\n凭据已写入本机，仅在新任务启动时以 CLOUDFLARE_API_TOKEN 注入执行器。'

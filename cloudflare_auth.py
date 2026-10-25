@@ -41,8 +41,11 @@ GRANT_TYPE = 'urn:ietf:params:oauth:grant-type:device_code'
 CLIENT_UA = 'wrangler/4.42.0'
 ACCEPT = 'application/json'
 # 申请的权限。offline_access 是拿 refresh_token 的前提，没有它访问令牌一过期就得重新授权；
-# 其余三项覆盖诊断最常用的读操作。写操作权限刻意不默认申请 —— 默认最小。
-DEFAULT_SCOPE = 'offline_access account:read zone:read workers:read'
+# 其余按 wrangler 官方有效的权限清单申请：读账号、读用户、读站点、读 Worker 日志。
+# 写操作权限刻意不默认申请 —— 默认最小。
+# 注意：user:read 必须包含在内，/user 接口只认它；少了这一项校验会返回 403，
+# 而令牌本身是好的。workers:read 并不是官方权限名，写错会被忽略。
+DEFAULT_SCOPE = 'offline_access account:read user:read zone:read workers_tail:read'
 
 
 class CloudflareError(Exception):
@@ -190,6 +193,11 @@ def whoami(token, timeout=20):
 
     这是行为验证而不是看状态字段：OAuth 访问令牌不能走 /user/tokens/verify
     （那是给 API 令牌用的），所以真正可靠的判定就是真发一个请求看返回。
+
+    /user 需要 user:read 权限。令牌没给这一项时它会返回 403，但那不代表令牌坏了 ——
+    这时改用令牌有权访问的接口（/zones、/accounts）验证，验证通过就照常保存，
+    只是拿不到账号邮箱。这两种情况的区别必须讲清楚，否则机主会以为令牌被撤销，
+    白白重新授权一次。
     """
     request = urllib.request.Request(API_BASE + '/user', headers={
         'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json',
@@ -198,11 +206,40 @@ def whoami(token, timeout=20):
         with urllib.request.urlopen(request, timeout=timeout) as response:
             body = json.load(response)
     except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            raise CloudflareError('令牌已失效或被撤销，请重新授权。') from None
+        if exc.code == 403:
+            return _verify_without_identity(token, timeout)
         raise CloudflareError('令牌校验失败（HTTP ' + str(exc.code) + '），可能已撤销或权限不足。') from None
     except (urllib.error.URLError, OSError, ValueError):
         raise CloudflareError('无法连接 Cloudflare 校验令牌。') from None
     result = (body or {}).get('result') or {}
-    return {'email': result.get('email') or '', 'id': result.get('id') or ''}
+    return {'email': result.get('email') or '', 'id': result.get('id') or '',
+            'identity': True}
+
+
+def _verify_without_identity(token, timeout=20):
+    """令牌没有 user:read 时，改用有权访问的接口证明它可用。
+
+    只要有一个授权范围内的接口返回成功，就说明令牌本身有效，
+    只是读不到账号信息 —— 这时应当把令牌保存下来继续用。
+    """
+    for url in (ZONES_URL, ACCOUNTS_URL):
+        request = urllib.request.Request(url, headers={
+            'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json',
+            'User-Agent': 'telegram-agent-hub'})
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                body = json.load(response)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 401:
+                raise CloudflareError('令牌已失效或被撤销，请重新授权。') from None
+            continue
+        except (urllib.error.URLError, OSError, ValueError):
+            raise CloudflareError('无法连接 Cloudflare 校验令牌。') from None
+        if body.get('success'):
+            return {'email': '', 'id': '', 'identity': False}
+    raise CloudflareError('令牌能取到，但没有任何可用的访问权限，请重新授权并同意所需权限。')
 
 
 def _get(url, token, timeout=20):
