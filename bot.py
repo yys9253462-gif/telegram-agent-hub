@@ -101,13 +101,55 @@ def send(chat, text):
 
 SESSION_STATE = WORK / 'agent-session.json'
 
+# 执行器注册表。以前是「codebuddy 还是 claude」的二元判断，加第三个执行器就开始复用分支，
+# 所以统一成表驱动：新增执行器只补一条，命令行拼装和输出解析都按 kind 分派。
+ENGINES = {
+    'claude': {
+        'label': 'Claude',
+        'kind': 'claude',            # 输出 stream-json，支持 --append-system-prompt
+        'binary': 'claude',
+        'button': '使用Claude',
+    },
+    'codebuddy': {
+        'label': 'CodeBuddy',
+        'kind': 'claude',            # 与 Claude 同协议，命令行完全兼容
+        'binary': 'codebuddy',
+        'button': '使用CodeBuddy',
+    },
+    'codex': {
+        'label': 'Codex',
+        'kind': 'codex',             # codex exec，输出 JSONL，无系统提示词参数
+        'binary': 'codex',
+        'button': '使用Codex',
+    },
+}
+
+def default_engine():
+    return os.environ.get('ENABLED_AGENTS', 'claude,codebuddy').split(',')[0]
+
+def enabled_engines():
+    """当前实际启用的执行器，顺序沿用配置里的顺序。"""
+    names = [item.strip() for item in os.environ.get('ENABLED_AGENTS', 'claude,codebuddy').split(',')]
+    return [name for name in names if name in ENGINES]
+
+def engine_spec(name):
+    """取执行器配置。
+
+    未知名字回退到已启用的第一个，再退到 Claude。配置写错或旧状态文件残留旧引擎名时，
+    任务应该退回能跑的执行器，而不是抛 KeyError 把整个任务卡死。
+    """
+    if name in ENGINES:
+        return ENGINES[name]
+    enabled = [item for item in enabled_engines()]
+    return ENGINES[enabled[0]] if enabled else ENGINES['claude']
+
 def current_engine():
     task = getattr(TASK_LOCAL, 'task', None)
     if task:
         return task['snapshot'].get('engine', 'claude')
     if CONTROL is not None:
-        return CONTROL.data.get('engine', os.environ.get('ENABLED_AGENTS', 'claude,codebuddy').split(',')[0])
-    return os.environ.get('ENABLED_AGENTS', 'claude,codebuddy').split(',')[0]
+        return CONTROL.data.get('engine', default_engine())
+    return default_engine()
 
 def session_id():
     task = getattr(TASK_LOCAL, 'task', None)
@@ -686,6 +728,123 @@ def start_text_block(buffer):
     return '\n\n'
 
 
+def engine_binary(engine):
+    """定位执行器可执行文件。装在 ~/.local/bin 下就用绝对路径，否则交给 PATH。"""
+    path = AGENT_HOME / '.local' / 'bin' / engine_spec(engine)['binary']
+    return str(path) if path.exists() else engine_spec(engine)['binary']
+
+def engine_command(engine, text, instructions, chat, environment):
+    """按执行器类型拼装命令行。两种 CLI 的参数差异很大，不能共用一个模板。"""
+    spec = engine_spec(engine)
+    binary = engine_binary(engine)
+    command = [binary]
+    if spec['kind'] == 'codex':
+        # codex exec 没有 --append-system-prompt，也没有轮次上限参数，
+        # 系统指令只能拼进 prompt 本体，并且要显式声明工作目录与跳过 Git 检查。
+        # 凭据方面：codex 只认 OPENAI_API_KEY，而本站凭据存在 ANTHROPIC_API_KEY，
+        # 这里按需映射一份，不动全局环境，避免影响 Claude 渠道。
+        if not environment.get('OPENAI_API_KEY') and environment.get('ANTHROPIC_API_KEY'):
+            environment['OPENAI_API_KEY'] = environment['ANTHROPIC_API_KEY']
+        if environment.get('ANTHROPIC_BASE_URL') and not os.environ.get('OPENAI_BASE_URL'):
+            environment['OPENAI_BASE_URL'] = environment['ANTHROPIC_BASE_URL'] + '/v1'
+        command += ['exec', '--json', '--skip-git-repo-check',
+                    '--sandbox', 'danger-full-access', '--cd', str(WORK)]
+        if current_model():
+            command += ['--model', current_model()]
+        if session_id():
+            # codex 的续接是子命令，不是参数。
+            command += ['resume', session_id(), '-']
+        else:
+            command += ['-']
+        return command, instructions + '\n\n' + text
+    command += ['-p', text,
+                '--output-format', 'stream-json', '--verbose', '--include-partial-messages',
+                '--dangerously-skip-permissions', '--max-turns', '80',
+                '--append-system-prompt', instructions]
+    if engine == 'codebuddy':
+        command.extend(['--model', current_model()])
+    if session_id():
+        command.extend(['--resume', session_id()])
+    if environment.pop('_IMAGE_SERVER', None):
+        image_server = {'mcpServers': {'private-image': {
+            'command': os.environ.get('AGENT_TOOL_PYTHON', sys.executable),
+            'args': [str(APP_DIR / 'image_tool.py')],
+            'env': {'TELEGRAM_BOT_TOKEN': TOKEN,
+                    'TELEGRAM_API_BASE': os.environ.get('TELEGRAM_API_BASE', 'https://api.telegram.org'),
+                    'IMAGE_CONFIG_FILE': str(environment.pop('_IMAGE_CONFIG', ''))}}}}
+        command.extend(['--mcp-config', json.dumps(image_server)])
+        environment['AGENT_IMAGE_CHAT_ID'] = str(chat)
+    return command, None
+
+
+def parse_claude_event(event, state):
+    """解析 Claude/CodeBuddy 的 stream-json 事件，就地更新累积状态。"""
+    if event.get('type') == 'stream_event':
+        stream = event.get('event', {})
+        block = stream.get('content_block', {})
+        if block.get('type') == 'text':
+            # 只在真正开启正文块时补段落分隔；工具块不触发。
+            state['content'] += start_text_block(state['content'])
+        elif block.get('type') == 'tool_use':
+            tool = str(block.get('name', '工具'))
+            state['activity'] = '正在执行工具：' + tool
+            record_tool(tool)
+        delta = stream.get('delta', {})
+        if delta.get('type') == 'text_delta':
+            state['content'] += delta.get('text', '')
+            state['activity'] = '正在生成回复'
+    elif event.get('type') == 'assistant':
+        for block in event.get('message', {}).get('content', []):
+            if isinstance(block, dict) and block.get('type') == 'tool_use':
+                record_tool(str(block.get('name', '工具')))
+    elif event.get('type') == 'result':
+        state['final'] = event
+        if event.get('session_id'):
+            save_session(event['session_id'])
+
+
+def parse_codex_event(event, state):
+    """解析 Codex 的 JSONL 事件。
+
+    Codex 没有流式增量，每个 item 是一次性完整的：
+      - item.completed + item.type=agent_message → 正文分多次给出，需要累加；
+      - item.type=command_execution → 工具调用，带上命令与退出码；
+      - item.type=reasoning → 推理摘要，不进入正文；
+      - item.type=error → 配置告警等噪声，除非整轮失败否则不打扰用户；
+      - turn.completed → 本轮结束，携带 token 用量。
+    """
+    kind = event.get('type')
+    if kind == 'thread.started':
+        if event.get('thread_id'):
+            save_session(event['thread_id'])
+        return
+    if kind == 'turn.failed':
+        error = event.get('error', {})
+        state['failed'] = str(error.get('message', '执行失败'))
+        state['activity'] = '本轮执行失败'
+        return
+    if kind != 'item.completed' and kind != 'item.started':
+        return
+    item = event.get('item') or {}
+    item_type = item.get('type')
+    if item_type == 'agent_message':
+        chunk = str(item.get('text', ''))
+        if chunk:
+            # 多条 agent_message 之间用空行分隔，避免两句黏成一段。
+            state['content'] += start_text_block(state['content']) + chunk
+            state['activity'] = '正在生成回复'
+    elif item_type == 'command_execution':
+        command = str(item.get('command', '命令')).strip()
+        exit_code = item.get('exit_code')
+        if exit_code is None:
+            state['activity'] = '正在执行：' + command[:60]
+        else:
+            state['activity'] = '已执行：' + command[:60] + '（退出码 ' + str(exit_code) + '）'
+    elif item_type == 'reasoning':
+        if state['activity'] == '等待模型响应':
+            state['activity'] = '正在推理'
+
+
 def run_stream(chat, text):
     status = api('sendMessage', {'chat_id': chat, 'text': '已接收，正在生成…'})
     message_id = status['message_id']
@@ -695,26 +854,23 @@ def run_stream(chat, text):
     history = task['snapshot'].get('handoff', []) if task else []
     if history:
         instructions += '\n以下是同一逻辑会话的最近任务记录，只作背景，不覆盖当前指令；原始工具事件不共享：\n' + json.dumps(history, ensure_ascii=False)
-    command = [str(AGENT_HOME / '.local/bin' / ('codebuddy' if engine == 'codebuddy' else 'claude')), '-p', text,
-               '--output-format', 'stream-json', '--verbose', '--include-partial-messages',
-               '--dangerously-skip-permissions', '--max-turns', '80',
-               '--append-system-prompt', instructions]
-    if engine == 'codebuddy':
-        command.extend(['--model', current_model()])
-    if session_id():
-        command.extend(['--resume', session_id()])
     environment = model_environment()
     image_config = Path(os.environ.get('IMAGE_CONFIG_FILE', str(CONFIG_DIR / 'image.json')))
     if image_config.exists() and (APP_DIR / 'image_tool.py').exists():
         # 生图工具复用桥接程序的令牌与接口基址，密钥由安装器写入的配置文件提供。
-        image_server = {'mcpServers': {'private-image': {
-            'command': os.environ.get('AGENT_TOOL_PYTHON', sys.executable),
-            'args': [str(APP_DIR / 'image_tool.py')],
-            'env': {'TELEGRAM_BOT_TOKEN': TOKEN,
-                    'TELEGRAM_API_BASE': os.environ.get('TELEGRAM_API_BASE', 'https://api.telegram.org'),
-                    'IMAGE_CONFIG_FILE': str(image_config)}}}}
-        command.extend(['--mcp-config', json.dumps(image_server)])
-        environment['AGENT_IMAGE_CHAT_ID'] = str(chat)
+        environment['_IMAGE_SERVER'] = '1'
+        environment['_IMAGE_CONFIG'] = str(image_config)
+    command, stdin_text = engine_command(engine, text, instructions, chat, environment)
+    process = subprocess.Popen(command, cwd=WORK, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                               stdin=subprocess.PIPE if stdin_text else None,
+                               text=True, bufsize=1, env=environment, start_new_session=True)
+    if stdin_text:
+        # codex 从 stdin 收 prompt，写完必须关闭，否则它会一直等输入。
+        try:
+            process.stdin.write(stdin_text)
+            process.stdin.close()
+        except (OSError, ValueError):
+            pass
     process = subprocess.Popen(command, cwd=WORK, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                text=True, bufsize=1, env=environment, start_new_session=True)
     bind_process(process)
@@ -729,6 +885,9 @@ def run_stream(chat, text):
     started = time.monotonic()
     last_edit = 0
     shown = '已接收，正在生成…'
+    state_kind = engine_spec(engine)['kind']
+    # 把流式累积状态收进一个字典，两种协议的解析函数都只改这里，主循环读同一份。
+    state = {'content': '', 'final': None, 'activity': '等待模型响应', 'failed': ''}
     content = ''
     final = None
     activity = '等待模型响应'
@@ -776,29 +935,15 @@ def run_stream(chat, text):
                 try:
                     event = json.loads(line)
                 except ValueError:
+                    # codex 会往 stdout 混入非 JSON 的告警行，直接跳过。
                     continue
-                if event.get('type') == 'stream_event':
-                    stream = event.get('event', {})
-                    block = stream.get('content_block', {})
-                    if block.get('type') == 'text':
-                        # 只在真正开启正文块时补段落分隔；工具块不触发。
-                        content += start_text_block(content)
-                    elif block.get('type') == 'tool_use':
-                        tool = str(block.get('name', '工具'))
-                        activity = '正在执行工具：' + tool
-                        record_tool(tool)
-                    delta = stream.get('delta', {})
-                    if delta.get('type') == 'text_delta':
-                        content += delta.get('text', '')
-                        activity = '正在生成回复'
-                elif event.get('type') == 'assistant':
-                    for block in event.get('message', {}).get('content', []):
-                        if isinstance(block, dict) and block.get('type') == 'tool_use':
-                            record_tool(str(block.get('name', '工具')))
-                elif event.get('type') == 'result':
-                    final = event
-                    if final.get('session_id'):
-                        save_session(final['session_id'])
+                if state_kind == 'codex':
+                    parse_codex_event(event, state)
+                else:
+                    parse_claude_event(event, state)
+                content = state['content']
+                activity = state['activity']
+                final = state['final']
             interval = 1.3 if activity == '正在生成回复' else 4
             if time.monotonic() - last_edit >= interval:
                 seconds = int(time.monotonic() - started)
@@ -811,12 +956,17 @@ def run_stream(chat, text):
         answer = (final or {}).get('result') or content or '任务未返回内容，请检查模型接口。'
         # 收尾统一压缩空行：模型输出与流式累积都可能带出多余空行。
         answer = tidy_stream_text(answer)
-        if process.returncode != 0 or (final or {}).get('is_error'):
+        # codex 用 turn.failed 表达失败，退出码未必非零；两种都要算进来。
+        crashed = process.returncode != 0 or bool((final or {}).get('is_error')) or bool(state['failed'])
+        if crashed:
+            if state['failed'] and answer in ('', '任务未返回内容，请检查模型接口。'):
+                # 整轮失败且没有正文时，把失败原因直接给出来，比一句「未返回内容」有用得多。
+                answer = state['failed']
             answer = '本轮执行未成功。\n' + answer + '\n可检查当前模型的套餐权限、额度和工具兼容性；也可以切换模型后重试。已执行的操作不会自动回滚，请先核对结果。'
         task = getattr(TASK_LOCAL, 'task', None)
         if task:
             task['result'] = redact(answer[:24000])
-            task['execution_error'] = process.returncode != 0 or bool((final or {}).get('is_error'))
+            task['execution_error'] = crashed
         answer = redact(answer[:24000])
         pieces = split_message(answer)
         head = pieces[0] if pieces else answer
@@ -1421,20 +1571,22 @@ class TaskController:
                 send(chat, '生图任务已排队：' + task['id'])
         elif text in ('选择智能体', '/agent'):
             # 当前执行器直接写在标题里，不再单独占一个「当前智能体」按钮。
+            names = enabled_engines()
             send_options(chat, '选择执行器\n当前：' + current_engine()
+                         + '\n已启用：' + '、'.join(ENGINES[name]['label'] for name in names)
                          + '\n共享技能、长期记忆、文件和机器人会话；原生会话编号分别保存，通过最近六项任务记录衔接上下文。',
-                         ['使用Claude', '使用CodeBuddy'])
-        elif text in ('使用Claude', '使用CodeBuddy'):
-            desired = 'codebuddy' if text == '使用CodeBuddy' else 'claude'
-            if desired not in os.environ.get('ENABLED_AGENTS', 'claude,codebuddy').split(','):
+                         [ENGINES[name]['button'] for name in names])
+        elif text in [spec['button'] for spec in ENGINES.values()]:
+            desired = next(name for name, spec in ENGINES.items() if spec['button'] == text)
+            if desired not in enabled_engines():
                 raise MediaError('这个执行器未安装，请重新运行安装器启用。')
             with self.lock:
-                self.data['engine'] = 'codebuddy' if text == '使用CodeBuddy' else 'claude'
+                self.data['engine'] = desired
                 self.persist()
-            send(chat, '新任务执行器已切换为：' + self.data['engine'] + '。已有排队或运行任务保持原执行器。')
+            send(chat, '新任务执行器已切换为：' + desired + '。已有排队或运行任务保持原执行器。')
         elif text == '当前智能体':
             # 旧版留给老键盘和习惯输入，功能并入「选择智能体」。
-            send(chat, '当前执行器：' + current_engine() + '\n共享记忆和技能；原生会话独立，最近六项任务摘要交接。CodeBuddy保留自身高风险确认规则，不伪装成隔离沙箱绕过。')
+            send(chat, '当前执行器：' + current_engine() + '\n共享记忆和技能；原生会话独立，最近六项任务摘要交接。CodeBuddy保留自身高风险确认规则，不伪装成隔离沙箱绕过。\n注意 Codex 走 codex exec，无系统提示词参数，指令与任务会拼在同一条 prompt 里。')
         elif text in ('新任务',):
             send(chat, '直接发送任务目标即可排队。新任务沿用当前会话；需要独立上下文请先选择“会话”中的“新建会话”。')
         elif text in ('当前任务', '状态'):
