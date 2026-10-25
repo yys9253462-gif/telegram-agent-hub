@@ -74,6 +74,7 @@ MENU_GROUPS = {
     '设置': {
         '任务与模型': ['模型', '选择智能体'],
         '会话与文件': ['新建会话', '会话列表'],
+        '账号登录': ['登录Claude', '登录CodeBuddy', '账号状态', '渠道切换'],
         '版本更新': ['检查版本', '更新机器人'],
     },
     '更多': {
@@ -103,7 +104,8 @@ MENU_LABELS = {
     '设置': '模型与会话', '更多': '授权管理',
     '目标': '执行目标', '模型': '模型设置', '队列': '任务队列',
     '会话': '会话管理', '文件': '文件管理',
-    '登录Claude': '账号登录', '授权GitHub': '仓库授权',
+    '登录Claude': '登录Claude账号', '登录CodeBuddy': '登录CodeBuddy账号',
+    '授权GitHub': '仓库授权',
     '授权Cloudflare': '云端授权', '云flare粘贴令牌': '手动填令牌',
     '返回主菜单': '返回首页',
 }
@@ -2718,6 +2720,16 @@ class TaskController:
             send(chat, '请用手机浏览器打开下面的链接完成授权（可能需要先登录 claude.ai）。\n\n'
                        + url + '\n\n授权后网页会给出一段授权码，把它直接发给我即可。\n'
                        '链接十分钟内有效；期间不要重复发起登录。')
+        elif text == '登录CodeBuddy':
+            binary = AGENT_HOME / '.local/bin/codebuddy'
+            if not binary.is_file():
+                raise MediaError('这台服务器尚未安装 CodeBuddy 执行器，请先由管理员安装。')
+            send(chat, 'CodeBuddy 账号登录目前需要在服务器交互终端完成。\n'
+                       '官方流程：运行下面的命令，选择国内站或国际站，再按终端提示打开浏览器授权。\n\n'
+                       + shlex.quote(str(binary))
+                       + '\n\n请使用机器人运行账号执行。当前尚未接入电报内的登录链接与回填流程，'
+                       '不要把账号密码或登录令牌发到聊天里。\n'
+                       '登录完成不会自动切换当前配置的模型网关。')
         elif text == '账号状态':
             ok, detail = account_authorized()
             send(chat, 'Claude 账号：' + ('已登录\n' + detail if ok else '未登录')
