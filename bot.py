@@ -2563,7 +2563,14 @@ def record_tool(name):
 def sensitive_path(path):
     parts = [part.lower() for part in path.parts]
     name = path.name.lower()
-    return (any(part in ('.ssh', '.aws', '.gnupg', '.kube') for part in parts)
+    # 这条清单是「发文件」功能唯一的防线：一旦放行，机主随手一条
+    # 「把 /home/x/.codex/auth.json 发我」就把登录态原文甩进了聊天记录。
+    # 所以除了通用关键词，还要显式列出各家 CLI 的真实凭据文件名。
+    secret_names = ('.netrc', '_netrc', '.git-credentials', '.npmrc', '.pypirc',
+                    'auth.json', 'sessions.json', 'cookies.json', 'keyring.json',
+                    'known_hosts', '.pgpass')
+    return (any(part in ('.ssh', '.aws', '.gnupg', '.kube', '.docker', '.config') for part in parts)
+            or name in secret_names
             or name == '.env' or name.startswith('.env.') or name.endswith(('.pem', '.key', '.p12', '.pfx', '.jks', '.blocked'))
             or name.startswith(('id_rsa', 'id_ed25519', 'id_ecdsa', 'id_dsa'))
             or any(word in name for word in ('credential', 'secret', 'token', 'passwd', 'shadow')))
@@ -2732,6 +2739,16 @@ class TaskController:
         self._normalize()
         self.target = self.data.get('target', '本机')
         self.seen = set(self.data.get('seen', []))
+        # 已处理更新的最高编号。重启后 Telegram 会把 offset 之后的更新重新投递，
+        # 其中有相当一部分在上一轮已经处理过、只是还没赶上落盘。
+        # 只靠 seen 集合去重是有漏洞的（集合会裁剪、落盘又是攒批的），
+        # 而这些更新的编号必然小于当前水位，用水位一元判断既足够又不会漏。
+        try:
+            self.watermark = int(self.data.get('watermark') or 0)
+        except (TypeError, ValueError):
+            self.watermark = 0
+        if self.seen:
+            self.watermark = max(self.watermark, max(self.seen))
         for task in self.data['tasks']:
             if task.get('status') == 'running':
                 task.update(status='interrupted', finished=time.time(), result='桥接进程重启，任务已中断；不会自动重放。已发生的操作请人工核对。')
@@ -2809,6 +2826,10 @@ class TaskController:
             data['favorites'] = []
         if not isinstance(data.get('seen'), list):
             data['seen'] = []
+        try:
+            data['watermark'] = int(data.get('watermark') or 0)
+        except (TypeError, ValueError):
+            data['watermark'] = 0
         kept = []
         for task in data['tasks']:
             if not isinstance(task, dict) or 'id' not in task:
@@ -2856,6 +2877,7 @@ class TaskController:
             # 内存里的 seen 也要跟着裁：落盘裁到 2000，但内存原本只增不减，
             # 长期运行会一直向上长（整数集合虽然慢，但没有上界）。
             self.data['seen'] = sorted(self.seen)[-2000:]
+            self.data['watermark'] = self.watermark
             if len(self.seen) > 4000:
                 self.seen = set(self.data['seen'])
             # 内存保留原文供执行器使用；落盘一律脱敏，避免令牌写入状态文件。
@@ -2880,9 +2902,16 @@ class TaskController:
         重启发生在「已处理但未落盘」之间时会重放一条，而重放有 update_id
         去重兜不住时也只是重复一次只读查询。所以改成按间隔落盘。
         """
+        # 更新编号只会递增。小于当前水位的一律视为已处理：老本体没有见过
+        # 新编号，滚动重启后会把积压的旧消息全部重跑一遍（同一条任务重复执行），
+        # 而它们显然都发生在当前水位之前。
         with self.lock:
-            # 去重集合必须在这里一起更新：enqueue 会在 worker 线程检查 seen，
-            # 主线程无锁写入会和它撞上。
+            if update_id < self.watermark:
+                return
+            # 水位递进说明中间的编号（如果有）已被 Telegram 收走或与本机器人无关，
+            # 记下新的水位即可，不必把它们逐个塞进集合。
+            if update_id > self.watermark + 1:
+                self.watermark = update_id
             self.seen.add(update_id)
             self._seen_dirty = self._seen_dirty + 1
             now = time.monotonic()
@@ -2917,7 +2946,7 @@ class TaskController:
         with self.condition:
             if self.updating:
                 raise MediaError('机器人正在更新，暂不接收新任务，请在重启后重试。')
-            if update_id is not None and update_id in self.seen:
+            if update_id is not None and (update_id <= self.watermark or update_id in self.seen):
                 return None
             if sum(task['status'] == 'queued' for task in self.data['tasks']) >= 100:
                 raise MediaError('排队任务已满一百条，请先撤销或等待完成。')
@@ -3420,7 +3449,9 @@ class TaskController:
             engine = current_engine()
             label = engine_spec(engine)['label']
             if auth_channel(engine) != 'account':
-                raise MediaError('当前走接口密钥渠道，没有账号模型可选。先发送“渠道切换”切到账号。')
+                # 换渠道的操作就在这里，不必让机主先退出去找「渠道切换」再回来。
+                raise MediaError('当前走接口密钥渠道，没有账号模型可选。'
+                                 '到「设置 → 渠道切换」切到账号后，这里才会列出账号可用的模型。')
             models = account_model_options(engine)
             if not models:
                 raise MediaError(label + ' 账号模式暂无可选模型清单。')
@@ -3567,7 +3598,7 @@ def handle_update(update):
     if chat is None or update_id is None:
         print('更新缺少必要字段，已跳过', flush=True)
         return
-    if update_id in CONTROL.seen:
+    if update_id <= CONTROL.watermark or update_id in CONTROL.seen:
         return
     if callback:
         data = callback.get('data', '')
@@ -3588,6 +3619,9 @@ def handle_update(update):
                     ACTION_UI_SEEN.pop(next(iter(ACTION_UI_SEEN)))
                 action = ACTION_UI.get(fields[1])
                 if action is not None and action['chat'] == chat:
+                    # 一次性令牌：无论后面判定为过期还是可用，都立刻摘掉。
+                    # 留着一个已经过期的条目，下一次点它还是会走到「已失效」，
+                    # 但它同时还会占着 ACTION_UI 的名额，把真正可用的挤出去。
                     action = ACTION_UI.pop(fields[1])
                 else:
                     action = None
@@ -3625,7 +3659,11 @@ def handle_update(update):
         if task:
             send(chat, '附件接收任务已排队：' + task['id'] + '。语音转写完成后需确认执行；普通文件只保存。')
     else:
-        text = message.get('text', '').strip()
+        raw = message.get('text')
+        # 正文必须是字符串。Telegram 正常只会给字符串，但网关替身、协议升级
+        # 或伪造请求都可能给对象；直接 .strip() 会抛 AttributeError，
+        # 异常穿过 handle_update 会推进 offset 并中断整批更新，后面的消息一起丢。
+        text = raw.strip() if isinstance(raw, str) else ''
         if text:
             CONTROL.handle_text(chat, text, update_id)
         else:
