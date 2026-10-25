@@ -128,11 +128,138 @@ def current_model():
     except (OSError, ValueError, KeyError):
         return os.environ.get('ANTHROPIC_MODEL', 'auto')
 
+AUTH_STATE = WORK / 'auth-channel.json'
+AUTH_CHANNELS = {'gateway': '接口密钥', 'account': 'Claude 账号'}
+LOGIN_PENDING = WORK / 'login-pending.json'
+
+
+def auth_channel():
+    """当前使用的模型渠道。默认走网关密钥，账号登录只是可选渠道。"""
+    try:
+        value = json.loads(AUTH_STATE.read_text()).get('channel')
+    except (OSError, ValueError, AttributeError):
+        value = None
+    return value if value in AUTH_CHANNELS else 'gateway'
+
+
+def set_auth_channel(channel):
+    if channel not in AUTH_CHANNELS:
+        raise MediaError('未知渠道。')
+    atomic_json(AUTH_STATE, {'channel': channel})
+
+
+def claude_binary():
+    return str(AGENT_HOME / '.local' / 'bin' / 'claude')
+
+
+def account_authorized():
+    """查询 CLI 是否已有可用的账号登录态。不读取任何凭据内容，只看状态。"""
+    try:
+        result = subprocess.run([claude_binary(), 'auth', 'status', '--text'],
+                                capture_output=True, text=True, timeout=20,
+                                env=login_environment())
+    except (OSError, subprocess.SubprocessError):
+        return False, '无法执行 claude 命令。'
+    output = (result.stdout or '') + (result.stderr or '')
+    # CLI 未登录时输出 "Not logged in"，已登录会打印账号信息。
+    if 'not logged in' in output.lower():
+        return False, '尚未登录 Claude 账号。'
+    return True, output.strip()[:600] or '已登录。'
+
+
+def login_environment():
+    """登录与查询登录态时用的环境：必须剔除网关变量，否则 CLI 认为无需登录。"""
+    environment = {**os.environ}
+    for name in ('ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL'):
+        environment.pop(name, None)
+    return environment
+
+
+def start_account_login():
+    """发起登录，返回需要机主在浏览器打开的授权链接。
+
+    CLI 会先尝试打开浏览器；服务器上没有浏览器，它转而打印链接并在标准输入等待授权码。
+    这里把带 code=true 的链接截出来回给机主，凭据本身不落盘、不进日志。
+    """
+    process = subprocess.Popen([claude_binary(), 'auth', 'login'],
+                               stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, text=True,
+                               env=login_environment(), start_new_session=True)
+    # 故意不 bind_process：登录进程会长时间等待授权码，绑定上去会覆盖
+    # CONTROL.process，导致正在执行的任务拿不到自己的进程句柄。
+    url = ''
+    deadline = time.monotonic() + 30
+    # 逐行读到链接出现为止；读到后立即把进程留给后续提交授权码。
+    while time.monotonic() < deadline:
+        line = process.stdout.readline()
+        if not line:
+            break
+        match = re.search(r'https://\S+', line)
+        if match:
+            url = match.group(0)
+            break
+    if not url:
+        terminate_process(process)
+        raise MediaError('未能取得授权链接，请检查 claude 命令是否可用。')
+    LOGIN_PENDING.write_text(str(process.pid))
+    os.chmod(LOGIN_PENDING, 0o600)
+    return url
+
+
+def submit_login_code(code):
+    """把机主提供的授权码交给等待中的登录进程。"""
+    try:
+        pid = int(LOGIN_PENDING.read_text().strip())
+    except (OSError, ValueError):
+        raise MediaError('没有进行中的登录，请先发送“登录Claude”。')
+    # 复用正在等待的进程：写入授权码后 CLI 会自行校验并保存凭据。
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        LOGIN_PENDING.unlink(missing_ok=True)
+        raise MediaError('登录进程已结束，请重新发送“登录Claude”获取新链接。')
+    try:
+        with open('/proc/' + str(pid) + '/fd/0', 'w') as handle:
+            handle.write(code.strip() + '\n')
+            handle.flush()
+    except OSError:
+        LOGIN_PENDING.unlink(missing_ok=True)
+        raise MediaError('无法向登录进程写入授权码，请重试。')
+    time.sleep(2)
+    LOGIN_PENDING.unlink(missing_ok=True)
+    ok, detail = account_authorized()
+    return ok, detail
+
+
+def looks_like_login_code(text):
+    """判断一段文本是否可能是 OAuth 授权码。
+
+    授权码是浏览器回调里带出来的一段长随机串，不含空格和中文。
+    收紧判断是为了避免把机主的正常任务消息误当成授权码提交。
+    """
+    candidate = (text or '').strip()
+    if len(candidate) < 16 or len(candidate) > 2000:
+        return False
+    if any(character.isspace() for character in candidate):
+        return False
+    return bool(re.fullmatch(r'[A-Za-z0-9._~+/=#-]+', candidate))
+
+
 def model_environment():
     model = current_model()
-    return {**os.environ, 'DISABLE_AUTOUPDATER': '1', 'ANTHROPIC_MODEL': model,
-            'ANTHROPIC_DEFAULT_HAIKU_MODEL': model, 'ANTHROPIC_DEFAULT_SONNET_MODEL': model,
-            'ANTHROPIC_DEFAULT_OPUS_MODEL': model}
+    environment = {**os.environ, 'DISABLE_AUTOUPDATER': '1', 'ANTHROPIC_MODEL': model,
+                   'ANTHROPIC_DEFAULT_HAIKU_MODEL': model, 'ANTHROPIC_DEFAULT_SONNET_MODEL': model,
+                   'ANTHROPIC_DEFAULT_OPUS_MODEL': model}
+    if auth_channel() == 'account':
+        # 账号模式下必须移除网关相关变量。只要 ANTHROPIC_API_KEY / BASE_URL 还在环境里，
+        # CLI 就会优先走它们，登录得到的账号凭据永远用不上。
+        for name in ('ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL'):
+            environment.pop(name, None)
+        environment.pop('ANTHROPIC_MODEL', None)
+        for name in ('ANTHROPIC_DEFAULT_HAIKU_MODEL', 'ANTHROPIC_DEFAULT_SONNET_MODEL',
+                     'ANTHROPIC_DEFAULT_OPUS_MODEL'):
+            environment.pop(name, None)
+    return environment
 
 def catalog(refresh=False):
     if not refresh and MODEL_CACHE.exists():
@@ -1385,7 +1512,32 @@ class TaskController:
                 result = task.get('result', '') if task else '任务ID不存在。'
             send_formatted(chat, redact(result or '尚无结果。'))
         elif text == '设置':
-            send_options(chat, '设置与查询。长期记忆和技能查询会作为只读任务进入队列。', ['执行策略', '长期记忆', '技能查询', '工具审计', '历史结果', '巡检配置', '权限状态', '任务说明', '收起菜单', '工作目录'])
+            send_options(chat, '设置与查询。长期记忆和技能查询会作为只读任务进入队列。', ['执行策略', '长期记忆', '技能查询', '工具审计', '历史结果', '登录Claude', '账号状态', '渠道切换', '权限状态', '任务说明', '收起菜单', '工作目录'])
+        elif text in ('登录Claude', '登录 Claude', '/login'):
+            url = start_account_login()
+            send(chat, '请用手机浏览器打开下面的链接完成授权（可能需要先登录 claude.ai）。\n\n'
+                       + url + '\n\n授权后网页会给出一段授权码，把它直接发给我即可。\n'
+                       '链接十分钟内有效；期间不要重复发起登录。')
+        elif text == '账号状态':
+            ok, detail = account_authorized()
+            send(chat, 'Claude 账号：' + ('已登录\n' + detail if ok else '未登录')
+                      + '\n当前使用渠道：' + AUTH_CHANNELS[auth_channel()])
+        elif text == '渠道切换':
+            send_options(chat, '当前渠道：' + AUTH_CHANNELS[auth_channel()]
+                              + '\n\n接口密钥：走已配置的网关与密钥，模型目录来自网关。\n'
+                              'Claude 账号：走登录得到的订阅额度，模型目录来自账号本身。',
+                         ['使用接口密钥', '使用Claude账号'])
+        elif text in ('使用接口密钥', '使用Claude账号'):
+            if text == '使用Claude账号':
+                ok, _ = account_authorized()
+                if not ok:
+                    raise MediaError('还没有登录 Claude 账号，请先发送“登录Claude”。')
+                set_auth_channel('account')
+            else:
+                set_auth_channel('gateway')
+            # 渠道变了，模型目录来源也变了，清掉缓存避免沿用另一渠道的模型名。
+            MODEL_CACHE.unlink(missing_ok=True)
+            send(chat, '已切换到：' + AUTH_CHANNELS[auth_channel()] + '\n下一条任务生效。')
         elif text in ('长期记忆', '技能查询'):
             prompt = ('只读查询当前CLI可用的长期记忆来源和已保存条目摘要。不要读取认证文件，不修改或创建记忆；不存在时明确说明。'
                       if text == '长期记忆' else '只读列出当前CLI实际可用技能的名称、用途和调用方式；以实际配置为准，不安装、不执行技能、不读取密钥。')
@@ -1402,6 +1554,11 @@ class TaskController:
                 send(chat, '只读状态查询已排队：' + task['id'])
         elif quick_action(chat, text):
             pass
+        elif LOGIN_PENDING.exists() and looks_like_login_code(text):
+            # 只在确有登录进程在等时才会走到这里，避免把普通文本误当授权码吞掉。
+            ok, detail = submit_login_code(text)
+            send(chat, 'Claude 账号登录成功。\n' + detail + '\n\n要改用它，请到“设置 → 渠道切换 → 使用Claude账号”。'
+                      if ok else '授权码未通过校验：' + detail + '\n可以重新发送“登录Claude”获取新链接。')
         else:
             task = self.enqueue(chat, text, update_id=update_id)
             if task:
