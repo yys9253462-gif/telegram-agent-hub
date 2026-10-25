@@ -409,32 +409,42 @@ def render_reply(text):
     return '\n'.join(output).strip() or '正在生成…'
 
 def split_message(text, limit=1800):
-    """按行切分长消息，尽量不切断代码围栏与行内标记。
+    """按行切分长文本，避免在行中间截断（硬切会破坏代码块与 HTML 转义边界）。
 
-    硬按字符数切会把 **加粗** 劈成两半、把 ``` 代码块截断，渲染后既丢格式
-    又把标记符号直接暴露给用户。策略优先级：换行 > 标记边界 > 空格 > 硬切。
+    单行本身超长时退化为切分，但优先在行内标记（** 或 `）的空隙处断开，
+    否则会把加粗劈成两半、把代码符号直接暴露给用户。
     """
-    if len(text) <= limit:
-        return [text]
     pieces = []
-    rest = text
-    while len(rest) > limit:
-        cut = rest.rfind('\n', 0, limit)
-        if cut <= limit // 2:
-            # 超长单行：退一步在行内标记的空隙处断开，避免劈开 **` 等符号。
-            for pattern in (r'\*\*', r'`'):
-                positions = [m.start() for m in re.finditer(pattern, rest[:limit]) if m.start() > limit // 2]
-                if positions:
-                    cut = positions[-1]
-                    break
-        if cut <= 0:
-            space = rest.rfind(' ', 0, limit)
-            cut = space if space > limit // 2 else limit
-        piece = rest[:cut] if rest[cut:cut + 1] == '\n' else rest[:cut]
-        pieces.append(piece)
-        rest = rest[len(piece):]
-    if rest:
-        pieces.append(rest)
+    buffer = ''
+    for line in text.splitlines(keepends=True):
+        if len(line) > limit:
+            if buffer:
+                pieces.append(buffer)
+                buffer = ''
+            rest = line
+            while len(rest) > limit:
+                cut = 0
+                # 超长单行：退一步在行内标记的空隙处断开，避免劈开 **` 等符号。
+                for pattern in (r'\*\*', r'`'):
+                    positions = [m.start() for m in re.finditer(pattern, rest[:limit]) if m.start() > limit // 2]
+                    if positions:
+                        cut = positions[-1]
+                        break
+                if cut <= 0:
+                    space = rest.rfind(' ', 0, limit)
+                    cut = space if space > limit // 2 else limit
+                pieces.append(rest[:cut])
+                rest = rest[cut:]
+            buffer = rest
+            continue
+        if len(buffer) + len(line) > limit:
+            pieces.append(buffer)
+            buffer = ''
+        buffer += line
+    if buffer:
+        pieces.append(buffer)
+    if not pieces:
+        return ['']
     # 逐片检查围栏是否成对；未闭合则在本片末尾补上收尾，并在下一片开头重新打开。
     balanced = []
     opened = None
@@ -452,7 +462,6 @@ def split_message(text, limit=1800):
             opened = None
         balanced.append(body)
     return balanced
-
 
 def send_formatted(chat, text):
     text = redact(text)
@@ -491,6 +500,29 @@ def clean_reply(text):
             parts[index] = re.sub(r'\*\*(?=\S)(.+?)(?<=\S)\*\*', r'\1', parts[index])
         lines.append(''.join(parts))
     return ''.join(lines)
+
+def tidy_stream_text(text):
+    """压缩流式累积过程中产生的多余空行。
+
+    只处理空行密度，不改动正文：连续 3 个以上换行压成 2 个（最多留一个空行），
+    并去掉首尾多余的换行。正文中间正常的段落分隔（2 个换行）原样保留。
+    """
+    return re.sub(r'\n{3,}', '\n\n', text).strip('\n')
+
+
+def start_text_block(buffer):
+    """开启一个新的正文块时调用，返回需要附加到缓冲区的分隔符。
+
+    这是修复空行膨胀的关键：原代码在每次 message_start 时无条件追加 '\\n\\n'，
+    而 agent 每完成一次工具调用都会产生一个 message_start，导致空行不断堆积
+    （线上实测出现过 153 个连续换行）。这里改为：
+      - 只在缓冲区已有正文、且末尾还没有空行时，补一个段落分隔；
+      - 其余情况返回空串，绝不叠加。
+    """
+    if not buffer or buffer.endswith('\n\n'):
+        return ''
+    return '\n\n'
+
 
 def run_stream(chat, text):
     status = api('sendMessage', {'chat_id': chat, 'text': '已接收，正在生成…'})
@@ -544,16 +576,26 @@ def run_stream(chat, text):
         value = redact(value)
         if value == shown or time.monotonic() < update_after:
             return
+        # 空文本会被 Telegram 拒绝（400），直接跳过，避免无谓请求。
+        if not value.strip():
+            return
+        # 单条文本上限 4000 字符（留出余量），超出必然 400，截断后再发。
+        if len(value) > 4000:
+            value = value[:4000]
         try:
             api('editMessageText', {'chat_id': chat, 'message_id': message_id, 'text': render_reply(value), 'parse_mode': 'HTML'})
             shown = value
         except urllib.error.HTTPError as exc:
+            data = {}
             try:
                 data = json.loads(exc.read())
-                delay = data.get('parameters', {}).get('retry_after', 3)
             except Exception:
-                delay = 3
-            update_after = time.monotonic() + delay
+                data = {}
+            # 只有真正的限流才退避等待；其他 400（格式错误等）不占用退避窗口，
+            # 否则每次失败都会白等数秒，导致后续更新被整体拖慢。
+            if exc.code == 429 or 'retry_after' in data.get('parameters', {}):
+                delay = data.get('parameters', {}).get('retry_after', 3)
+                update_after = time.monotonic() + delay
         except Exception:
             update_after = time.monotonic() + 3
         last_edit = time.monotonic()
@@ -575,10 +617,11 @@ def run_stream(chat, text):
                     continue
                 if event.get('type') == 'stream_event':
                     stream = event.get('event', {})
-                    if stream.get('type') == 'message_start' and content:
-                        content += '\n\n'
                     block = stream.get('content_block', {})
-                    if block.get('type') == 'tool_use':
+                    if block.get('type') == 'text':
+                        # 只在真正开启正文块时补段落分隔；工具块不触发。
+                        content += start_text_block(content)
+                    elif block.get('type') == 'tool_use':
                         tool = str(block.get('name', '工具'))
                         activity = '正在执行工具：' + tool
                         record_tool(tool)
@@ -598,10 +641,14 @@ def run_stream(chat, text):
             if time.monotonic() - last_edit >= interval:
                 seconds = int(time.monotonic() - started)
                 progress = activity + ' · 已运行' + str(seconds) + '秒'
-                preview = content if len(content) <= 1800 else '（显示最新生成内容）\n' + content[-1800:]
+                # 预览同样压缩空行，避免流式过程中气泡被空行撑高。
+                clean_content = tidy_stream_text(content)
+                preview = clean_content if len(clean_content) <= 1800 else '（显示最新生成内容）\n' + clean_content[-1800:]
                 edit((preview + '\n\n' if preview else '') + progress)
         process.wait(timeout=10)
         answer = (final or {}).get('result') or content or '任务未返回内容，请检查模型接口。'
+        # 收尾统一压缩空行：模型输出与流式累积都可能带出多余空行。
+        answer = tidy_stream_text(answer)
         if process.returncode != 0 or (final or {}).get('is_error'):
             answer = '本轮执行未成功。\n' + answer + '\n可检查当前模型的套餐权限、额度和工具兼容性；也可以切换模型后重试。已执行的操作不会自动回滚，请先核对结果。'
         task = getattr(TASK_LOCAL, 'task', None)

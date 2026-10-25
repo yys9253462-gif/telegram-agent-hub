@@ -158,6 +158,38 @@ class PruneTest(unittest.TestCase):
         self.assertEqual(len(control.data['tasks']), 50)
 
 
+class StreamBlankLineTest(unittest.TestCase):
+    """缺陷：旧代码在每次 message_start 时无条件追加 '\\n\\n'，而 agent 每完成
+    一次工具调用都会产生一个 message_start，连续工具调用期间没有任何正文插入，
+    空行便不断叠加（线上实测出现过 153 个连续换行，气泡被撑到极高）。"""
+
+    def test_repeated_tool_calls_do_not_accumulate(self):
+        buffer = '初始正文'
+        for _ in range(20):
+            buffer += bot.start_text_block(buffer)
+        self.assertEqual(buffer.count('\n'), 2, '连续 20 次工具调用后应只保留一个段落分隔')
+
+    def test_old_behavior_really_accumulates(self):
+        # 反向验证：证明旧写法确实会膨胀，否则本组用例失去意义。
+        old = '初始正文'
+        for _ in range(20):
+            old += '\n\n'
+        self.assertEqual(old.count('\n'), 40, '旧实现应当累积 40 个换行')
+
+    def test_no_separator_without_content(self):
+        self.assertEqual(bot.start_text_block(''), '', '空缓冲区不应补分隔符')
+
+    def test_no_separator_when_already_spaced(self):
+        self.assertEqual(bot.start_text_block('正文\n\n'), '', '末尾已有空行时不应再叠加')
+
+    def test_tidy_collapses_excess_newlines(self):
+        self.assertEqual(bot.tidy_stream_text('a' + '\n' * 153 + 'b'), 'a\n\nb')
+        self.assertEqual(bot.tidy_stream_text('\n\nabc\n\n'), 'abc')
+
+    def test_tidy_keeps_normal_paragraph(self):
+        self.assertEqual(bot.tidy_stream_text('abc\n\ndef'), 'abc\n\ndef', '正常段落分隔必须保留')
+
+
 class AtomicJsonTest(unittest.TestCase):
     """缺陷：5 处重复的 write_text + replace 没有 fsync、权限、排他创建；
     统一走 atomic_json 后 offset 必须仍是纯文本，不能变成 JSON。"""
