@@ -14,8 +14,15 @@
 set -euo pipefail
 
 REPO="yys9253462-gif/telegram-agent-hub"
-REF="__REF__"
-SHA256="__SHA256__"
+# 固定提交号存放在 version.txt，由发布流程更新，与代码分离，避免自引用。
+# 可用环境变量覆盖以便测试：AGENT_REF=... AGENT_ARCHIVE_SHA256=...
+REF="${AGENT_REF:-}"
+SHA256="${AGENT_ARCHIVE_SHA256:-}"
+VERSION_URLS=(
+    "https://raw.githubusercontent.com/$REPO/main/version.txt"
+    "https://ghproxy.net/https://raw.githubusercontent.com/$REPO/main/version.txt"
+    "https://cdn.jsdelivr.net/gh/$REPO@main/version.txt"
+)
 
 say() { printf '%s\n' "$*"; }
 fail() { printf '安装中止：%s\n' "$*" >&2; exit 1; }
@@ -44,6 +51,23 @@ case "$(uname -m)" in
     *) fail "仅支持 x86_64 与 arm64，当前为 $(uname -m)" ;;
 esac
 
+if [ -z "$REF" ]; then
+    say "正在获取固定版本号…"
+    for url in "${VERSION_URLS[@]}"; do
+        version="$(curl --proto '=https' --proto-redir '=https' -fsSL --max-time 30 "$url" 2>/dev/null || true)"
+        ref_line="$(printf '%s
+' "$version" | grep -E '^[0-9a-f]{40}$' | head -1 || true)"
+        sha_line="$(printf '%s
+' "$version" | grep -E '^sha256:[0-9a-f]{64}$' | head -1 | cut -d: -f2 || true)"
+        if [ -n "$ref_line" ]; then
+            REF="$ref_line"
+            [ -n "$sha_line" ] && SHA256="$sha_line"
+            break
+        fi
+    done
+    [ -n "$REF" ] || fail "无法获取固定版本号。请检查网络，或手动指定 AGENT_REF=<40位提交号> 后重试。"
+fi
+
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 chmod 700 "$WORK"
@@ -68,7 +92,7 @@ for url in "${FETCH_URLS[@]}"; do
 done
 [ "$OK" -eq 1 ] || fail "所有下载源均失败。请检查网络能否访问 GitHub，或改用镜像安装命令（见 README）。"
 
-if [ -n "$SHA256" ] && [ "$SHA256" != "__SHA256__" ]; then
+if [ -n "$SHA256" ]; then
     ACTUAL="$(sha256sum "$ARCHIVE" | awk '{print $1}')"
     if [ "$ACTUAL" != "$SHA256" ]; then
         fail "归档校验不一致，已停止。可能是发布方更新或网络被篡改。"
