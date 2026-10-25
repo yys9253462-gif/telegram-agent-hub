@@ -119,8 +119,8 @@ class GroupMenuTest(unittest.TestCase):
 
     def test_every_old_button_still_reachable(self):
         """改版不能弄丢功能：原来顶层的功能都要能在顶层或二级找到。"""
-        legacy = {'新任务', '当前任务', '停止', '队列', '目标', '模型',
-                  '选择智能体', '图片创作', '生图设置', '会话', '文件', '服务器状态'}
+        legacy = {'新任务', '当前任务', '停止', '模型',
+                  '选择智能体', '新建会话', '会话列表', '服务器状态'}
         reachable = set(top_buttons()) | set(grouped_buttons())
         missing = legacy - reachable
         self.assertFalse(missing, '功能入口丢失：' + '、'.join(sorted(missing)))

@@ -65,16 +65,11 @@ KEYBOARD = {
 # 分组菜单：每组一个标题，点进分组后只显示该组的功能，不再平铺十几项。
 MENU_GROUPS = {
     '设置': {
-        '任务与模型': ['目标', '模型', '队列', '选择智能体'],
-        '会话与文件': ['会话', '文件'],
-        '生图与文档': ['生图设置', '图片创作'],
+        '任务与模型': ['模型', '选择智能体'],
+        '会话与文件': ['新建会话', '会话列表'],
     },
     '更多': {
-        '账号与渠道': ['登录Claude', '账号状态', '渠道切换'],
-        '平台授权': ['授权GitHub', '授权Cloudflare', '授权状态', '撤销授权',
-                     '云flare粘贴令牌'],
-        '执行与查询': ['执行策略', '长期记忆', '技能查询', '工具审计'],
-        '系统与帮助': ['权限状态', '工作目录', '任务说明', '收起菜单'],
+        '平台授权': ['授权GitHub', '授权Cloudflare', '授权状态', '撤销授权'],
     },
 }
 CHECKS = {
@@ -97,7 +92,7 @@ ALIASES = {'/start': '显示菜单', '/menu': '显示菜单', '/help': '任务�
 MENU_LABELS = {
     '新任务': '开始任务', '当前任务': '查看进度',
     '停止': '停止任务', '服务器状态': '主机状态',
-    '设置': '工作设置', '更多': '更多功能',
+    '设置': '模型与会话', '更多': '授权管理',
     '目标': '执行目标', '模型': '模型设置', '队列': '任务队列',
     '会话': '会话管理', '文件': '文件管理',
     '登录Claude': '账号登录', '授权GitHub': '仓库授权',
@@ -133,7 +128,7 @@ def home_menu_text():
             '会话状态  ·  ' + ('继续当前会话' if session_id() else '准备开始') + '\n'
             '────────────────\n'
             '直接发送文字、语音或图片开始任务。\n'
-            '查看进度了解执行情况，工作设置调整模型与会话。')
+            '查看进度了解执行情况，模型与会话调整工作方式。')
 
 
 MENU_STATE = WORK / 'menu-visible.json'
@@ -975,6 +970,10 @@ def send_options(chat, title, labels):
 
 def send_group_menu(chat, title, groups):
     """渲染分组菜单。先只列分组名，点进分组才展开该组的具体功能。"""
+    if len(groups) == 1:
+        name, items = next(iter(groups.items()))
+        send_options(chat, name + '\n\n' + GROUP_DESCRIPTIONS.get(name, ''), list(items))
+        return
     labels = list(groups)
     overview = '\n\n'.join(name + '\n' + GROUP_DESCRIPTIONS.get(name, '选择功能继续。')
                             for name in labels)
