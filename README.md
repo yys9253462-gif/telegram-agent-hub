@@ -143,9 +143,22 @@ python3 test_menu_layout.py     # 键盘按钮与分组菜单一致性
 python3 test_auth_channel.py    # 网关/账号双渠道切换
 python3 test_platform_auth.py   # GitHub/Cloudflare 授权、凭据存取与注入
 python3 test_image_tool.py      # 生图 MCP 工具与协议测试
+python3 -m unittest test_interaction_r1 test_interaction_r2 test_interaction_r3 test_interaction_r4 test_interaction_r5
+                                # 交互逻辑五轮测试：路由 / 队列 / 渠道 / 授权 / 边界
 python3 security_check.py       # 提交前的敏感信息扫描
 bash -n get.sh && bash -n install.sh
 ```
+
+`test_interaction_r1.py` ~ `test_interaction_r5.py` 是按「机主真的按了一下」写的五轮交互测试，与前面那些按源码结构检查的用例互补：
+
+| 轮次 | 覆盖范围 | 主要判据 |
+|---|---|---|
+| 第一轮 | 顶层按钮、二级分组、分组名、全部别名 | 每一下都必须有反应；普通文字必须进队列 |
+| 第二轮 | 队列、并发隔离、停止与撤销、语音草稿 | 同会话不并行、撤销后不被领走、只停指定任务 |
+| 第三轮 | 执行器与渠道切换、账号模型、底部摘要 | 渠道按执行器独立；切渠道不偷偷切执行器 |
+| 第四轮 | 设备码、令牌回填、撤销、凭据注入、续期 | 等待期普通任务不被吞；未授权变量必须剔除 |
+| 第五轮 | 超长消息、畸形更新、状态文件损坏、重入 | 任何异常都要落到一句人话，不能中断轮询 |
+
 
 `verify_platform_auth.py` 是授权功能的**反向验证脚本**：它把 8 处保护逐条故意改坏，确认 `test_platform_auth.py` 真的报红。永远绿的测试等于没有测试，改动授权相关代码后请跑一遍。
 
