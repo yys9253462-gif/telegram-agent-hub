@@ -112,7 +112,7 @@ MENU_GROUPS = {
     '设置': {
         '任务与模型': ['模型', '选择智能体'],
         '会话与文件': ['新建会话', '会话列表'],
-        '账号登录': ['登录Claude', '登录CodeBuddy', '登录Codex', '账号状态', '渠道切换', '账号模型'],
+        '账号登录': ['登录Claude', '登录CodeBuddy', '登录Codex', '退出账号', '账号状态', '渠道切换', '账号模型'],
         '版本更新': ['检查版本', '更新机器人'],
     },
     '更多': {
@@ -3379,11 +3379,58 @@ class TaskController:
                 raise MediaError('未知登录执行器。')
             result = CLI_LOGINS.cancel(engine, chat)
             send(chat, '已请求取消' + engine_spec(engine)['label'] + '登录。' if result.get('ok') else '当前没有进行中的该执行器登录。')
+        elif text == '退出账号':
+            # 先列一份「谁现在是登录着的」，让机主看着身份去选退哪个，
+            # 而不是先选执行器再猜它有没有登录。
+            options = []
+            lines = ['退出账号登录\n只清除账号登录态，接口密钥与任务数据都不受影响。']
+            for name in enabled_engines():
+                label = engine_spec(name)['label']
+                identity = subscription_identity(name)
+                if identity:
+                    lines.append(label + '：已登录 · ' + github_auth.account_identity_label(identity))
+                    options.append(('退出' + label + '账号', '退出账号 ' + name))
+                else:
+                    lines.append(label + '：未登录或无法确认')
+            if not options:
+                raise MediaError('当前没有已登录的账号可以退出。' + '\n'.join(lines[1:]))
+            lines.append('')
+            lines.append('退出后该执行器的账号渠道会切回接口密钥，新任务立即生效；'
+                         '正在运行的任务不受影响。')
+            send_options(chat, '\n'.join(lines), options)
+        elif text.startswith('退出账号 '):
+            engine = text.partition(' ')[2].strip()
+            if engine not in ENGINES:
+                raise MediaError('未知执行器。')
+            label = engine_spec(engine)['label']
+            # 退出前先确认它确实登录着，否则「退出成功」只会让机主误以为
+            # 自己刚删掉了一份并不存在的凭据。
+            ok, detail = account_authorized(engine)
+            if not ok:
+                raise MediaError(label + ' 当前没有确认的账号登录（' + detail.strip()
+                                 + '），不需要退出。')
+            result = CLI_LOGINS.logout(engine, engine_binary(engine),
+                                       account_environment(os.environ, engine))
+            if not result.get('ok'):
+                raise MediaError(label + ' 退出失败：' + (result.get('message') or '原因未知'))
+            # 账号渠道下退了账号，任务会拿不到任何凭据直接失败。
+            # 这里顺手切回接口密钥，省得机主退完还得自己回来改渠道。
+            note = ''
+            if auth_channel(engine) == 'account':
+                set_auth_channel('gateway', engine)
+                note = '\n该执行器的渠道已切回接口密钥（账号已退出，留在账号渠道会没有可用凭据）。'
+            if result.get('state') == 'not_logged_in':
+                send(chat, label + ' 本来就没有保存的账号登录，无需退出。' + note)
+            else:
+                send(chat, label + ' 账号已退出。' + note
+                     + ('\n' + result['removed'] if result.get('removed') else ''))
         elif text == '账号状态':
             engine = current_engine()
             ok, detail = account_authorized(engine)
-            send(chat, engine_spec(engine)['label'] + ' 账号：' + ('已登录\n' + detail if ok else detail)
-                      + '\n当前使用渠道：' + channel_label(engine))
+            title = (engine_spec(engine)['label'] + ' 账号：' + ('已登录\n' + detail if ok else detail)
+                     + '\n当前使用渠道：' + channel_label(engine))
+            options = [('退出账号', '退出账号')]
+            send_options(chat, title, options)
         elif text == '渠道切换':
             engine = current_engine()
             label = engine_spec(engine)['label']
