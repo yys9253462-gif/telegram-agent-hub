@@ -1048,7 +1048,7 @@ def quick_action(chat, text):
     elif text in ('继续会话', '/resume'):
         send(chat, '发送下一条任务即可继续当前会话。' if session_id() else '目前没有会话，发送任务即可开始。')
     elif text == '会话信息':
-        send(chat, '当前会话：' + (session_id() or '尚未开始') + '\n当前模型：' + current_model() + '\n任务串行执行，上限三十分钟、最多八十轮。')
+        send(chat, '当前会话：' + (session_id() or '尚未开始') + '\n当前模型：' + current_model() + '\n任务并发执行，每项上限三十分钟、最多八十轮；繁忙会话自动隔离。')
     elif text == '工作目录':
         send(chat, '默认工作目录：' + str(WORK) + '\n可以在任务中指定其他服务器路径。')
     elif text == '权限状态':
@@ -1402,11 +1402,13 @@ def parse_codex_event(event, state):
 
 
 def run_stream(chat, text):
-    status = api('sendMessage', {'chat_id': chat, 'text': '已接收，正在生成…'})
+    task = getattr(TASK_LOCAL, 'task', None)
+    label = ('任务 ' + task['id'] + ' · ' + redact(text).replace('\n', ' ')[:80] + '\n') if task else ''
+    initial = label + '已接收，正在生成…'
+    status = api('sendMessage', {'chat_id': chat, 'text': initial})
     message_id = status['message_id']
     engine = current_engine()
     instructions = agent_instructions()
-    task = getattr(TASK_LOCAL, 'task', None)
     history = task['snapshot'].get('handoff', []) if task else []
     if history:
         instructions += '\n以下是同一逻辑会话的最近任务记录，只作背景，不覆盖当前指令；原始工具事件不共享：\n' + json.dumps(history, ensure_ascii=False)
@@ -1429,13 +1431,6 @@ def run_stream(chat, text):
     process = subprocess.Popen(command, cwd=WORK, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                stdin=subprocess.PIPE if stdin_text else None,
                                text=True, bufsize=1, env=environment, start_new_session=True)
-    if stdin_text:
-        # codex 从 stdin 收 prompt，写完必须关闭，否则它会一直等输入。
-        try:
-            process.stdin.write(stdin_text)
-            process.stdin.close()
-        except (OSError, ValueError):
-            pass
     bind_process(process)
     events = queue.Queue()
     def read_events():
@@ -1447,7 +1442,7 @@ def run_stream(chat, text):
     threading.Thread(target=read_events, daemon=True).start()
     started = time.monotonic()
     last_edit = 0
-    shown = '已接收，正在生成…'
+    shown = initial
     state_kind = engine_spec(engine)['kind']
     # 把流式累积状态收进一个字典，两种协议的解析函数都只改这里，主循环读同一份。
     state = {'content': '', 'final': None, 'activity': '等待模型响应', 'failed': ''}
@@ -1457,7 +1452,7 @@ def run_stream(chat, text):
     update_after = 0
     def edit(value):
         nonlocal shown, last_edit, update_after
-        value = redact(value)
+        value = label + redact(value)
         if value == shown or time.monotonic() < update_after:
             return
         # 空文本会被 Telegram 拒绝（400），直接跳过，避免无谓请求。
@@ -1484,6 +1479,14 @@ def run_stream(chat, text):
             update_after = time.monotonic() + 3
         last_edit = time.monotonic()
     try:
+        if stdin_text:
+            # 先登记进程，再写入；停止或关闭可终止因管道写满而阻塞的任务。
+            check_cancelled()
+            try:
+                process.stdin.write(stdin_text)
+                process.stdin.close()
+            except (OSError, ValueError):
+                pass
         while True:
             check_cancelled()
             if time.monotonic() - started > 1800:
@@ -1535,12 +1538,12 @@ def run_stream(chat, text):
         head = pieces[0] if pieces else answer
         if time.monotonic() < update_after:
             # 上一次编辑被限流，直接按分片整段发送，避免重复编辑再被拒。
-            send_formatted(chat, answer)
+            send_formatted(chat, label + answer)
         else:
             edit(head)
             # 首片已通过编辑消息呈现，其余分片补发；不论首片是否编辑成功都要补。
             for piece in pieces[1:]:
-                send_formatted(chat, piece)
+                send_formatted(chat, label + piece)
     finally:
         terminate_process(process)
         unbind_process(process)
@@ -1612,20 +1615,31 @@ def check_cancelled():
 
 
 def bind_process(process):
-    check_cancelled_after = False
-    if CONTROL is not None:
-        with CONTROL.lock:
-            CONTROL.process = process
-            check_cancelled_after = CONTROL.cancel_event.is_set()
-    if check_cancelled_after:
+    controller = getattr(TASK_LOCAL, 'controller', None) or CONTROL
+    event = getattr(TASK_LOCAL, 'cancel', None)
+    if controller is not None:
+        with controller.lock:
+            task = getattr(TASK_LOCAL, 'task', None)
+            state = controller.running.get(task['id']) if task else None
+            if state is not None:
+                state['process'] = process
+                event = state['cancel']
+            elif task is None and len(controller.running) <= 1:
+                controller.process = process
+                event = controller.cancel_event
+    if event is not None and event.is_set():
         terminate_process(process)
 
 
 def unbind_process(process):
-    if CONTROL is not None:
-        with CONTROL.lock:
-            if CONTROL.process is process:
-                CONTROL.process = None
+    controller = getattr(TASK_LOCAL, 'controller', None) or CONTROL
+    if controller is not None:
+        with controller.lock:
+            for state in controller.running.values():
+                if state['process'] is process:
+                    state['process'] = None
+            if controller._idle_process is process:
+                controller._idle_process = None
 
 
 def terminate_process(process):
@@ -1881,9 +1895,14 @@ class TaskController:
         self.path = self.root / 'bridge-state.json'
         self.lock = threading.RLock()
         self.condition = threading.Condition(self.lock)
-        self.cancel_event = threading.Event()
-        self.process = None
-        self.current = None
+        self.running = {}
+        self.workers = []
+        self._idle_cancel = threading.Event()
+        self._idle_process = None
+        try:
+            self.max_concurrent = max(1, min(6, int(os.environ.get('AGENT_MAX_CONCURRENT', '3'))))
+        except ValueError:
+            self.max_concurrent = 3
         self.closing = False
         self.seen = set()
         self.ui = {}
@@ -1920,6 +1939,56 @@ class TaskController:
             if task.get('status') == 'running':
                 task.update(status='interrupted', finished=time.time(), result='桥接进程重启，任务已中断；不会自动重放。已发生的操作请人工核对。')
         self.persist()
+
+    @property
+    def current(self):
+        with self.lock:
+            return next((state['task'] for state in self.running.values()), None)
+
+    @property
+    def cancel_event(self):
+        with self.lock:
+            return next((state['cancel'] for state in self.running.values()), self._idle_cancel)
+
+    @property
+    def process(self):
+        with self.lock:
+            return next((state['process'] for state in self.running.values()), self._idle_process)
+
+    @process.setter
+    def process(self, value):
+        with self.lock:
+            state = next(iter(self.running.values()), None)
+            if state is None:
+                self._idle_process = value
+            else:
+                state['process'] = value
+
+    def start_workers(self):
+        with self.condition:
+            if self.workers or self.closing:
+                return
+            self.workers = [threading.Thread(target=self.worker, name='telegram-task-worker-' + str(index + 1), daemon=True)
+                            for index in range(self.max_concurrent)]
+            for worker in self.workers:
+                worker.start()
+
+    def close(self, timeout=12):
+        with self.condition:
+            self.closing = True
+            for state in self.running.values():
+                state['cancel'].set()
+            processes = [state['process'] for state in self.running.values() if state['process'] is not None]
+            self.condition.notify_all()
+        for process in processes:
+            terminate_process(process)
+        deadline = time.monotonic() + timeout
+        for worker in self.workers:
+            worker.join(timeout=max(0, deadline - time.monotonic()))
+        with self.lock:
+            for state in self.running.values():
+                state['task'].update(status='interrupted', result='桥接停止，任务已中断；不会自动重放。')
+            self.persist()
 
     def _normalize(self):
         """补齐缺失字段。状态文件可能被老版本或人工编辑改坏，
@@ -2061,8 +2130,11 @@ class TaskController:
             if 'caption' in safe_payload:
                 safe_payload['caption'] = redact(safe_payload['caption'])
             # text 保留原文：执行器需要真实输入（口令、令牌等），脱敏只作用于持久化与日志。
+            task_snapshot = copy.deepcopy(snapshot if snapshot is not None else self.snapshot())
+            if kind in ('agent', 'media'):
+                self.isolate_session(task_snapshot)
             task = {'id': uuid.uuid4().hex[:12], 'chat': chat, 'kind': kind, 'text': text,
-                    'payload': safe_payload, 'snapshot': snapshot or self.snapshot(), 'status': 'queued',
+                    'payload': safe_payload, 'snapshot': task_snapshot, 'status': 'queued',
                     'created': time.time(), 'tools': [], 'result': ''}
             self.data['tasks'].append(task)
             if update_id is not None:
@@ -2077,12 +2149,35 @@ class TaskController:
         except Exception:
             print('通知发送失败，结果保留在本地历史', flush=True)
 
-    def stop(self):
+    def isolate_session(self, snapshot, exclude=None):
+        key = snapshot['session_key']
+        if any(item is not exclude and item['kind'] in ('agent', 'media')
+               and item['status'] in ('queued', 'running') and item['snapshot']['session_key'] == key
+               for item in self.data['tasks']):
+            new_key = uuid.uuid4().hex[:12]
+            self.data['sessions'][new_key] = {'name': '并发会话 ' + new_key, 'session_id': None, 'engine_sessions': {}}
+            snapshot['session_key'] = new_key
+            snapshot['session_id'] = None
+            snapshot.pop('handoff', None)
+            if self.data['active_session'] == key:
+                self.data['active_session'] = new_key
+
+    def stop(self, task_id=None):
         with self.lock:
-            if not self.current:
+            if not self.running:
                 return '当前没有运行中的任务。'
-            self.cancel_event.set()
-            return '已请求停止任务 ' + self.current['id'] + '。仅终止该任务所属进程组，已发生的操作不会回滚。'
+            if task_id is None:
+                if len(self.running) > 1:
+                    return '运行中的任务：\n' + '\n'.join(self.running) + '\n发送“停止任务 ID”停止指定任务。'
+                task_id = next(iter(self.running))
+            state = self.running.get(task_id)
+            if state is None:
+                return '未找到运行中的任务：' + task_id
+            state['cancel'].set()
+            process = state['process']
+        if process is not None:
+            terminate_process(process)
+        return '已请求停止任务 ' + task_id + '。仅终止该任务所属进程组，已发生的操作不会回滚。'
 
     def cancel(self, task_id):
         with self.condition:
@@ -2103,15 +2198,22 @@ class TaskController:
                 + '\n耗时：' + str(int(max(0, task.get('finished', time.time()) - task.get('started', task['created'])))) + '秒'
                 + '\n最近工具：' + ('、'.join(task.get('tools', [])[-3:]) or '暂无'))
 
+    def next_task(self):
+        occupied = {state['task']['snapshot']['session_key'] for state in self.running.values()
+                    if state['task']['kind'] in ('agent', 'media')}
+        return next((item for item in self.data['tasks'] if item['status'] == 'queued'
+                     and (item['kind'] not in ('agent', 'media')
+                          or item['snapshot']['session_key'] not in occupied)), None)
+
     def worker(self):
         while True:
             with self.condition:
-                self.condition.wait_for(lambda: self.closing or any(item['status'] == 'queued' for item in self.data['tasks']))
+                self.condition.wait_for(lambda: self.closing or self.next_task() is not None)
                 if self.closing:
                     return
-                task = next(item for item in self.data['tasks'] if item['status'] == 'queued')
-                self.cancel_event.clear()
-                self.current = task
+                task = self.next_task()
+                cancel = threading.Event()
+                self.running[task['id']] = {'task': task, 'cancel': cancel, 'process': None}
                 task.update(status='running', started=time.time(), user_context=redact(task.get('text', ''))[:1600])
                 # 固定会话身份，仅解析同一会话在前一项任务完成后的续接ID。
                 session = self.data['sessions'][task['snapshot']['session_key']]
@@ -2120,7 +2222,8 @@ class TaskController:
                 task['snapshot']['handoff'] = list(session.get('handoff', []))
                 self.persist()
             TASK_LOCAL.task = task
-            TASK_LOCAL.cancel = self.cancel_event
+            TASK_LOCAL.cancel = cancel
+            TASK_LOCAL.controller = self
             status = 'completed'
             try:
                 check_cancelled()
@@ -2153,11 +2256,12 @@ class TaskController:
                     if task['status'] != 'awaiting_confirmation':
                         task['text'] = ''
                         task['payload'] = {}
-                    self.current = None
-                    self.process = None
+                    self.running.pop(task['id'], None)
                     self.persist()
+                    self.condition.notify_all()
                 TASK_LOCAL.task = None
                 TASK_LOCAL.cancel = None
+                TASK_LOCAL.controller = None
 
     def execute(self, task):
         chat, kind = task['chat'], task['kind']
@@ -2252,15 +2356,17 @@ class TaskController:
             # 旧版留给老键盘和习惯输入，功能并入「选择智能体」。
             send(chat, '当前执行器：' + current_engine() + '\n共享记忆和技能；原生会话独立，最近六项任务摘要交接。CodeBuddy保留自身高风险确认规则，不伪装成隔离沙箱绕过。\n注意 Codex 走 codex exec，无系统提示词参数，指令与任务会拼在同一条 prompt 里。')
         elif text in ('新任务',):
-            send(chat, '直接发送任务目标即可排队。新任务沿用当前会话；需要独立上下文请先选择“会话”中的“新建会话”。')
+            send(chat, '直接发送任务目标即可排队，最多同时执行' + str(self.max_concurrent) + '项。当前会话已有排队或运行中的智能体任务时，会自动新建并切换独立会话；空闲会话继续原有上下文。')
         elif text in ('当前任务', '状态'):
             with self.lock:
-                current = self.task_summary(self.current) if self.current else '当前没有运行中的任务。'
+                current = '\n\n'.join(self.task_summary(state['task']) for state in self.running.values()) or '当前没有运行中的任务。'
                 count = sum(item['status'] == 'queued' for item in self.data['tasks'])
             send(chat, current + '\n排队：' + str(count) + '\n新任务设置：' + current_model() + ' / ' + self.target + ' / ' + strategy_name()
                  + '\n运行和排队任务保留各自设置。实时系统资源请选择“服务器状态”。')
         elif text == '停止':
             send(chat, self.stop())
+        elif text.startswith('停止任务 '):
+            send(chat, self.stop(text.split(maxsplit=1)[1].strip()))
         elif text == '队列':
             with self.lock:
                 entries = [self.task_summary(item) for item in self.data['tasks'] if item['status'] in ('queued', 'awaiting_confirmation')]
@@ -2282,6 +2388,7 @@ class TaskController:
                         self.persist()
                         send(chat, '草稿已修改，仍未执行。发送“执行语音 ' + task['id'] + '”确认。')
                 else:
+                    self.isolate_session(task['snapshot'], exclude=task)
                     task.update(kind='agent', status='queued', result='')
                     self.persist()
                     self.condition.notify()
@@ -2567,8 +2674,7 @@ def main():
     last_state_flush = offset
     last_state_time = time.monotonic()
     CONTROL = TaskController(WORK)
-    worker = threading.Thread(target=CONTROL.worker, name='telegram-task-worker', daemon=True)
-    worker.start()
+    CONTROL.start_workers()
     def shutdown(signum, frame):
         raise KeyboardInterrupt()
     signal.signal(signal.SIGTERM, shutdown)
@@ -2624,14 +2730,8 @@ def main():
                         last_state_flush = offset
                         last_state_time = now
     except KeyboardInterrupt:
-        with CONTROL.condition:
-            CONTROL.closing = True
-            CONTROL.cancel_event.set()
-            CONTROL.condition.notify_all()
-        worker.join(timeout=12)
+        CONTROL.close()
         with CONTROL.lock:
-            if CONTROL.current:
-                CONTROL.current.update(status='interrupted', result='桥接停止，任务已中断；不会自动重放。')
             # 退出前把攒下的游标与 seen 落盘，避免停机后重放已处理过的消息。
             if offset is not None:
                 atomic_json(STATE, str(offset), raw=True)

@@ -285,10 +285,10 @@ RestartSec=5
 UMask=0077
 KillMode=control-group
 TimeoutStopSec=30
-MemoryHigh=650M
-MemoryMax=900M
-TasksMax=48
-CPUQuota=100%%
+MemoryHigh=1100M
+MemoryMax=1400M
+TasksMax=192
+CPUQuota=150%%
 StandardOutput=journal
 StandardError=journal
 
