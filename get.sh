@@ -14,14 +14,14 @@
 set -euo pipefail
 
 REPO="yys9253462-gif/telegram-agent-hub"
-# 固定提交号存放在 version.txt，由发布流程更新，与代码分离，避免自引用。
+# 固定提交号存放在 version.txt，与代码分离，避免自引用。
 # 可用环境变量覆盖以便测试：AGENT_REF=... AGENT_ARCHIVE_SHA256=...
 REF="${AGENT_REF:-}"
 SHA256="${AGENT_ARCHIVE_SHA256:-}"
 VERSION_URLS=(
+    "https://cdn.jsdelivr.net/gh/$REPO@main/version.txt"
     "https://raw.githubusercontent.com/$REPO/main/version.txt"
     "https://ghproxy.net/https://raw.githubusercontent.com/$REPO/main/version.txt"
-    "https://cdn.jsdelivr.net/gh/$REPO@main/version.txt"
 )
 
 say() { printf '%s\n' "$*"; }
@@ -55,10 +55,9 @@ if [ -z "$REF" ]; then
     say "正在获取固定版本号…"
     for url in "${VERSION_URLS[@]}"; do
         version="$(curl --proto '=https' --proto-redir '=https' -fsSL --max-time 30 "$url" 2>/dev/null || true)"
-        ref_line="$(printf '%s
-' "$version" | grep -E '^[0-9a-f]{40}$' | head -1 || true)"
-        sha_line="$(printf '%s
-' "$version" | grep -E '^sha256:[0-9a-f]{64}$' | head -1 | cut -d: -f2 || true)"
+        ref_line="$(printf '%s' "$version" | tr -d '\r' | grep -E '^[0-9a-f]{40}$' | head -1 || true)"
+        sha_line="$(printf '%s' "$version" | tr -d '\r' | grep -E '^sha256:[0-9a-f]{64}$' | head -1 | cut -d: -f2 || true)"
+        # jsdelivr 缓存刷新最快，排在最前；拿到首个合法版本即采用。
         if [ -n "$ref_line" ]; then
             REF="$ref_line"
             [ -n "$sha_line" ] && SHA256="$sha_line"
