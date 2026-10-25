@@ -163,6 +163,8 @@ Codex 走官方 `login --device-auth`，用户在官方网页输入设备码即�
 CodeBuddy 官方只提供浏览器登录链接并在本地等待，没有授权码回填入口，
 因此这里实现的是「给出链接 + 等待官方界面确认」，不伪造回填输入框。
 """
+import codecs
+import hashlib
 import os
 import queue
 import re
@@ -189,6 +191,15 @@ LOGIN_TRUST_PROMPT = 'Do you trust the files in this folder?'
 LOGIN_METHOD_PROMPT = 'Select login method:'
 LOGIN_SUCCESS_HINTS = ('logged in', 'login success', 'successfully', 'success',
                        '登录成功', '授权成功', '欢迎回来')
+# 官方界面的旋转动画帧字符。这些行只有动画与耗时，写进缓冲只会挤掉真正的信息。
+LOGIN_SPINNER_CHARS = ('✷', '✶', '✸', '✹', '✺', '✻', '✳', '·',
+                       '⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏')
+# 动画帧里的特征词汇。块边界把动画行切成半截后，行首字符就没了，
+# 只能靠这些词认出来。实测完整帧形如：
+#   ✷ Syncing… (5s · streaming · ↓ 83 tokens)
+# 选的词都只在动画帧里出现，正常提示行（信任目录 / 选择登录方式 / 登录链接 /
+# 等待授权）一个都不会命中。
+LOGIN_SPINNER_HINTS = ('syncing', 'streaming', 'tokens)', '· ↓', '↓ ')
 
 
 def login_clean_env(env):
@@ -241,6 +252,46 @@ def codebuddy_login_prompt(text):
     return None
 
 
+def login_relevant(text):
+    """只保留与登录进展有关的行，丢掉动画刷屏。
+
+    CodeBuddy 在已登录状态下会直接进「Syncing…」旋转动画，每 0.1 秒输出一帧，
+    九秒就能填满 16KB 的尾部缓冲，把真正的链接挤出去（2026-10-26 实测）。
+    所以在写进缓冲之前先滤一遍：纯动画帧行、连续重复行都不留。
+
+    🔴 不能只判行首：pty 与管道都不保证这一块数据恰好落在换行处，
+    动画行会被块边界切成半截，切剩下的那半截行首是个普通字符，
+    只判行首就会原样放进缓冲（实测某次只滤掉一部分，缓冲末段全是
+    「treaming · ↓ 83 tokens)ns)kens)」这类碎片）。所以按「整行是否只是动画」判。
+    """
+    kept = []
+    seen = set()
+    for raw in (text or '').split('\n'):
+        line = raw.strip()
+        if not line:
+            kept.append(raw)
+            continue
+        if _is_spinner_line(line):
+            continue
+        if line in seen:
+            continue
+        seen.add(line)
+        kept.append(raw)
+    return '\n'.join(kept).strip('\n')
+
+
+def _is_spinner_line(line):
+    """判断一行是不是（可能是被块边界切碎的）旋转动画帧。"""
+    if line[:1] in LOGIN_SPINNER_CHARS:
+        return True
+    # 被切碎的半截行：行首掉了，但动画的特征词汇还在，且整行短得不像正经提示。
+    low = line.lower()
+    for hint in LOGIN_SPINNER_HINTS:
+        if hint in low and len(line) <= 120:
+            return True
+    return False
+
+
 class _LoginSession:
     """一次登录会话。会话按执行器划分，因为同一执行器共用一个账号目录。"""
 
@@ -255,6 +306,10 @@ class _LoginSession:
         self.state = 'starting'
         self.buffer = ''
         self.thread = None
+        # 已经解析出来的登录信息（链接 / 设备码）。
+        # 官方界面在等待授权时会持续刷新动画，几 KB 的尾部缓冲会被新动画挤满，
+        # 光靠 buffer 里再搜一次会搜不到，所以一旦找到就单独记住，不再依赖缓冲区。
+        self.payload = None
 
 
 class LoginManager:
@@ -378,6 +433,9 @@ class LoginManager:
 
     def _read(self, session, output):
         source = session.master if session.master is not None else session.process.stdout
+        # 读到的字节可能把一个多字节字符从中间切开（pty 与管道都不保证读完整个字符），
+        # 用「允许末尾残留」的解码器把半个字符留到下一块再拼，避免落成乱码。
+        decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
         try:
             while not session.stopped.is_set():
                 if session.master is not None:
@@ -391,7 +449,10 @@ class LoginManager:
                 if not chunk:
                     break
                 if isinstance(chunk, bytes):
-                    chunk = chunk.decode('utf-8', errors='replace')
+                    chunk = decoder.decode(chunk)
+                    if not chunk:
+                        # 这一块整个都是半个字符，等下一块补齐再处理。
+                        continue
                 try:
                     output.put_nowait(chunk)
                 except queue.Full:
@@ -436,7 +497,14 @@ class LoginManager:
             eof = False
             step = 0
             next_probe = time.monotonic() + 20
-            while True:
+            # 先问一次官方命令：已经登录好的机器上，界面不会给登录链接，
+            # 而是直接进「Syncing…」动画。这时若还傻等链接，就只能等到超时，
+            # 最后把「已登录」说成超时或失败（2026-10-26 真实反馈）。
+            already = (session.provider == 'codebuddy'
+                       and self._codebuddy_authenticated(binary, env))
+            if already:
+                final_state = 'succeeded'
+            while not already:
                 if session.stopped.is_set():
                     final_state = 'cancelled'
                     break
@@ -450,33 +518,53 @@ class LoginManager:
                     else:
                         # 官方界面会持续刷新，只保留尾部内容即可；
                         # 这里不能因为输出变长就中断登录流程。
-                        session.buffer = (session.buffer + chunk)[-self.buffer_limit:]
+                        # 但在写进缓冲前要先滤掉旋转动画，否则几秒就被刷屏填满，
+                        # 真正的链接会被挤出窗口（2026-10-26 实测：9 秒即达 16KB 上限）。
+                        session.buffer = (session.buffer + login_relevant(chunk))[-self.buffer_limit:]
                         text = LOGIN_ANSI.sub('', session.buffer)
                         if session.provider == 'codebuddy':
-                            step = self._advance_codebuddy(session, text, step)
-                            prompt = codebuddy_login_prompt(session.buffer)
-                            if prompt and not ready:
-                                ready = True
-                                self._emit(session, 'ready', **prompt)
-                            elif ready and any(hint in text.lower() for hint in LOGIN_SUCCESS_HINTS):
+                            # 成功提示必须排在动画判断之前：官方界面自报登录成功时，
+                            # 紧跟其后的就是「Syncing…」动画，先读它才不会把结果误判成失败。
+                            if any(hint in text.lower() for hint in LOGIN_SUCCESS_HINTS):
                                 final_state = 'succeeded'
                                 session.stopped.set()
-                            elif ready and time.monotonic() >= next_probe:
+                                continue
+                            step = self._advance_codebuddy(session, text, step)
+                            if session.payload is None:
+                                prompt = codebuddy_login_prompt(session.buffer)
+                                if prompt:
+                                    session.payload = prompt
+                                    ready = True
+                                    self._emit(session, 'ready', **prompt)
+                            if ready and time.monotonic() >= next_probe:
                                 # 官方界面不一定退出，用官方命令的真实行为核实登录是否生效。
                                 next_probe = time.monotonic() + 20
                                 if self._codebuddy_authenticated(binary, env):
                                     final_state = 'succeeded'
                                     session.stopped.set()
                         else:
-                            prompt = codex_login_prompt(session.buffer)
-                            if prompt and not ready:
-                                ready = True
-                                self._emit(session, 'ready', **prompt)
+                            if session.payload is None:
+                                prompt = codex_login_prompt(session.buffer)
+                                if prompt:
+                                    session.payload = prompt
+                                    ready = True
+                                    self._emit(session, 'ready', **prompt)
                 except queue.Empty:
                     pass
                 returncode = session.process.poll()
                 if returncode is not None and (eof or not reader.is_alive()) and output.empty():
-                    final_state = 'succeeded' if returncode == 0 else 'failed'
+                    if returncode == 0:
+                        final_state = 'succeeded'
+                    elif session.provider == 'codebuddy':
+                        # 界面什么都没给出就退出，往往是一开始就已经登录好了，
+                        # 此时不能凭退出码断言失败，要问官方命令要真实结论。
+                        # 只对 CodeBuddy 这么做：Codex 走的是设备码流程，退出码非 0
+                        # 就是真的失败，套用同一个探测逻辑会把失败说成成功
+                        # （服务器上装了 codebuddy 且已登录时实测复现）。
+                        final_state = ('succeeded' if self._codebuddy_authenticated(binary, env)
+                                       else 'failed')
+                    else:
+                        final_state = 'failed'
                     break
         except Exception:
             final_state = 'cancelled' if session.stopped.is_set() else 'failed'
