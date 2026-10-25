@@ -65,6 +65,15 @@ def handled_labels():
 
 
 class TopLevelLayoutTest(unittest.TestCase):
+    def test_display_buttons_resolve_to_original_commands(self):
+        """展示文案美化后，点击按钮必须仍能进入原来的处理分支。"""
+        import bot
+        rendered = bot.menu_keyboard()
+        for original, display in zip(KEYBOARD['keyboard'], rendered['keyboard']):
+            self.assertEqual([bot.ALIASES.get(label, label) for label in display], original)
+        for command, label in bot.MENU_LABELS.items():
+            self.assertEqual(bot.ALIASES.get(label, label), command)
+
     def test_top_level_is_compact(self):
         """顶层最多三行，否则又会糊住聊天界面。"""
         self.assertLessEqual(len(KEYBOARD['keyboard']), 3,

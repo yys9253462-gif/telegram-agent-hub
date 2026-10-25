@@ -93,6 +93,49 @@ ALIASES = {'/start': '显示菜单', '/menu': '显示菜单', '/help': '任务�
            # 外部平台授权的短命令别名，方便手机上手打。
            '/gh': '授权GitHub', '/cf': '授权Cloudflare', '/auth': '授权状态'}
 
+# 展示文案与内部命令分离，旧键盘、短命令和历史消息继续兼容。
+MENU_LABELS = {
+    '新任务': '开始任务', '当前任务': '查看进度',
+    '停止': '停止任务', '服务器状态': '主机状态',
+    '设置': '工作设置', '更多': '更多功能',
+    '目标': '执行目标', '模型': '模型设置', '队列': '任务队列',
+    '会话': '会话管理', '文件': '文件管理',
+    '登录Claude': '账号登录', '授权GitHub': '仓库授权',
+    '授权Cloudflare': '云端授权', '云flare粘贴令牌': '手动填令牌',
+    '返回主菜单': '返回首页',
+}
+ALIASES.update({label: command for command, label in MENU_LABELS.items()})
+
+GROUP_DESCRIPTIONS = {
+    '任务与模型': '选择执行目标、模型和智能体，管理待办任务。',
+    '会话与文件': '继续之前的对话，查找和发送任务文件。',
+    '生图与文档': '描述你的创意，选择生图模型和画幅。',
+    '账号与渠道': '管理账号登录，切换模型调用渠道。',
+    '平台授权': '连接代码仓库与云平台，让智能体调用你的授权。',
+    '执行与查询': '调整执行方式，查看记忆、技能和工具记录。',
+    '系统与帮助': '查看权限与目录，了解使用方法。',
+}
+
+
+def menu_keyboard():
+    """统一渲染首页按钮，内部命令常量保持不变。"""
+    return {**KEYBOARD, 'keyboard': [
+        [MENU_LABELS.get(label, label) for label in row]
+        for row in KEYBOARD['keyboard']]}
+
+
+def home_menu_text():
+    """首页信息集中展示，避免返回首页与显示菜单的文案漂移。"""
+    return ('智能体工作台\n'
+            '────────────────\n'
+            '当前模型  ·  ' + current_model() + '\n'
+            '执行方式  ·  ' + strategy_name() + '\n'
+            '会话状态  ·  ' + ('继续当前会话' if session_id() else '准备开始') + '\n'
+            '────────────────\n'
+            '直接发送文字、语音或图片开始任务。\n'
+            '查看进度了解执行情况，工作设置调整模型与会话。')
+
+
 MENU_STATE = WORK / 'menu-visible.json'
 
 def menu_visible():
@@ -111,7 +154,7 @@ def send_rich(chat, html):
     Telegram 直接返回 400。这里短消息一次发完，不做切片。
     """
     html = redact(html)
-    markup = KEYBOARD if menu_visible() else {'remove_keyboard': True}
+    markup = menu_keyboard() if menu_visible() else {'remove_keyboard': True}
     payload = {'chat_id': chat, 'text': html, 'parse_mode': 'HTML', 'reply_markup': markup,
                'disable_web_page_preview': True}
     try:
@@ -127,7 +170,7 @@ def send(chat, text):
     task = getattr(TASK_LOCAL, 'task', None)
     if task and task['kind'] == 'quick':
         task['result'] = text[:24000]
-    markup = KEYBOARD if menu_visible() else {'remove_keyboard': True}
+    markup = menu_keyboard() if menu_visible() else {'remove_keyboard': True}
     # 这里是纯文本发送（不带 parse_mode），所以按字符数硬切是安全的：
     # Python 的字符串切片以码位为单位，不会把中文或 emoji 劈成半个字节序列。
     # 分片长度比 Telegram 的 4096 上限保守，留出余量给后续可能的格式包装。
@@ -924,24 +967,28 @@ def send_options(chat, title, labels):
     # 「收起菜单」可能已经在 labels 里（如系统分组），不再重复追加，否则同一个按钮会出现两次。
     tail = ['返回主菜单'] + ([] if '收起菜单' in labels else ['收起菜单'])
     api('sendMessage', {'chat_id': chat, 'text': title, 'reply_markup': {
-        'keyboard': [labels[index:index + 2] for index in range(0, len(labels), 2)] + [tail],
-        'resize_keyboard': True, 'one_time_keyboard': False,
+        'keyboard': [[MENU_LABELS.get(label, label) for label in labels[index:index + 2]]
+                     for index in range(0, len(labels), 2)]
+                    + [[MENU_LABELS.get(label, label) for label in tail]],
+        'resize_keyboard': True, 'is_persistent': True, 'one_time_keyboard': False,
         'input_field_placeholder': '选择功能，或直接发送任务'}})
 
 def send_group_menu(chat, title, groups):
     """渲染分组菜单。先只列分组名，点进分组才展开该组的具体功能。"""
     labels = list(groups)
-    api('sendMessage', {'chat_id': chat, 'text': title, 'reply_markup': {
-        'keyboard': [labels[index:index + 2] for index in range(0, len(labels), 2)] + [['返回主菜单', '收起菜单']],
-        'resize_keyboard': True, 'one_time_keyboard': False,
-        'input_field_placeholder': '选择分组，或直接发送任务'}})
+    overview = '\n\n'.join(name + '\n' + GROUP_DESCRIPTIONS.get(name, '选择功能继续。')
+                            for name in labels)
+    api('sendMessage', {'chat_id': chat, 'text': title + '\n\n' + overview, 'reply_markup': {
+        'keyboard': [labels[index:index + 2] for index in range(0, len(labels), 2)] + [['返回首页', '收起菜单']],
+        'resize_keyboard': True, 'is_persistent': True, 'one_time_keyboard': False,
+        'input_field_placeholder': '选择一个功能分组'}})
 
 
 def group_title(owner, group):
     """分组展开时的标题文案。集中在这里，避免两处实现各写一句、逐渐漂移。"""
-    intro = {'设置': '按用途分成三组，点进去只看该组功能。',
-             '更多': '账号、执行与系统类入口都收在这里。'}
-    return group + '\n' + intro.get(owner, '选择下面的功能。')
+    intro = {'设置': '把工作方式调成你习惯的样子。',
+             '更多': '连接平台、管理账号，查看系统与使用帮助。'}
+    return MENU_LABELS.get(group, group) + '\n' + intro.get(owner, '选择下面的功能。')
 
 
 def expand_group(chat, text):
@@ -955,7 +1002,8 @@ def expand_group(chat, text):
         items = groups.get(text)
         if items:
             # 标题带上级名字，避免两个菜单重名时看不出自己在哪一层。
-            send_options(chat, owner + ' › ' + text, list(items))
+            send_options(chat, MENU_LABELS.get(owner, owner) + ' / ' + text
+                         + '\n\n' + GROUP_DESCRIPTIONS.get(text, '选择下面的功能。'), list(items))
             return True
     return False
 
@@ -986,7 +1034,7 @@ def quick_action(chat, text):
         pass
     elif text == '返回主菜单':
         set_menu_visible(True)
-        send(chat, '智能体控制台\n当前模型：' + current_model() + '\n执行策略：' + strategy_name() + '\n直接输入任务，或选择下方功能。')
+        send(chat, home_menu_text())
     elif text in ('服务器状态', '/resources'):
         send(chat, resource_status())
     elif text in ('收起菜单', '/hide'):
@@ -994,7 +1042,7 @@ def quick_action(chat, text):
         send(chat, '菜单已收起，可以直接输入任务。发送 /menu 重新展开。')
     elif text == '显示菜单':
         set_menu_visible(True)
-        send(chat, '智能体控制台\n━━━━━━━━━━━━\n模型：' + current_model() + '\n策略：' + strategy_name() + '\n会话：' + ('已连接' if session_id() else '等待新任务') + '\n━━━━━━━━━━━━\n文字、语音、图片都可以直接发送。')
+        send(chat, home_menu_text())
     elif text in ('新建会话', '/new'):
         save_session(None)
         send(chat, '已新建会话。下一条消息作为新任务开始，旧会话文件保留。')
@@ -1160,7 +1208,7 @@ def send_formatted(chat, text):
     text = redact(text)
     for piece in split_message(text):
         payload = {'chat_id': chat, 'text': render_reply(piece), 'parse_mode': 'HTML',
-                   'reply_markup': KEYBOARD if menu_visible() else {'remove_keyboard': True}}
+                   'reply_markup': menu_keyboard() if menu_visible() else {'remove_keyboard': True}}
         try:
             api('sendMessage', payload)
         except urllib.error.HTTPError as exc:

@@ -415,11 +415,13 @@ class GroupMenuTest(unittest.TestCase):
             self.assertFalse(bot.expand_group(1, '根本不存在'))
         finally:
             bot.send_options = original
-        self.assertEqual(captured[0][0], '设置 › 任务与模型')
+        self.assertTrue(captured[0][0].startswith('工作设置 / 任务与模型'))
+        self.assertIn(bot.GROUP_DESCRIPTIONS['任务与模型'], captured[0][0])
+        self.assertEqual(captured[0][1], bot.MENU_GROUPS['设置']['任务与模型'])
 
     def test_title_helper_covers_both_owners(self):
-        self.assertIn('按用途分成三组', bot.group_title('设置', '设置'))
-        self.assertIn('账号、执行与系统类入口', bot.group_title('更多', '更多'))
+        self.assertTrue(bot.group_title('设置', '设置').startswith('工作设置\n'))
+        self.assertTrue(bot.group_title('更多', '更多').startswith('更多功能\n'))
 
 
 if __name__ == '__main__':
