@@ -1050,6 +1050,103 @@ class GitHubRenewalTest(unittest.TestCase):
         self.assertIn('自动续期', bot.auth_status_text())
 
 
+class RenewNotificationTest(unittest.TestCase):
+    """续期通知策略：成功静默，只有真失效才提醒。
+
+    2026-10-26 机主要求：「这个刷新不用一直发消息直接后台静默就行，
+    只有在失效了才通知」。自动续期是设计上该成功的事，
+    每天一条「已续期，无需处理」纯属噪音。
+    """
+
+    def setUp(self):
+        self.temp = Path(tempfile.mkdtemp(prefix='renew-notify-'))
+        self.addCleanup(shutil.rmtree, self.temp, True)
+        self.original = (bot.CREDENTIALS, bot.CREDENTIAL_RENEW_WARNED)
+        bot.CREDENTIALS = self.temp / 'credentials.json'
+        # 每轮都从干净的告警状态开始，否则用例之间会互相压制。
+        bot.CREDENTIAL_RENEW_WARNED = {}
+        self.addCleanup(self._restore)
+        self.sent = []
+
+    def _restore(self):
+        bot.CREDENTIALS, bot.CREDENTIAL_RENEW_WARNED = self.original
+
+    def save(self, expires_in, refresh='refresh-value'):
+        store = credentials.CredentialStore(bot.CREDENTIALS)
+        store.save('cloudflare', FAKE_CF, scope='站点', refresh=refresh,
+                   expires_in=expires_in)
+        return store
+
+    def run_check(self, provider='cloudflare'):
+        with patch.object(bot, 'notify', side_effect=lambda chat, text: self.sent.append(text)):
+            return bot.renew_check_once(provider)
+
+    def test_successful_renewal_sends_nothing(self):
+        """续期成功必须完全静默 —— 这是本次请求的核心。"""
+        self.save(600)
+        body = {'access_token': 'cfut_' + 'Ne' * 20, 'refresh_token': 'cf-next',
+                'expires_in': 86400}
+        with patch('bot.cloudflare_auth.refresh', return_value=body):
+            sent_alert = self.run_check()
+        self.assertFalse(sent_alert)
+        self.assertEqual(self.sent, [], '续期成功不该发任何消息')
+
+    def test_successful_renewal_still_updates_the_token(self):
+        # 静默的前提是「该做的事真做了」，不能变成什么都不做。
+        store = self.save(600)
+        body = {'access_token': 'cfut_' + 'Ne' * 20, 'refresh_token': 'cf-next',
+                'expires_in': 86400}
+        with patch('bot.cloudflare_auth.refresh', return_value=body):
+            self.run_check()
+        self.assertEqual(store.get('cloudflare')['value'], body['access_token'])
+        self.assertEqual(store.get('cloudflare')['refresh'], 'cf-next')
+
+    def test_failed_renewal_does_send_an_alert(self):
+        self.save(600)
+        with patch('bot.cloudflare_auth.refresh', side_effect=RuntimeError('接口拒绝')):
+            sent_alert = self.run_check()
+        self.assertTrue(sent_alert)
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn('续期失败', self.sent[0])
+        self.assertIn('授权', self.sent[0])
+
+    def test_missing_refresh_token_alerts(self):
+        # 没有刷新令牌 = 到期后必然失效，属于必须提醒的情况。
+        # 直接给一份没有 refresh 的记录，避免依赖 store 内部写盘细节。
+        with patch.object(bot, 'renewal_needed',
+                          return_value=({'value': 'x', 'expires_at': int(time.time()) + 60,
+                                         'client_id': 'cf'}, True)):
+            sent_alert = self.run_check()
+        self.assertTrue(sent_alert)
+        self.assertIn('没有可用于自动续期', self.sent[0])
+
+    def test_alert_is_not_repeated_within_the_gap(self):
+        """真失效时也不能每五分钟吵一次。"""
+        self.save(600)
+        with patch('bot.cloudflare_auth.refresh', side_effect=RuntimeError('拒绝')):
+            self.assertTrue(self.run_check())
+            # 紧接着再跑一次：仍在提醒间隔内，不该再发。
+            self.assertFalse(self.run_check())
+        self.assertEqual(len(self.sent), 1)
+
+    def test_alert_repeats_after_the_gap(self):
+        self.save(600)
+        with patch('bot.cloudflare_auth.refresh', side_effect=RuntimeError('拒绝')):
+            self.run_check()
+            # 把上次提醒时间往前推，模拟一小时已过。
+            bot.CREDENTIAL_RENEW_WARNED['cloudflare']['at'] -= bot.CREDENTIAL_RENEW_ALERT_GAP + 1
+            self.assertTrue(self.run_check())
+        self.assertEqual(len(self.sent), 2)
+
+    def test_nothing_happens_when_renewal_is_not_needed(self):
+        # 没到续期窗口时连接口都不该碰，更不该发消息。
+        self.save(86400)
+        with patch('bot.cloudflare_auth.refresh') as refresh:
+            self.assertFalse(self.run_check())
+        self.assertFalse(refresh.called)
+        self.assertEqual(self.sent, [])
+
+
 class SensitiveFileTest(unittest.TestCase):
     """缺陷：模型用「发文件」把凭据文件原样传回聊天。"""
 
