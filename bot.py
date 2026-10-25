@@ -42,20 +42,32 @@ def api(method, payload):
         raise RuntimeError('机器人接口返回失败')
     return body['result']
 
+# 顶层只留高频操作：派任务、看进度、急停、看机器、两个二级入口。
+# 低频配置和查询收进「设置」与「更多」的分组菜单，避免十几行按钮糊住整个聊天界面。
 KEYBOARD = {
     'keyboard': [
         ['新任务', '当前任务'],
-        ['停止', '队列'],
-        ['目标', '模型'],
-        ['选择智能体', '当前智能体'],
-        ['图片创作', '生图设置'],
-        ['会话', '文件'],
-        ['服务器状态', '设置'],
+        ['停止', '服务器状态'],
+        ['设置', '更多'],
     ],
     'resize_keyboard': True,
     'is_persistent': True,
     'one_time_keyboard': False,
     'input_field_placeholder': '点击功能按钮，或直接输入任务',
+}
+
+# 分组菜单：每组一个标题，点进分组后只显示该组的功能，不再平铺十几项。
+MENU_GROUPS = {
+    '设置': {
+        '任务与模型': ['目标', '模型', '队列', '选择智能体'],
+        '会话与文件': ['会话', '文件'],
+        '生图与文档': ['生图设置', '图片创作'],
+    },
+    '更多': {
+        '账号与渠道': ['登录Claude', '账号状态', '渠道切换'],
+        '执行与查询': ['执行策略', '长期记忆', '技能查询', '工具审计'],
+        '系统与帮助': ['权限状态', '工作目录', '任务说明', '收起菜单'],
+    },
 }
 CHECKS = {
     '服务器概况': [['uptime'], ['free', '-m'], ['df', '-h', '/']],
@@ -423,10 +435,24 @@ def agent_instructions():
             '当前执行策略：' + strategy_name() + '。' + STRATEGIES[strategy_name()])
 
 def send_options(chat, title, labels):
+    # 「收起菜单」可能已经在 labels 里（如系统分组），不再重复追加，否则同一个按钮会出现两次。
+    tail = ['返回主菜单'] + ([] if '收起菜单' in labels else ['收起菜单'])
+    api('sendMessage', {'chat_id': chat, 'text': title, 'reply_markup': {
+        'keyboard': [labels[index:index + 2] for index in range(0, len(labels), 2)] + [tail],
+        'resize_keyboard': True, 'one_time_keyboard': False,
+        'input_field_placeholder': '选择功能，或直接发送任务'}})
+
+def send_group_menu(chat, title, groups):
+    """渲染分组菜单。先只列分组名，点进分组才展开该组的具体功能。"""
+    labels = list(groups)
     api('sendMessage', {'chat_id': chat, 'text': title, 'reply_markup': {
         'keyboard': [labels[index:index + 2] for index in range(0, len(labels), 2)] + [['返回主菜单', '收起菜单']],
         'resize_keyboard': True, 'one_time_keyboard': False,
-        'input_field_placeholder': '选择功能，或直接发送任务'}})
+        'input_field_placeholder': '选择分组，或直接发送任务'}})
+
+def group_entry(owner, group):
+    """判断某个按钮是不是分组名，并返回它下面那一层按钮。"""
+    return MENU_GROUPS.get(owner, {}).get(group)
 
 def quick_action(chat, text):
     text = ALIASES.get(text, text)
@@ -445,8 +471,17 @@ def quick_action(chat, text):
     elif text in STRATEGIES:
         atomic_json(STRATEGY_STATE, {'strategy': text})
         send(chat, '执行策略已切换为：' + text + '\n下一条任务生效，重启后保留。')
-    elif text == '更多设置':
-        send_options(chat, '设置与帮助\n常用操作放在主页，其余功能集中在这里。', ['刷新模型', '工作目录', '权限状态', '任务说明'])
+    elif text in ('设置', '更多设置', '/settings'):
+        send_group_menu(chat, '设置\n按用途分成三组，点进去只看该组功能。', MENU_GROUPS['设置'])
+    elif text == '更多':
+        send_group_menu(chat, '更多\n账号、执行与系统类入口都收在这里。', MENU_GROUPS['更多'])
+    elif any(text in groups for groups in MENU_GROUPS.values()):
+        # 先把按钮定位到它所属的那一级菜单，标题里带上级名字，避免两个菜单重名时串组。
+        for owner, groups in MENU_GROUPS.items():
+            items = groups.get(text)
+            if items:
+                send_options(chat, owner + ' › ' + text, list(items))
+                break
     elif text == '返回主菜单':
         set_menu_visible(True)
         send(chat, '智能体控制台\n当前模型：' + current_model() + '\n执行策略：' + strategy_name() + '\n直接输入任务，或选择下方功能。')
@@ -1385,7 +1420,10 @@ class TaskController:
             if task:
                 send(chat, '生图任务已排队：' + task['id'])
         elif text in ('选择智能体', '/agent'):
-            send_options(chat, '选择执行器\n共享技能、长期记忆、文件和机器人会话；原生会话编号分别保存，通过最近六项任务记录衔接上下文。', ['使用Claude', '使用CodeBuddy', '当前智能体'])
+            # 当前执行器直接写在标题里，不再单独占一个「当前智能体」按钮。
+            send_options(chat, '选择执行器\n当前：' + current_engine()
+                         + '\n共享技能、长期记忆、文件和机器人会话；原生会话编号分别保存，通过最近六项任务记录衔接上下文。',
+                         ['使用Claude', '使用CodeBuddy'])
         elif text in ('使用Claude', '使用CodeBuddy'):
             desired = 'codebuddy' if text == '使用CodeBuddy' else 'claude'
             if desired not in os.environ.get('ENABLED_AGENTS', 'claude,codebuddy').split(','):
@@ -1395,6 +1433,7 @@ class TaskController:
                 self.persist()
             send(chat, '新任务执行器已切换为：' + self.data['engine'] + '。已有排队或运行任务保持原执行器。')
         elif text == '当前智能体':
+            # 旧版留给老键盘和习惯输入，功能并入「选择智能体」。
             send(chat, '当前执行器：' + current_engine() + '\n共享记忆和技能；原生会话独立，最近六项任务摘要交接。CodeBuddy保留自身高风险确认规则，不伪装成隔离沙箱绕过。')
         elif text in ('新任务',):
             send(chat, '直接发送任务目标即可排队。新任务沿用当前会话；需要独立上下文请先选择“会话”中的“新建会话”。')
@@ -1512,7 +1551,16 @@ class TaskController:
                 result = task.get('result', '') if task else '任务ID不存在。'
             send_formatted(chat, redact(result or '尚无结果。'))
         elif text == '设置':
-            send_options(chat, '设置与查询。长期记忆和技能查询会作为只读任务进入队列。', ['执行策略', '长期记忆', '技能查询', '工具审计', '历史结果', '登录Claude', '账号状态', '渠道切换', '权限状态', '任务说明', '收起菜单', '工作目录'])
+            send_group_menu(chat, '设置\n按用途分成三组，点进去只看该组功能。', MENU_GROUPS['设置'])
+        elif text == '更多':
+            send_group_menu(chat, '更多\n账号、执行与系统类入口都收在这里。', MENU_GROUPS['更多'])
+        elif any(text in groups for groups in MENU_GROUPS.values()):
+            # 分组展开：只在确实是分组名时才响应，避免和功能名冲突。
+            for owner, groups in MENU_GROUPS.items():
+                items = groups.get(text)
+                if items:
+                    send_options(chat, owner + ' › ' + text, list(items))
+                    break
         elif text in ('登录Claude', '登录 Claude', '/login'):
             url = start_account_login()
             send(chat, '请用手机浏览器打开下面的链接完成授权（可能需要先登录 claude.ai）。\n\n'
