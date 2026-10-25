@@ -24,6 +24,7 @@ from pathlib import Path
 # 这样模块内引用 os.environ 时拿到的已经是本进程的环境。
 import cloudflare_auth
 import github_auth
+from github_auth import LoginManager
 from credentials import PROVIDERS, CredentialStore, fingerprint, looks_like
 
 # 导入模块不读取认证信息、不创建目录、不启动网络请求。
@@ -74,7 +75,7 @@ MENU_GROUPS = {
     '设置': {
         '任务与模型': ['模型', '选择智能体'],
         '会话与文件': ['新建会话', '会话列表'],
-        '账号登录': ['登录Claude', '登录CodeBuddy', '账号状态', '渠道切换'],
+        '账号登录': ['登录Claude', '登录CodeBuddy', '登录Codex', '账号状态', '渠道切换'],
         '版本更新': ['检查版本', '更新机器人'],
     },
     '更多': {
@@ -104,7 +105,7 @@ MENU_LABELS = {
     '设置': '模型与会话', '更多': '授权管理',
     '目标': '执行目标', '模型': '模型设置', '队列': '任务队列',
     '会话': '会话管理', '文件': '文件管理',
-    '登录Claude': '登录Claude账号', '登录CodeBuddy': '登录CodeBuddy账号',
+    '登录Claude': '登录Claude账号', '登录CodeBuddy': '登录CodeBuddy账号', '登录Codex': '登录Codex账号',
     '授权GitHub': '仓库授权',
     '授权Cloudflare': '云端授权', '云flare粘贴令牌': '手动填令牌',
     '返回主菜单': '返回首页',
@@ -266,31 +267,86 @@ def current_model():
         return os.environ.get('ANTHROPIC_MODEL', 'auto')
 
 AUTH_STATE = WORK / 'auth-channel.json'
-AUTH_CHANNELS = {'gateway': '接口密钥', 'account': 'Claude 账号'}
+AUTH_CHANNELS = {'gateway': '接口密钥', 'account': '账号'}
+AUTH_LOCK = threading.RLock()
 LOGIN_PENDING = WORK / 'login-pending.json'
+CLI_LOGINS = LoginManager()
 
 
-def auth_channel():
-    """当前使用的模型渠道。默认走网关密钥，账号登录只是可选渠道。"""
-    try:
-        value = json.loads(AUTH_STATE.read_text()).get('channel')
-    except (OSError, ValueError, AttributeError):
-        value = None
+def auth_channel(engine=None):
+    """每个执行器独立选择渠道；任务执行始终使用入队时的选择。"""
+    engine = engine or current_engine()
+    task = getattr(TASK_LOCAL, 'task', None)
+    if task and task['snapshot'].get('engine', 'claude') == engine:
+        return task['snapshot'].get('auth_channel', 'gateway')
+    with AUTH_LOCK:
+        try:
+            data = json.loads(AUTH_STATE.read_text())
+            channels = data.get('channels', {})
+            value = channels.get(engine)
+            if value is None and engine == 'claude':
+                value = data.get('channel')
+        except (OSError, ValueError, AttributeError):
+            value = None
     return value if value in AUTH_CHANNELS else 'gateway'
 
 
-def set_auth_channel(channel):
+def channel_label(engine=None):
+    engine = engine or current_engine()
+    return engine_spec(engine)['label'] + ' 账号' if auth_channel(engine) == 'account' else '接口密钥'
+
+
+def set_auth_channel(channel, engine=None):
     if channel not in AUTH_CHANNELS:
         raise MediaError('未知渠道。')
-    atomic_json(AUTH_STATE, {'channel': channel})
+    engine = engine or current_engine()
+    if engine not in ENGINES:
+        raise MediaError('未知执行器。')
+    with AUTH_LOCK:
+        try:
+            data = json.loads(AUTH_STATE.read_text())
+            channels = data.get('channels', {})
+            channels = dict(channels) if isinstance(channels, dict) else {}
+            if data.get('channel') in AUTH_CHANNELS:
+                channels.setdefault('claude', data['channel'])
+        except (OSError, ValueError, AttributeError):
+            channels = {}
+        channels[engine] = channel
+        atomic_json(AUTH_STATE, {'channels': channels})
+
+
+def cli_login_notification(event):
+    engine, chat = event['provider'], event['chat']
+    label = engine_spec(engine)['label']
+    state = event['state']
+    if state in ('ready', 'awaiting_code', 'awaiting_authorization'):
+        message = label + ' 登录授权\n' + event.get('url', '')
+        if engine == 'codex':
+            message += '\n设备码：' + event.get('code', '') + '\n在官方网页输入设备码，完成后会自动检查。'
+        else:
+            message += '\n完成浏览器授权后，服务器会自动等待并检测登录结果，不需要回填授权码。'
+        send_options(chat, message, [('取消' + label + '登录', '取消登录 ' + engine)])
+    elif state in ('succeeded', 'authenticated'):
+        send_options(chat, label + ' 账号登录成功。当前渠道保持不变，可选择后续任务使用的渠道。',
+                     [('使用' + label + '账号', '使用账号 ' + engine),
+                      ('使用接口密钥', '使用接口密钥 ' + engine)])
+    elif state in ('failed', 'timeout', 'cancelled'):
+        messages = {'failed': '登录失败，请重新发起登录。', 'timeout': '登录已超时，请重新获取授权。',
+                    'cancelled': '登录已取消。'}
+        send(chat, label + ' ' + messages[state])
 
 
 def claude_binary():
     return str(AGENT_HOME / '.local' / 'bin' / 'claude')
 
 
-def account_authorized():
+def account_authorized(engine=None):
     """查询 CLI 是否已有可用的账号登录态。不读取任何凭据内容，只看状态。"""
+    engine = engine or current_engine()
+    if engine != 'claude':
+        status = CLI_LOGINS.status(engine, engine_binary(engine), account_environment(os.environ, engine))
+        ok = bool(status.get('authenticated'))
+        return ok, ('已登录。' if ok else '尚未登录或无法确认官方登录状态。')
     try:
         result = subprocess.run([claude_binary(), 'auth', 'status', '--text'],
                                 capture_output=True, text=True, timeout=20,
@@ -299,7 +355,7 @@ def account_authorized():
         return False, '无法执行 claude 命令。'
     output = (result.stdout or '') + (result.stderr or '')
     # CLI 未登录时输出 "Not logged in"，已登录会打印账号信息。
-    if 'not logged in' in output.lower():
+    if result.returncode != 0 or 'not logged in' in output.lower():
         return False, '尚未登录 Claude 账号。'
     return True, output.strip()[:600] or '已登录。'
 
@@ -311,6 +367,17 @@ MODEL_PIN_VARS = ('ANTHROPIC_MODEL', 'ANTHROPIC_DEFAULT_HAIKU_MODEL',
 # 网关渠道专用变量。账号渠道下必须全部移除，否则 CLI 会优先走它们，
 # 登录得到的账号凭据永远用不上。
 GATEWAY_VARS = ('ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL')
+OPENAI_GATEWAY_VARS = ('OPENAI_API_KEY', 'OPENAI_BASE_URL', 'OPENAI_MODEL', 'CODEX_API_KEY')
+CODEBUDDY_GATEWAY_VARS = ('CODEBUDDY_API_KEY', 'CODEBUDDY_BASE_URL', 'CODEBUDDY_MODEL')
+
+
+def account_environment(environment, engine):
+    names = GATEWAY_VARS + MODEL_PIN_VARS
+    if engine == 'codex':
+        names += OPENAI_GATEWAY_VARS
+    elif engine == 'codebuddy':
+        names += CODEBUDDY_GATEWAY_VARS
+    return {name: value for name, value in environment.items() if name not in names}
 
 
 def login_environment():
@@ -761,8 +828,7 @@ def model_environment():
     environment = {**os.environ, 'DISABLE_AUTOUPDATER': '1'}
     environment.update({name: model for name in MODEL_PIN_VARS})
     if auth_channel() == 'account':
-        for name in GATEWAY_VARS + MODEL_PIN_VARS:
-            environment.pop(name, None)
+        environment = account_environment(environment, current_engine())
     return environment
 
 def read_model_cache():
@@ -783,15 +849,12 @@ def read_model_cache():
 
 
 def catalog(refresh=False):
+    if auth_channel() == 'account':
+        return [{'id': 'default', 'provider': engine_spec(current_engine())['label'] + ' 账号'}]
     if not refresh and MODEL_CACHE.exists():
         return read_model_cache()
-    # 账号渠道下没有网关基址与密钥（model_environment 会主动移除它们），
-    # 此时只能依赖本地缓存。不拦下来的话，点「刷新模型」会以 KeyError 报错，
-    # 而界面上只会显示「本次操作失败」，看不出真实原因。
     base_url = os.environ.get('ANTHROPIC_BASE_URL')
     api_key = os.environ.get('ANTHROPIC_API_KEY')
-    if auth_channel() == 'account':
-        raise MediaError('账号渠道不支持在线拉取模型目录，请切换回网关渠道后刷新。')
     if not base_url or not api_key:
         raise MediaError('缺少网关地址或密钥，无法拉取模型目录，请重新运行安装器。')
     url = base_url.rstrip('/') + '/v1/models'
@@ -1488,21 +1551,28 @@ def engine_command(engine, text, instructions, chat, environment):
     """按执行器类型拼装命令行。两种 CLI 的参数差异很大，不能共用一个模板。"""
     spec = engine_spec(engine)
     binary = engine_binary(engine)
+    account = auth_channel(engine) == 'account'
+    if account:
+        clean_environment = account_environment(environment, engine)
+        environment.clear()
+        environment.update(clean_environment)
     command = [binary]
     if spec['kind'] == 'codex':
         # codex exec 没有 --append-system-prompt，也没有轮次上限参数，
         # 系统指令只能拼进 prompt 本体，并且要显式声明工作目录与跳过 Git 检查。
         # 凭据方面：codex 只认 OPENAI_API_KEY，而本站凭据存在 ANTHROPIC_API_KEY，
         # 这里按需映射一份，不动全局环境，避免影响 Claude 渠道。
-        if not environment.get('OPENAI_API_KEY') and environment.get('ANTHROPIC_API_KEY'):
+        if not account and not environment.get('OPENAI_API_KEY') and environment.get('ANTHROPIC_API_KEY'):
             environment['OPENAI_API_KEY'] = environment['ANTHROPIC_API_KEY']
-        if environment.get('ANTHROPIC_BASE_URL') and not environment.get('OPENAI_BASE_URL'):
+        if not account and environment.get('ANTHROPIC_BASE_URL') and not environment.get('OPENAI_BASE_URL'):
             # 判断依据必须是传进来的 environment，不是进程全局环境：否则运维在配置里
             # 显式指定的 OPENAI_BASE_URL 会被网关地址覆盖，Codex 指不到自己想要的地址。
             environment['OPENAI_BASE_URL'] = environment['ANTHROPIC_BASE_URL'].rstrip('/') + '/v1'
         command += ['exec', '--json', '--skip-git-repo-check',
                     '--sandbox', 'danger-full-access', '--cd', str(WORK)]
-        if current_model():
+        if account:
+            command += ['-c', 'model_provider="openai"', '-c', 'forced_login_method="chatgpt"']
+        elif current_model():
             command += ['--model', current_model()]
         if session_id():
             # codex 的续接是子命令，不是参数。
@@ -1514,7 +1584,7 @@ def engine_command(engine, text, instructions, chat, environment):
                 '--output-format', 'stream-json', '--verbose', '--include-partial-messages',
                 '--dangerously-skip-permissions', '--max-turns', '80',
                 '--append-system-prompt', instructions]
-    if engine == 'codebuddy':
+    if engine == 'codebuddy' and not account:
         command.extend(['--model', current_model()])
     if session_id():
         command.extend(['--resume', session_id()])
@@ -2249,6 +2319,7 @@ class TaskController:
             snapshot.setdefault('target', data.get('target', '本机'))
             snapshot.setdefault('strategy', '均衡执行')
             snapshot.setdefault('engine', 'claude')
+            snapshot.setdefault('auth_channel', 'gateway')
             snapshot.setdefault('session_id', data['sessions'][snapshot['session_key']].get('session_id'))
             if snapshot['session_key'] not in data['sessions']:
                 snapshot['session_key'] = data['active_session']
@@ -2327,7 +2398,9 @@ class TaskController:
         with self.lock:
             key = self.data['active_session']
             session = self.data['sessions'].get(key) or {}
-            return {'model': current_model(), 'target': self.target, 'strategy': strategy_name(), 'engine': current_engine(),
+            engine = current_engine()
+            return {'model': current_model(), 'target': self.target, 'strategy': strategy_name(), 'engine': engine,
+                    'auth_channel': auth_channel(engine),
                     'session_key': key, 'session_id': session.get('session_id')}
 
     def enqueue(self, chat, text='', kind='agent', payload=None, update_id=None, snapshot=None):
@@ -2528,6 +2601,15 @@ class TaskController:
         # 里面写着 '当前模型': '当前模型' 这种自我映射（死项），并且把 /tasks 映射成
         # 「新任务」，与 MENU_GROUPS 中「新任务」只是说明文案的语义冲突。
         text = ALIASES.get(text, text)
+        if text == '提交CodeBuddy授权码' or text.startswith('提交CodeBuddy授权码 '):
+            code = text.partition(' ')[2].strip()
+            if not code:
+                raise MediaError('格式：提交CodeBuddy授权码 CODE')
+            result = CLI_LOGINS.submit('codebuddy', chat, code)
+            if not result.get('ok'):
+                raise MediaError('当前没有可提交授权码的 CodeBuddy 登录，请先发送“登录CodeBuddy”。')
+            send(chat, 'CodeBuddy 授权码已提交，正在等待官方登录结果。')
+            return
         if text in ('检查版本', '更新机器人', '确认更新机器人'):
             quick_action(chat, text)
         elif text == '图片创作':
@@ -2720,36 +2802,52 @@ class TaskController:
             send(chat, '请用手机浏览器打开下面的链接完成授权（可能需要先登录 claude.ai）。\n\n'
                        + url + '\n\n授权后网页会给出一段授权码，把它直接发给我即可。\n'
                        '链接十分钟内有效；期间不要重复发起登录。')
-        elif text == '登录CodeBuddy':
-            binary = AGENT_HOME / '.local/bin/codebuddy'
-            if not binary.is_file():
-                raise MediaError('这台服务器尚未安装 CodeBuddy 执行器，请先由管理员安装。')
-            send(chat, 'CodeBuddy 账号登录目前需要在服务器交互终端完成。\n'
-                       '官方流程：运行下面的命令，选择国内站或国际站，再按终端提示打开浏览器授权。\n\n'
-                       + shlex.quote(str(binary))
-                       + '\n\n请使用机器人运行账号执行。当前尚未接入电报内的登录链接与回填流程，'
-                       '不要把账号密码或登录令牌发到聊天里。\n'
-                       '登录完成不会自动切换当前配置的模型网关。')
+        elif text in ('登录CodeBuddy', '登录Codex'):
+            engine = 'codebuddy' if text == '登录CodeBuddy' else 'codex'
+            result = CLI_LOGINS.start(engine, chat, engine_binary(engine),
+                                      account_environment(os.environ, engine), cli_login_notification)
+            if not result.get('ok'):
+                if result.get('state') == 'already_running':
+                    raise MediaError('已有进行中的' + engine_spec(engine)['label'] + '登录，请完成或取消后重试。')
+                raise MediaError(result.get('message') or '无法启动官方登录流程，请检查执行器是否已安装。')
+            send_options(chat, '正在启动' + engine_spec(engine)['label'] + '官方登录，授权信息稍后发送。',
+                         [('取消登录', '取消登录 ' + engine)])
+        elif text.startswith('取消登录 '):
+            engine = text.partition(' ')[2]
+            if engine not in ('codebuddy', 'codex'):
+                raise MediaError('未知登录执行器。')
+            result = CLI_LOGINS.cancel(engine, chat)
+            send(chat, '已请求取消' + engine_spec(engine)['label'] + '登录。' if result.get('ok') else '当前没有进行中的该执行器登录。')
         elif text == '账号状态':
-            ok, detail = account_authorized()
-            send(chat, 'Claude 账号：' + ('已登录\n' + detail if ok else '未登录')
-                      + '\n当前使用渠道：' + AUTH_CHANNELS[auth_channel()])
+            engine = current_engine()
+            ok, detail = account_authorized(engine)
+            send(chat, engine_spec(engine)['label'] + ' 账号：' + ('已登录\n' + detail if ok else detail)
+                      + '\n当前使用渠道：' + channel_label(engine))
         elif text == '渠道切换':
-            send_options(chat, '当前渠道：' + AUTH_CHANNELS[auth_channel()]
-                              + '\n\n接口密钥：走已配置的网关与密钥，模型目录来自网关。\n'
-                              'Claude 账号：走登录得到的订阅额度，模型目录来自账号本身。',
-                         ['使用接口密钥', '使用Claude账号'])
-        elif text in ('使用接口密钥', '使用Claude账号'):
-            if text == '使用Claude账号':
-                ok, _ = account_authorized()
-                if not ok:
-                    raise MediaError('还没有登录 Claude 账号，请先发送“登录Claude”。')
-                set_auth_channel('account')
+            engine = current_engine()
+            label = engine_spec(engine)['label']
+            send_options(chat, label + ' 当前渠道：' + channel_label(engine)
+                              + '\n\n接口密钥：使用已配置的网关与密钥。\n'
+                              + label + ' 账号：使用官方登录态与默认模型。',
+                         [('使用接口密钥', '使用接口密钥 ' + engine),
+                          ('使用' + label + '账号', '使用账号 ' + engine)])
+        elif (text in ('使用接口密钥', '使用Claude账号', '使用CodeBuddy账号', '使用Codex账号')
+              or text.startswith(('使用接口密钥 ', '使用账号 '))):
+            if text.startswith(('使用接口密钥 ', '使用账号 ')):
+                engine = text.partition(' ')[2]
+            elif text == '使用接口密钥':
+                engine = current_engine()
             else:
-                set_auth_channel('gateway')
-            # 渠道变了，模型目录来源也变了，清掉缓存避免沿用另一渠道的模型名。
-            MODEL_CACHE.unlink(missing_ok=True)
-            send(chat, '已切换到：' + AUTH_CHANNELS[auth_channel()] + '\n下一条任务生效。')
+                engine = next(name for name, spec in ENGINES.items() if text == '使用' + spec['label'] + '账号')
+            if engine not in ENGINES:
+                raise MediaError('未知执行器。')
+            account = text.startswith('使用账号 ') or text.endswith('账号')
+            if account:
+                ok, _ = account_authorized(engine)
+                if not ok:
+                    raise MediaError('还没有确认' + engine_spec(engine)['label'] + '账号登录，请先发送“登录' + engine_spec(engine)['label'] + '”。')
+            set_auth_channel('account' if account else 'gateway', engine)
+            send(chat, engine_spec(engine)['label'] + ' 已切换到：' + channel_label(engine) + '\n仅影响该执行器的新任务。')
         elif text == '授权GitHub':
             send_rich(chat, start_github_device_flow(chat))
         elif text == '授权Cloudflare':
@@ -2905,7 +3003,7 @@ def handle_update(update):
             return
         elif fields[0] == 'choose' and len(fields) == 2:
             # 按缓存解析，主线程不调用网关。
-            models = read_model_cache()
+            models = catalog() if auth_channel() == 'account' else read_model_cache()
             model = next((item['id'] for item in models if hashlib.sha256(item['id'].encode()).hexdigest()[:24] == fields[1]), None)
             if model is None:
                 send(chat, '模型菜单已过期，请刷新模型列表。')

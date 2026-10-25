@@ -134,3 +134,394 @@ def whoami(token, timeout=15):
         raise DeviceFlowError('无法连接 GitHub 校验令牌。') from None
     return {'login': body.get('login') or '', 'name': body.get('name') or '',
             'id': body.get('id')}
+"""官方 CLI 的远程登录：Codex 设备码流程与 CodeBuddy 官方交互登录。
+
+两类流程都只在本进程内暂存终端输出：凭据不落盘、不写日志、不回传原始输出。
+Codex 走官方 `login --device-auth`，用户在官方网页输入设备码即可。
+CodeBuddy 官方只提供浏览器登录链接并在本地等待，没有授权码回填入口，
+因此这里实现的是「给出链接 + 等待官方界面确认」，不伪造回填输入框。
+"""
+import os
+import queue
+import re
+import signal
+import subprocess
+import threading
+import time
+from urllib.parse import urlsplit
+
+LOGIN_PROVIDERS = ('codex', 'codebuddy')
+LOGIN_ANSI = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]')
+LOGIN_URL = re.compile(r'https://[^\s<>"\']+')
+LOGIN_DEVICE_CODE = re.compile(r'(?<![A-Za-z0-9_-])([A-Z0-9]{4,6}-[A-Z0-9]{4,6})(?![A-Za-z0-9_-])')
+LOGIN_CODEX_HOSTS = ('auth.openai.com', 'chatgpt.com')
+LOGIN_CODEBUDDY_HOST = 'copilot.tencent.com'
+LOGIN_SECRET_QUERY = re.compile(r'(^|[?&])(state|code|token|access_token)=([^&\s]*)', re.IGNORECASE)
+LOGIN_GATEWAY_PREFIX = ('OPENAI_', 'ANTHROPIC_', 'CODEBUDDY_')
+LOGIN_TRUST_PROMPT = 'Do you trust the files in this folder?'
+LOGIN_METHOD_PROMPT = 'Select login method:'
+LOGIN_SUCCESS_HINTS = ('logged in', 'login success', 'successfully', 'success',
+                       '登录成功', '授权成功', '欢迎回来')
+
+
+def login_clean_env(env):
+    """保留 HOME、PATH 等运行环境，去掉会覆盖账号授权的网关变量。"""
+    return {key: value for key, value in env.items()
+            if not key.upper().startswith(LOGIN_GATEWAY_PREFIX)}
+
+
+def login_sanitize_url(url):
+    """只保留官方主机与路径，登录状态参数一律遮盖。"""
+    parsed = urlsplit(url)
+    if parsed.scheme != 'https' or not parsed.netloc:
+        return None
+    query = LOGIN_SECRET_QUERY.sub(
+        lambda found: found.group(1) + found.group(2) + '=[已隐藏]', parsed.query)
+    return parsed.scheme + '://' + parsed.netloc + parsed.path + (('?' + query) if query else '')
+
+
+def codex_login_prompt(text):
+    """从官方输出里取设备码链接与用户码。"""
+    clean = LOGIN_ANSI.sub('', text)
+    for match in LOGIN_URL.finditer(clean):
+        url = match.group(0).rstrip('.,);')
+        parsed = urlsplit(url)
+        if parsed.netloc in LOGIN_CODEX_HOSTS and parsed.path == '/codex/device':
+            code = LOGIN_DEVICE_CODE.search(clean)
+            if not code:
+                return None
+            return {'url': login_sanitize_url(url), 'code': code.group(1)}
+    return None
+
+
+def codebuddy_login_prompt(text):
+    """从官方界面取浏览器登录链接。"""
+    clean = LOGIN_ANSI.sub('', text)
+    for match in LOGIN_URL.finditer(clean):
+        url = match.group(0).rstrip('.,);')
+        parsed = urlsplit(url)
+        if parsed.netloc == LOGIN_CODEBUDDY_HOST and parsed.path == '/login':
+            return {'url': login_sanitize_url(url)}
+    return None
+
+
+class _LoginSession:
+    """一次登录会话。会话按执行器划分，因为同一执行器共用一个账号目录。"""
+
+    def __init__(self, provider, chat, notify):
+        self.provider = provider
+        self.chat = chat
+        self.notify = notify
+        self.lock = threading.RLock()
+        self.stopped = threading.Event()
+        self.process = None
+        self.master = None
+        self.state = 'starting'
+        self.buffer = ''
+        self.thread = None
+
+
+class LoginManager:
+    """start 立即返回，登录进度通过 notify 回调送达。
+
+    同一执行器同时只允许一个登录会话：两个聊天共用同一个账号目录，
+    并发登录会互相覆盖登录结果。取消只允许发起者操作。
+    """
+
+    def __init__(self, timeout=600, status_timeout=90, buffer_limit=16384):
+        self.timeout = timeout
+        self.status_timeout = status_timeout
+        self.buffer_limit = buffer_limit
+        self._sessions = {}
+        self._lock = threading.RLock()
+
+    def start(self, provider, chat, binary, env, notify):
+        if provider not in LOGIN_PROVIDERS:
+            return {'ok': False, 'state': 'unsupported'}
+        if provider == 'codebuddy' and os.name != 'posix':
+            return {'ok': False, 'state': 'unsupported',
+                    'message': 'CodeBuddy 登录依赖伪终端，仅支持 Linux 服务器。'}
+        with self._lock:
+            if provider in self._sessions:
+                return {'ok': False, 'state': 'already_running'}
+            session = _LoginSession(provider, chat, notify)
+            self._sessions[provider] = session
+            session.thread = threading.Thread(
+                target=self._run, args=(session, binary, login_clean_env(dict(env))),
+                daemon=True, name='cli-login-' + provider)
+            session.thread.start()
+        return {'ok': True, 'state': 'starting'}
+
+    def cancel(self, provider, chat):
+        with self._lock:
+            session = self._sessions.get(provider)
+        if session is None:
+            return {'ok': False, 'state': 'not_running'}
+        if chat is not None and session.chat != chat:
+            return {'ok': False, 'state': 'other_chat'}
+        session.stopped.set()
+        self._terminate(session)
+        return {'ok': True, 'state': 'cancelled'}
+
+    def submit(self, provider, chat, code):
+        """官方没有授权码回填入口，明确拒绝而不是假装支持。"""
+        return {'ok': False, 'state': 'unsupported',
+                'message': '官方登录流程不提供授权码回填，请在浏览器完成授权。'}
+
+    def status(self, provider, binary, env):
+        """查询官方登录状态。只执行官方命令，不读凭据文件。"""
+        if provider == 'codex':
+            return self._codex_status(binary, env)
+        if provider == 'codebuddy':
+            return self._codebuddy_status(binary, env)
+        return {'ok': False, 'state': 'unsupported', 'authenticated': False}
+
+    def _codex_status(self, binary, env):
+        try:
+            result = subprocess.run([binary, 'login', 'status'], capture_output=True,
+                                    text=True, timeout=self.status_timeout,
+                                    env=login_clean_env(dict(env)))
+        except (OSError, subprocess.SubprocessError):
+            return {'ok': False, 'state': 'failed', 'authenticated': False}
+        output = ((result.stdout or '') + (result.stderr or '')).lower()
+        # 退出码为 0 也可能是接口令牌登录，必须看到官方账号提示才算账号登录。
+        account = result.returncode == 0 and 'chatgpt' in output
+        return {'ok': True, 'state': 'authenticated' if account else 'unauthenticated',
+                'authenticated': account}
+
+    def _codebuddy_authenticated(self, binary, env):
+        """官方命令的真实行为：未登录时会明确要求先登录。"""
+        result = self.status('codebuddy', binary, env)
+        return bool(result.get('authenticated'))
+
+    def _codebuddy_status(self, binary, env):
+        """用官方命令的真实行为判断：未登录时会明确要求先登录。"""
+        try:
+            result = subprocess.run(
+                [binary, '-p', '只回复两个字：正常', '--dangerously-skip-permissions'],
+                capture_output=True, text=True, timeout=self.status_timeout,
+                env=login_clean_env(dict(env)))
+        except (OSError, subprocess.SubprocessError):
+            return {'ok': False, 'state': 'failed', 'authenticated': False}
+        output = ((result.stdout or '') + (result.stderr or '')).lower()
+        if 'authentication required' in output or 'use /login' in output:
+            return {'ok': True, 'state': 'unauthenticated', 'authenticated': False}
+        return {'ok': True, 'state': 'authenticated', 'authenticated': True}
+
+    def _emit(self, session, state, **fields):
+        session.state = state
+        event = {'provider': session.provider, 'chat': session.chat, 'state': state, **fields}
+        try:
+            session.notify(event)
+        except Exception:
+            # 通知失败不能影响子进程清理，也不记录可能含凭据的异常。
+            pass
+
+    def _spawn(self, session, command, env):
+        options = {'stdin': subprocess.PIPE, 'stdout': subprocess.PIPE,
+                   'stderr': subprocess.STDOUT, 'env': env, 'bufsize': 0}
+        if os.name == 'nt':
+            options['creationflags'] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            options['start_new_session'] = True
+        if session.provider == 'codebuddy':
+            import fcntl
+            import pty
+            import struct
+            import termios
+            master, slave = pty.openpty()
+            session.master = master
+            options['stdin'] = slave
+            options['stdout'] = slave
+            options['stderr'] = slave
+            fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 50, 220, 0, 0))
+            process = subprocess.Popen(command, **options)
+            os.close(slave)
+            return process
+        return subprocess.Popen(command, **options)
+
+    def _read(self, session, output):
+        source = session.master if session.master is not None else session.process.stdout
+        try:
+            while not session.stopped.is_set():
+                if session.master is not None:
+                    import select
+                    readable, _, _ = select.select([source], [], [], 0.1)
+                    if not readable:
+                        continue
+                    chunk = os.read(source, 4096)
+                else:
+                    chunk = source.read(1024)
+                if not chunk:
+                    break
+                if isinstance(chunk, bytes):
+                    chunk = chunk.decode('utf-8', errors='replace')
+                try:
+                    output.put_nowait(chunk)
+                except queue.Full:
+                    try:
+                        output.get_nowait()
+                    except queue.Empty:
+                        pass
+                    try:
+                        output.put_nowait(chunk)
+                    except queue.Full:
+                        pass
+        except (OSError, ValueError):
+            pass
+        finally:
+            try:
+                output.put_nowait(None)
+            except queue.Full:
+                pass
+
+    def _run(self, session, binary, env):
+        reader = None
+        final_state = 'failed'
+        try:
+            with session.lock:
+                if session.stopped.is_set():
+                    final_state = 'cancelled'
+                    return
+                if session.provider == 'codebuddy':
+                    # 官方交互界面只在伪终端下正常显示。
+                    env = dict(env)
+                    env['TERM'] = 'xterm-256color'
+                    env['COLUMNS'] = '220'
+                    session.process = self._spawn(session, [binary, '/login'], env)
+                else:
+                    session.process = self._spawn(
+                        session, [binary, 'login', '--device-auth'], env)
+            output = queue.Queue(maxsize=32)
+            reader = threading.Thread(target=self._read, args=(session, output), daemon=True)
+            reader.start()
+            deadline = time.monotonic() + self.timeout
+            ready = False
+            eof = False
+            step = 0
+            next_probe = time.monotonic() + 20
+            while True:
+                if session.stopped.is_set():
+                    final_state = 'cancelled'
+                    break
+                if time.monotonic() >= deadline:
+                    final_state = 'timeout'
+                    break
+                try:
+                    chunk = output.get(timeout=0.1)
+                    if chunk is None:
+                        eof = True
+                    else:
+                        # 官方界面会持续刷新，只保留尾部内容即可；
+                        # 这里不能因为输出变长就中断登录流程。
+                        session.buffer = (session.buffer + chunk)[-self.buffer_limit:]
+                        text = LOGIN_ANSI.sub('', session.buffer)
+                        if session.provider == 'codebuddy':
+                            step = self._advance_codebuddy(session, text, step)
+                            prompt = codebuddy_login_prompt(session.buffer)
+                            if prompt and not ready:
+                                ready = True
+                                self._emit(session, 'ready', **prompt)
+                            elif ready and any(hint in text.lower() for hint in LOGIN_SUCCESS_HINTS):
+                                final_state = 'succeeded'
+                                session.stopped.set()
+                            elif ready and time.monotonic() >= next_probe:
+                                # 官方界面不一定退出，用官方命令的真实行为核实登录是否生效。
+                                next_probe = time.monotonic() + 20
+                                if self._codebuddy_authenticated(binary, env):
+                                    final_state = 'succeeded'
+                                    session.stopped.set()
+                        else:
+                            prompt = codex_login_prompt(session.buffer)
+                            if prompt and not ready:
+                                ready = True
+                                self._emit(session, 'ready', **prompt)
+                except queue.Empty:
+                    pass
+                returncode = session.process.poll()
+                if returncode is not None and (eof or not reader.is_alive()) and output.empty():
+                    final_state = 'succeeded' if returncode == 0 else 'failed'
+                    break
+        except Exception:
+            final_state = 'cancelled' if session.stopped.is_set() else 'failed'
+        finally:
+            session.stopped.set()
+            try:
+                self._terminate(session)
+            except (OSError, subprocess.TimeoutExpired):
+                final_state = 'failed'
+            finally:
+                if reader:
+                    reader.join(timeout=1)
+                session.buffer = ''
+                self._emit(session, final_state)
+                with self._lock:
+                    if self._sessions.get(session.provider) is session:
+                        del self._sessions[session.provider]
+
+    def _advance_codebuddy(self, session, text, step):
+        """官方界面每一步只按一次回车，避免重复触发。
+
+        同一次输出里可能同时出现「信任目录」和「选择登录方式」，
+        因此要循环推进到没有新进展为止，否则会停在第一个提示上。
+        """
+        for _ in range(4):
+            if step == 0:
+                if LOGIN_TRUST_PROMPT in text:
+                    self._write(session, b'\r')
+                    step = 1
+                    continue
+                if LOGIN_METHOD_PROMPT in text:
+                    self._write(session, b'\r')
+                    step = 2
+                    continue
+            elif step == 1 and LOGIN_METHOD_PROMPT in text:
+                self._write(session, b'\r')
+                step = 2
+                continue
+            break
+        return step
+
+    def _write(self, session, data):
+        if session.master is None:
+            return
+        try:
+            os.write(session.master, data)
+        except OSError:
+            pass
+
+    def _terminate(self, session):
+        with session.lock:
+            process = session.process
+            if process is None:
+                return
+            if process.poll() is None:
+                if session.provider == 'codebuddy' and session.master is not None:
+                    # 官方界面支持 ESC 取消，优先用它收尾。
+                    self._write(session, b'\x1b')
+                try:
+                    process.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    try:
+                        if os.name == 'nt':
+                            process.kill()
+                        else:
+                            os.killpg(process.pid, getattr(signal, 'SIGKILL', signal.SIGTERM))
+                    except (OSError, ProcessLookupError):
+                        process.kill()
+                    process.wait(timeout=2)
+            else:
+                process.wait(timeout=1)
+            if session.master is None:
+                for stream in (process.stdin, process.stdout):
+                    if stream:
+                        try:
+                            stream.close()
+                        except OSError:
+                            pass
+            if session.master is not None:
+                try:
+                    os.close(session.master)
+                except OSError:
+                    pass
+                session.master = None
