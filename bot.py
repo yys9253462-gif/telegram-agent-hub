@@ -1,4 +1,6 @@
 import json
+import importlib.util
+import shlex
 import copy
 import hashlib
 import base64
@@ -67,6 +69,7 @@ MENU_GROUPS = {
     '设置': {
         '任务与模型': ['模型', '选择智能体'],
         '会话与文件': ['新建会话', '会话列表'],
+        '版本更新': ['检查版本', '更新机器人'],
     },
     '更多': {
         '平台授权': ['授权GitHub', '授权Cloudflare', '授权状态', '撤销授权'],
@@ -1007,9 +1010,213 @@ def expand_group(chat, text):
     return False
 
 
+UPDATE_LOCK = threading.Lock()
+UPDATE_NOTICE_LOCK = threading.Lock()
+UPDATE_PENDING = {}
+
+
+def update_module():
+    # 按安装目录加载，避免导入机器人时强依赖更新模块。
+    spec = importlib.util.spec_from_file_location('hub_updater', APP_DIR / 'updater.py')
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def version_text(info):
+    def short(value):
+        return str(value)[:12] if value else '未知'
+    return ('当前版本：' + short(info.get('current'))
+            + '\n最新版本：' + short(info.get('latest'))
+            + '\n' + ('有可用更新' if info.get('update_available') else '暂无可用更新')
+            + ('\n检测到本地修改，更新将被拒绝。' if info.get('local_modified') else ''))
+
+
+def check_bot_version(chat, prepare=False):
+    if chat != OWNER:
+        return
+    if not UPDATE_LOCK.acquire(blocking=False):
+        send(chat, '正在检查版本或启动更新，请稍后再试。')
+        return
+    def worker():
+        try:
+            if CONTROL is not None and CONTROL.updating:
+                reconcile_update_result(CONTROL, CONTROL.update_baseline)
+            info = update_module().check(APP_DIR)
+            if prepare:
+                UPDATE_PENDING.pop(chat, None)
+            if prepare and info.get('update_available') and not info.get('local_modified'):
+                UPDATE_PENDING[chat] = time.monotonic() + 300
+                send_options(chat, version_text(info) + '\n确认后会短暂重启，五分钟内有效。',
+                             ['确认更新机器人', '检查版本'])
+            else:
+                send(chat, version_text(info))
+        except Exception:
+            if prepare:
+                UPDATE_PENDING.pop(chat, None)
+            send(chat, '检查版本失败，请稍后重试，或请管理员检查安装信息与网络。')
+        finally:
+            UPDATE_LOCK.release()
+    try:
+        threading.Thread(target=worker, daemon=True, name='version-check').start()
+    except Exception:
+        UPDATE_LOCK.release()
+        raise
+
+
+def confirm_bot_update(chat):
+    if chat != OWNER:
+        return
+    if not UPDATE_LOCK.acquire(blocking=False):
+        send(chat, '正在检查版本或启动更新，请稍后再试。')
+        return
+    controller = CONTROL
+    reserved = False
+    command = None
+    try:
+        if UPDATE_PENDING.get(chat, 0) < time.monotonic():
+            UPDATE_PENDING.pop(chat, None)
+            send(chat, '更新确认已过期，请先点击“更新机器人”重新检查。')
+            return
+        if controller is None:
+            send(chat, '任务控制器尚未就绪，请稍后重试。')
+            return
+        with controller.lock:
+            if controller.updating:
+                send(chat, '机器人正在更新，请等待重启。')
+                return
+            if controller.running or any(task['status'] in ('queued', 'running')
+                                         for task in controller.data['tasks']):
+                send(chat, '有运行中或排队任务，请等待完成或取消任务后再更新。')
+                return
+            controller.updating = True
+            reserved = True
+        install = update_module().load_install(APP_DIR)
+        command = ['sudo', '-n', 'systemd-run', '--unit=' + install['service'].removesuffix('.service') + '-updater',
+                   '--collect', '--property=Type=exec', install['python'],
+                   str(APP_DIR / 'updater.py'), '--apply', '--app-dir', str(APP_DIR)]
+        send(chat, '正在启动机器人更新，服务会短暂重启，恢复后会通知更新结果。')
+        baseline = update_result_stamp()
+        with controller.lock:
+            controller.update_baseline = baseline
+        result = subprocess.run(command, timeout=15, capture_output=True)
+        if result.returncode:
+            raise RuntimeError('启动更新服务失败')
+        UPDATE_PENDING.pop(chat, None)
+        watch_update_result(baseline, controller)
+        reserved = False
+    except Exception:
+        text = '无法启动更新，请管理员检查安装元数据及 sudo/systemd 权限后重试。'
+        if command:
+            text += '\n管理员可执行：\n' + shlex.join([arg for arg in command if arg != '-n'])
+        send(chat, text)
+    finally:
+        if reserved:
+            with controller.lock:
+                controller.updating = False
+        UPDATE_LOCK.release()
+
+
+def update_result_stamp():
+    try:
+        return str((APP_DIR / 'update-result.json').stat().st_mtime_ns)
+    except OSError:
+        return None
+
+
+def reconcile_update_result(controller, baseline):
+    stamp = update_result_stamp()
+    if stamp is None or stamp == baseline:
+        return False
+    try:
+        result = json.loads((APP_DIR / 'update-result.json').read_text(encoding='utf-8'))
+        if not isinstance(result, dict) or not isinstance(result.get('success'), bool):
+            return False
+    except (OSError, ValueError):
+        return False
+    if controller is not None:
+        with controller.lock:
+            controller.updating = False
+    return notify_update_result()
+
+
+def startup_update_watch():
+    baseline = update_result_stamp()
+    active = False
+    try:
+        install = update_module().load_install(APP_DIR)
+        unit = install['service'].removesuffix('.service') + '-updater.service'
+        result = subprocess.run(['systemctl', 'is-active', '--quiet', unit],
+                                timeout=5, capture_output=True)
+        active = result.returncode == 0
+    except Exception:
+        pass
+    if active:
+        with CONTROL.lock:
+            CONTROL.updating = True
+            CONTROL.update_baseline = baseline
+        watch_update_result(baseline, CONTROL)
+    else:
+        watch_update_result()
+
+
+def watch_update_result(baseline=None, controller=None):
+    if controller is None:
+        baseline = update_result_stamp()
+    def worker():
+        if controller is None:
+            notify_update_result()
+        for _ in range(300 if controller is not None else 30):
+            if reconcile_update_result(controller, baseline):
+                return
+            threading.Event().wait(1)
+        if controller is not None and controller.updating:
+            try:
+                send(OWNER, '更新结果等待超时，暂时保持暂停接收任务。稍后点击“检查版本”可重新读取更新结果并恢复接收；若仍无结果，请管理员检查更新服务。')
+            except Exception:
+                pass
+    threading.Thread(target=worker, daemon=True, name='update-result').start()
+
+
+def notify_update_result():
+    with UPDATE_NOTICE_LOCK:
+        return _notify_update_result()
+
+
+def _notify_update_result():
+    result_path = APP_DIR / 'update-result.json'
+    marker = WORK / 'update-notice.json'
+    try:
+        details = result_path.stat()
+        stamp = str(details.st_mtime_ns)
+        if marker.exists() and json.loads(marker.read_text(encoding='utf-8')).get('stamp') == stamp:
+            return True
+        result = json.loads(result_path.read_text(encoding='utf-8'))
+        text = '机器人更新' + ('成功。' if result.get('success') else '失败，请管理员检查更新结果与服务状态。')
+        current = result.get('current') or result.get('commit')
+        if current:
+            text += '\n当前版本：' + str(current)[:12]
+        if result.get('message'):
+            text += '\n详情：' + str(result['message'])[:1200]
+        if result.get('backup'):
+            text += '\n备份位置：' + str(result['backup'])[:500]
+        send(OWNER, redact(text))
+        atomic_json(marker, {'stamp': stamp})
+        return True
+    except (OSError, ValueError, TypeError):
+        pass
+    except Exception:
+        print('更新结果通知失败，将在下次启动时重试', flush=True)
+
+
 def quick_action(chat, text):
     text = ALIASES.get(text, text)
-    if text in ('任务助手', '/tasks'):
+    if text in ('检查版本', '更新机器人'):
+        check_bot_version(chat, prepare=text == '更新机器人')
+    elif text == '确认更新机器人':
+        confirm_bot_update(chat)
+    elif text in ('任务助手', '/tasks'):
         send_options(chat, '任务助手\n选择一种任务，机器人会提示需要提供的信息；下一条消息直接描述目标即可。', ['开发与改代码', '排查与修复', '部署与运维', '资料与总结'])
     elif text in ('开发与改代码', '排查与修复', '部署与运维', '资料与总结'):
         guides = {
@@ -1904,6 +2111,8 @@ class TaskController:
         except ValueError:
             self.max_concurrent = 3
         self.closing = False
+        self.updating = False
+        self.update_baseline = None
         self.seen = set()
         self.ui = {}
         # 先给两个派生属性兜底值：下面持久状态的解析一旦抛错，__init__ 就会中途退出，
@@ -2115,6 +2324,8 @@ class TaskController:
 
     def enqueue(self, chat, text='', kind='agent', payload=None, update_id=None, snapshot=None):
         with self.condition:
+            if self.updating:
+                raise MediaError('机器人正在更新，暂不接收新任务，请在重启后重试。')
             if update_id is not None and update_id in self.seen:
                 return None
             if sum(task['status'] == 'queued' for task in self.data['tasks']) >= 100:
@@ -2309,7 +2520,9 @@ class TaskController:
         # 里面写着 '当前模型': '当前模型' 这种自我映射（死项），并且把 /tasks 映射成
         # 「新任务」，与 MENU_GROUPS 中「新任务」只是说明文案的语义冲突。
         text = ALIASES.get(text, text)
-        if text == '图片创作':
+        if text in ('检查版本', '更新机器人', '确认更新机器人'):
+            quick_action(chat, text)
+        elif text == '图片创作':
             send(chat, '发送“生图 描述”生成一张图片，例如：生图 一只趴在窗边的橘猫，水彩插画。图片任务使用独立生图通道，与聊天执行器无关。当前：' + json.dumps(image_options(), ensure_ascii=False))
         elif text == '生图设置':
             send_options(chat, '选择生图模型或画幅。目录可见不代表全部模型已验证。', ['生图模型 ' + value for value in IMAGE_MODELS] + ['画幅 方形', '画幅 横图', '画幅 竖图'])
@@ -2674,6 +2887,7 @@ def main():
     last_state_flush = offset
     last_state_time = time.monotonic()
     CONTROL = TaskController(WORK)
+    startup_update_watch()
     CONTROL.start_workers()
     def shutdown(signum, frame):
         raise KeyboardInterrupt()

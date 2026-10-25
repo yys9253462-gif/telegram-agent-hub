@@ -581,6 +581,7 @@ def install(args, c):
     backup.mkdir(mode=0o700)
     tracked = [unit, CONFIG / 'bot.env', CONFIG / 'config.json', CONFIG / 'image.json', home / '.codebuddy/models.json', home / '.claude/settings.json', home / '.codex/config.toml', home / '.ssh/config', home / '.ssh/known_hosts', home / '.ssh/telegram-agent-ed25519', Path('/etc/sudoers.d') / args.service_name]
     tracked += [APP / p.name for p in source.glob('*.py')]
+    tracked += [APP / 'installed-version.json', APP / 'update-install.json']
     saved = []
     for index, path in enumerate(tracked):
         if path.is_symlink():
@@ -651,6 +652,15 @@ def install(args, c):
         stored = {k: v for k, v in c.items() if k != 'ssh_import_path' and not k.startswith('_')}
         atomic_write(CONFIG / 'config.json', json_text(stored), 0o600)
         atomic_write(unit, service_text(user, home), 0o644)
+        # 记录真实安装路径与归档版本，后续源码升级只读该信息，不重写生产配置。
+        import updater
+        source_commit = os.environ.get('AGENT_SOURCE_COMMIT', '').lower()
+        if source_commit and not re.fullmatch(r'[0-9a-f]{40}', source_commit):
+            raise InstallError('安装来源提交号无效')
+        atomic_write(APP / 'update-install.json', json_text({
+            'service': args.service_name + '.service', 'app_dir': str(APP),
+            'work_dir': str(home / 'tasks'), 'python': str(APP / '.venv/bin/python')}), 0o644)
+        updater.create_manifest(APP, source_commit, args.service_name + '.service')
         run(['systemd-analyze', 'verify', str(unit)], quiet=True)
         run(['systemctl', 'daemon-reload'], quiet=True)
         run(['systemctl', 'enable', args.service_name], quiet=True)

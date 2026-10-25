@@ -147,7 +147,7 @@ def main(argv=None):
         command = [sys.executable, str(installer)] + installer_args
         if hasattr(os, 'geteuid') and os.geteuid() != 0:
             command = ['sudo'] + command
-        return subprocess.run(command).returncode
+        return subprocess.run(command, env={**os.environ, 'AGENT_SOURCE_COMMIT': args.ref.lower()}).returncode
 
 
 if __name__ == '__main__':
