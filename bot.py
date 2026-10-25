@@ -12,6 +12,7 @@ import signal
 import stat
 import re
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -37,6 +38,42 @@ CONFIG_DIR = Path(os.environ.get('CONFIG_DIR', '/etc/telegram-agent-hub'))
 LOCAL_LABEL = os.environ.get('LOCAL_LABEL', '本机')
 REMOTE_LABEL = os.environ.get('REMOTE_LABEL', '远程服务器')
 REMOTE_ALIAS = os.environ.get('REMOTE_ALIAS', '')
+# 本机自己的各种叫法。ssh config 里经常有一条 Host 指向这台机器，
+# 它不该被当成「远程目标」——机器人 ssh 自己毫无意义，还会让目标判断失真。
+LOCAL_ALIASES = {name for name in (os.environ.get('REMOTE_LOCAL_ALIAS', ''),
+                                   socket.gethostname(), socket.gethostname().split('.')[0])
+                 if name}
+
+
+def local_addresses():
+    """本机自己的主机名与全部 IP，用来在 ssh config 里认出「指向自己」的条目。
+
+    服务器上 gethostname() 常常就是 localhost，只靠它认不出
+    「Host tencent → 43.155.161.217」这种本机条目，所以要把 IP 也拉进来。
+    纯本地运算，不发网络请求。
+    """
+    names = set(LOCAL_ALIASES)
+    try:
+        names.add(socket.getfqdn())
+    except OSError:
+        pass
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None):
+            names.add(info[4][0])
+        # 拿到本机所有网卡地址；getaddrinfo 在容器里常常只给回环。
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            # 不真正发包，只为让内核选出出口网卡的地址。
+            probe.connect(('8.8.8.8', 53))
+            names.add(probe.getsockname()[0])
+        finally:
+            probe.close()
+    except OSError:
+        pass
+    for extra in (os.environ.get('REMOTE_LOCAL_ADDRESS', '') or '').split(','):
+        if extra.strip():
+            names.add(extra.strip())
+    return {name for name in names if name}
 WORK = Path(os.environ.get('CLAUDE_BOT_WORKDIR', str(AGENT_HOME / 'tasks')))
 STATE = WORK / 'telegram-offset'
 offset = 0
@@ -1375,6 +1412,49 @@ def strategy_name():
     except (OSError, ValueError, KeyError):
         return '均衡执行'
 
+def ssh_targets():
+    """列出 ~/.ssh/config 里真实可用的 SSH 主机别名。
+
+    为什么不只看环境变量：安装器升级服务时若没重跑远程配置，
+    REMOTE_ALIAS 就会是空的，但密钥、known_hosts、config 全都还在、
+    SSH 也免密能通。这时若还按「未配置远程目标」处理，机器人会自己
+    给自己下禁令——明明有权限却不敢连，只交一份历史报告出来
+    （2026-10-26 真实发生，机主问「为什么还要我去授权」）。
+
+    判定顺序：环境变量优先（安装器显式配置的意图最明确），
+    其次才是 config 里实际存在的 Host。两边都没有才算真没有。
+    """
+    if REMOTE_ALIAS:
+        return [(REMOTE_ALIAS, REMOTE_LABEL)]
+    mine = local_addresses()
+    found = []
+    try:
+        text = (AGENT_HOME / '.ssh' / 'config').read_text()
+    except (OSError, UnicodeDecodeError):
+        return []
+    current = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith('#'):
+            continue
+        key, _, value = line.partition(' ')
+        key = key.lower()
+        if key == 'host':
+            # 只认精确的 "Host <名字>"，跳过 Host * 这类通配段。
+            for alias in value.split():
+                if not alias or any(ch in alias for ch in '*?!') or alias in mine:
+                    continue
+                found.append([alias, '远程服务器 ' + alias])
+            current = found[-1] if found else None
+        elif key == 'hostname' and current is not None:
+            # Host 块里的 HostName 指向本机自己时也要剔除：配置里常有一条
+            # 「Host tencent → 本机公网地址」，它不是远程目标。
+            if value.strip() in mine:
+                found.pop()
+                current = None
+    return [tuple(item) for item in found]
+
+
 def agent_instructions():
     task = getattr(TASK_LOCAL, 'task', None)
     target = task['snapshot']['target'] if task else (CONTROL.target if CONTROL else '本机')
@@ -1396,9 +1476,20 @@ def agent_instructions():
                  if granted else
                  '当前没有已授权的外部平台，需要操作 GitHub 或 Cloudflare 时明确告知机主先授权，'
                  '不得声称已经登录，也不得尝试读取凭据文件。')
+    targets = ssh_targets()
+    if targets:
+        alias, label = targets[0]
+        remote_hint = ('远程服务器用 ssh ' + alias + '，名称为' + label + '。'
+                       + ('其它可用主机：' + '、'.join(item[0] for item in targets[1:]) + '。'
+                          if len(targets) > 1 else '')
+                       + '机主让你查服务器时直接连上去查，不要因为目标是「远程」就停下来征求同意。')
+    else:
+        remote_hint = ('本机没有可用的 SSH 主机配置。需要访问远程服务器时如实说明缺少 SSH 配置，'
+                       '不得声称已经连上。')
     return ('本任务目标机器：' + target + '。执行器始终运行在安装主机' + LOCAL_LABEL + '。'
-            + ('远程目标使用ssh ' + REMOTE_ALIAS + '，名称为' + REMOTE_LABEL + '。' if REMOTE_ALIAS else '当前未配置远程SSH目标，不得声称可以访问远程服务器。')
-            + '你是机主的执行助手，全程简体中文。管理员权限以实际sudo授权为准。'
+            + remote_hint
+            + '你是机主的执行助手，全程简体中文。管理员权限以实际sudo授权为准，'
+              '已授权的能力直接用，不要反复索取许可或要求机主再确认一次权限。'
             '操作前确认目标机器，未指明且会影响生产时先问关键问题；普通可逆任务自主完成，不反复索要确认。'
             '遇到引用旧上下文的任务，先核实当前文件和服务状态。声称完成必须有真实工具输出，不确定和未验证内容明确标注。'
             '排查只读优先，禁止顺手修复目标外问题。写配置前备份，保留回退办法。发现失败先读取错误再处理，不重复盲试。'
@@ -1707,7 +1798,9 @@ def quick_action(chat, text):
     elif text == '工作目录':
         send(chat, '默认工作目录：' + str(WORK) + '\n可以在任务中指定其他服务器路径。')
     elif text == '权限状态':
-        send(chat, '仅接受机主私聊。工具权限遵循当前执行器规则；管理员权限以安装时sudo授权为准。远程连接：' + (REMOTE_ALIAS if REMOTE_ALIAS else '未配置') + '。')
+        targets = ssh_targets()
+        send(chat, '仅接受机主私聊。工具权限遵循当前执行器规则；管理员权限以实际sudo授权为准。\n'
+                   '远程连接：' + ('、'.join(item[0] for item in targets) if targets else '未配置') + '。')
     elif text == '任务说明':
         send(chat, '直接发送开发、文件处理、软件安装、部署或运维任务。当前会话自动续接；新建会话清空当前上下文指针；切换模型下个任务生效。全部工具开放，可sudo提权，无逐项审批。单任务最多三十分钟、八十轮。只接受机主私聊。')
     elif text in ('切换模型', '/models'):
@@ -3118,10 +3211,21 @@ class TaskController:
                     self.condition.notify()
                     send(chat, '已确认执行并加入队列：' + task['id'])
         elif text == '目标':
-            send_options(chat, '当前新任务目标：' + self.target + '\n目标通过系统指令注入；CLI仍运行在本机。', ['目标本机', '目标远程服务器'])
+            targets = ssh_targets()
+            hint = ('\n可用远程主机：' + '、'.join(item[0] for item in targets) if targets
+                    else '\n本机没有可用的 SSH 主机配置。')
+            send_options(chat, '当前新任务目标：' + self.target + '\n目标通过系统指令注入；CLI仍运行在本机。'
+                               + hint, ['目标本机', '目标远程服务器'])
         elif text in ('目标本机', '目标远程服务器'):
-            if text == '目标远程服务器' and not REMOTE_ALIAS:
-                raise MediaError('尚未配置远程服务器，请重新运行安装器补充SSH配置。')
+            if text == '目标远程服务器':
+                # 判据用 ssh_targets()：密钥与 config 都在的情况下不能因为
+                # 环境变量没设就拦住机主。
+                targets = ssh_targets()
+                if not targets:
+                    raise MediaError('本机没有可用的 SSH 主机配置（~/.ssh/config 里没有 Host）。'
+                                     '请先补好免密 SSH，再用「目标远程服务器」。')
+                send(chat, '远程目标可用：' + '、'.join(item[0] for item in targets) + '。'
+                           '新任务会按这个目标注入指令，可以直接让我连上去操作。')
             with self.lock:
                 self.target = text[2:]
                 self.persist()
