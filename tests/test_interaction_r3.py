@@ -6,6 +6,7 @@
 2. 切执行器与切渠道是两件事，不能互相偷偷带动。
 3. 不管当前处于什么组合，回复底部那行「执行器 · 模型」都不能自相矛盾。
 """
+import _root  # noqa: F401  仓库根目录进 sys.path
 import json
 import tempfile
 import unittest

@@ -7,6 +7,7 @@
 3. 未授权时同名环境变量必须被剔除，不能让任务捡到全局令牌。
 4. 续期只静默成功、只在真失效时提醒。
 """
+import _root  # noqa: F401  仓库根目录进 sys.path
 import tempfile
 import time
 import unittest

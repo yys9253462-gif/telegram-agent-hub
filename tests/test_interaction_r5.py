@@ -5,6 +5,7 @@
 超长消息、畸形回调、状态文件被改坏、时钟异常、并发重入、附件异常。
 判据统一是：**要么正常处理，要么给出一句人话，绝不能崩掉整个轮询循环。**
 """
+import _root  # noqa: F401  仓库根目录进 sys.path
 import json
 import tempfile
 import threading

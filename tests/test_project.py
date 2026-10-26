@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """不接触真实账号的项目回归测试。"""
+import _root  # noqa: F401  仓库根目录进 sys.path
 import importlib.util
 import os
 from pathlib import Path
@@ -8,10 +9,10 @@ import threading
 import time
 import unittest
 
-ROOT = Path(__file__).resolve().parent
+ROOT = _root.ROOT
 
 def load(name):
-    spec = importlib.util.spec_from_file_location(name, ROOT / (name + '.py'))
+    spec = importlib.util.spec_from_file_location(name, (ROOT / 'scripts' / (name + '.py') if name == 'security_check' else ROOT / (name + '.py')))
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

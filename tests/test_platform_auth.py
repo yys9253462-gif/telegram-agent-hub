@@ -3,6 +3,7 @@
 每个用例都对应一处真实风险，注释里写明「不这么做会怎样」：
 凭据泄漏、误吞正常任务、轮询过快被封、撤销后又被写回、未授权时捡到全局令牌。
 """
+import _root  # noqa: F401  仓库根目录进 sys.path
 import json
 import os
 import shutil
@@ -13,7 +14,6 @@ import unittest
 from unittest.mock import patch
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import credentials
 import cloudflare_auth

@@ -5,6 +5,7 @@
 用量是机主决定「还能不能继续跑」的依据，一个伪造的 100% 比一句
 「读不到」危险得多，所以每个降级路径都必须有独立断言。
 """
+import _root  # noqa: F401  仓库根目录进 sys.path
 import io
 import json
 import os

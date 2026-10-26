@@ -4,12 +4,13 @@
 在 handle_text / quick_action 里都真有分支接住它。
 前科：菜单项改版后按钮还在、处理分支被删，点下去毫无反应且不报错。
 """
+import _root  # noqa: F401  仓库根目录进 sys.path
 import ast
 import os
 import unittest
 from pathlib import Path
 
-SOURCE = Path(__file__).with_name('bot.py').read_text(encoding='utf-8')
+SOURCE = (_root.ROOT / 'bot.py').read_text(encoding='utf-8')
 TREE = ast.parse(SOURCE)
 
 

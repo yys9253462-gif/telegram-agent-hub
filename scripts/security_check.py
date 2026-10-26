@@ -4,7 +4,7 @@ from pathlib import Path
 import re
 import sys
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent
 RULES = {
     '真实模型密钥': r'\bsk-[A-Za-z0-9_-]{24,}',
     '代码托管令牌': r'\bgh[pousr]_[A-Za-z0-9]{20,}',

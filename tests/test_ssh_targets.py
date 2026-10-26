@@ -10,6 +10,7 @@
 教训：判断「我有没有这个能力」要看**实际配置**，不能只看某个环境变量。
 变量是安装器写的意图，配置是机器上真实存在的能力，两者缺一都不能当成没有。
 """
+import _root  # noqa: F401  仓库根目录进 sys.path
 import os
 import tempfile
 import unittest

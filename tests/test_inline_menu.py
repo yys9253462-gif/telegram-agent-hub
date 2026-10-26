@@ -1,4 +1,5 @@
 """消息按钮与短期操作令牌测试，不访问网络。"""
+import _root  # noqa: F401  仓库根目录进 sys.path
 import hashlib
 import tempfile
 import threading

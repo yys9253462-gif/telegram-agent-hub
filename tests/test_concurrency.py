@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """无网络、无模型请求的多任务并发回归。"""
+import _root  # noqa: F401  仓库根目录进 sys.path
 import io
 import os
 import urllib.error
