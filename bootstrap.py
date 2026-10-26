@@ -141,7 +141,11 @@ def main(argv=None):
     with tempfile.TemporaryDirectory(prefix='telegram-agent-hub-') as folder:
         os.chmod(folder, 0o700)
         source = extract_archive(data, folder)
-        installer = source / 'install.py'
+        # 程序文件在仓库的 app/ 目录；更早的版本放在归档根目录。两种都认，
+        # 这样旧版本发布的归档与新布局的归档都能安装和升级。
+        installer = source / 'app' / 'install.py'
+        if not installer.is_file():
+            installer = source / 'install.py'
         if not installer.is_file():
             raise BootstrapError('仓库中不存在 install.py')
         command = [sys.executable, str(installer)] + installer_args

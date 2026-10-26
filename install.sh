@@ -12,8 +12,10 @@ if ! command -v python3 >/dev/null 2>&1; then
         sudo apt-get install -y python3 ca-certificates
     fi
 fi
+INSTALLER="$SCRIPT_DIR/app/install.py"
+[ -f "$INSTALLER" ] || INSTALLER="$SCRIPT_DIR/install.py"
 if [ "$(id -u)" -eq 0 ]; then
-    exec python3 "$SCRIPT_DIR/install.py" "$@"
+    exec python3 "$INSTALLER" "$@"
 else
-    exec sudo python3 "$SCRIPT_DIR/install.py" "$@"
+    exec sudo python3 "$INSTALLER" "$@"
 fi

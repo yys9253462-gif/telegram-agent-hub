@@ -114,7 +114,10 @@ fi
 
 mkdir -p "$WORK/src"
 tar -xzf "$ARCHIVE" -C "$WORK/src" --strip-components=1 --no-same-owner --no-same-permissions
-[ -f "$WORK/src/install.py" ] || fail "归档中缺少安装器，可能是版本不匹配。"
+# 程序文件在 app/ 下；更早的版本放在归档根目录，两种都认。
+INSTALLER="$WORK/src/app/install.py"
+[ -f "$INSTALLER" ] || INSTALLER="$WORK/src/install.py"
+[ -f "$INSTALLER" ] || fail "归档中缺少安装器，可能是版本不匹配。"
 
 say ""
 say "源码已就绪，开始交互式安装。"
@@ -124,9 +127,9 @@ export AGENT_SOURCE_COMMIT="$REF"
 # 有控制终端就把它接回标准输入；完全没有终端时交给安装器提示改用 --yes --config。
 # 注意：[ -r /dev/tty ] 在无控制终端的会话里仍可能为真，必须真正打开才算数。
 if [ -t 0 ]; then
-    exec python3 "$WORK/src/install.py" "$@"
+    exec python3 "$INSTALLER" "$@"
 fi
 if exec 3<>/dev/tty 2>/dev/null; then
-    exec python3 "$WORK/src/install.py" "$@" <&3 3<&-
+    exec python3 "$INSTALLER" "$@" <&3 3<&-
 fi
-exec python3 "$WORK/src/install.py" "$@"
+exec python3 "$INSTALLER" "$@"
