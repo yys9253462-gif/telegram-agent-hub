@@ -588,7 +588,20 @@ class RevokeTest(TempStoreMixin):
 
 
 class RedactNewPatternTest(unittest.TestCase):
-    """缺陷：新令牌前缀没进脱敏规则，模型把令牌贴进正文时原样进聊天记录。"""
+    """缺陷：新令牌前缀没进脱敏规则，模型把令牌贴进正文时原样进聊天记录。
+
+    这里测的是正则规则本身：同一枚假令牌可能已在别的用例里按原值登记过，
+    不清掉的话，即使正则被删也照样被按值抹掉，测试就失去了意义。
+    """
+
+    def setUp(self):
+        import textfmt
+        self.saved_secrets = set(textfmt.SECRET_VALUES)
+        textfmt.SECRET_VALUES.clear()
+
+    def tearDown(self):
+        import textfmt
+        textfmt.SECRET_VALUES.update(self.saved_secrets)
 
     def test_cloudflare_token_masked(self):
         self.assertNotIn(FAKE_CF, bot.redact('令牌是 ' + FAKE_CF + ' 请收好'))
