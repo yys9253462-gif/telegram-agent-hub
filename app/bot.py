@@ -2144,14 +2144,44 @@ def extract_suggestions(answer):
     return stripped[:match.start()].rstrip(), items[:3]
 
 
-def context_bar(used, window):
+CONTEXT_BASE_TOKENS = 20000   # 系统提示 + 工具定义的大致占用（账号渠道实测约 2.5 万）
+
+
+def estimate_context(session, home=None):
+    """接口不回报输入用量时（部分自定义网关 input_tokens 恒为 0），按会话记录粗估。
+
+    读 CLI 自己的会话文件，只算最近一次压缩之后的内容，约 3 个字符折 1 个 token。
+    只用于进度条，宁可粗一点也比完全不显示强；拿不到就返回 0。
+    """
+    if not session:
+        return 0
+    folder = re.sub(r'[^A-Za-z0-9]', '-', str(WORK))
+    path = Path(home or Path.home()) / '.claude' / 'projects' / folder / (session + '.jsonl')
+    chars = 0
+    try:
+        with path.open(encoding='utf-8', errors='replace') as handle:
+            for line in handle:
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if entry.get('subtype') == 'compact_boundary':
+                    chars = 0
+                elif entry.get('type') in ('user', 'assistant'):
+                    chars += len(json.dumps((entry.get('message') or {}).get('content'), ensure_ascii=False))
+    except OSError:
+        return 0
+    return CONTEXT_BASE_TOKENS + chars // 3 if chars else 0
+
+
+def context_bar(used, window, estimated=False):
     if not used or not window:
         return ''
     ratio = min(used / window, 1)
     filled = round(ratio * 10)
     def short(value):
         return (str(round(value / 1000000, 1)).rstrip('0').rstrip('.') + 'M') if value >= 1000000 else str(round(value / 1000)) + 'k'
-    return ('上下文 ' + '▰' * filled + '▱' * (10 - filled) + ' ' + str(round(ratio * 100)) + '%'
+    return ('上下文' + ('（估算）' if estimated else '') + ' ' + '▰' * filled + '▱' * (10 - filled) + ' ' + str(round(ratio * 100)) + '%'
             + ' · ' + short(used) + ' / ' + short(window))
 
 
@@ -3362,8 +3392,12 @@ def run_stream(chat, text):
         # started 是 monotonic 读数，只有它在这次进程里算得对；墙钟那份交给
         # started_wall 兜底，两者不能互相顶替。
         footer = reply_footer(engine, started, started_wall=started_wall)
-        window = state.get('context_window') or (200000 if state.get('context_used') else 0)
-        bar = context_bar(state.get('context_used'), window)
+        used = state.get('context_used')
+        estimated = not used and state_kind != 'codex'
+        if estimated:
+            used = estimate_context((final or {}).get('session_id'))
+        window = state.get('context_window') or (200000 if used else 0)
+        bar = context_bar(used, window, estimated)
         if bar:
             footer = (footer + '\n' if footer else '') + bar
         if footer:

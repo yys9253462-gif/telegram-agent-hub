@@ -48,6 +48,20 @@ class ReplyButtonsTest(unittest.TestCase):
                                 'compact_metadata': {'pre_tokens': 25157, 'post_tokens': 7822}}, s)
         self.assertEqual(s['compacted']['post_tokens'], 7822)
 
+    def test_estimate_from_session_file(self):
+        import json, tempfile
+        from pathlib import Path
+        home = Path(tempfile.mkdtemp())
+        folder = home / '.claude' / 'projects' / __import__('re').sub(r'[^A-Za-z0-9]', '-', str(bot.WORK))
+        folder.mkdir(parents=True)
+        lines = [{'type': 'user', 'message': {'content': 'x' * 9000}},
+                 {'type': 'system', 'subtype': 'compact_boundary'},
+                 {'type': 'assistant', 'message': {'content': 'y' * 2998}}]
+        (folder / 's1.jsonl').write_text(chr(10).join(json.dumps(item) for item in lines))
+        self.assertEqual(bot.estimate_context('s1', home), bot.CONTEXT_BASE_TOKENS + 1000)
+        self.assertEqual(bot.estimate_context('missing', home), 0)
+        self.assertIn('（估算）', bot.context_bar(30000, 200000, True))
+
     def test_prompt_mentions_format(self):
         self.assertIn('【建议】', bot.SUGGEST_PROMPT)
 
