@@ -21,10 +21,10 @@ class ReplyStyleTest(unittest.TestCase):
     def test_progress_line_is_italic(self):
         self.assertEqual(render_reply(PROGRESS_MARK + '正在执行 Bash · 已运行12秒'), '<i>⏳ 正在执行 Bash · 已运行12秒</i>')
 
-    def test_footer_goes_into_expandable_quote(self):
+    def test_footer_goes_into_quote(self):
         rendered = render_reply('正文\n\n' + FOOTER_MARK + '\n执行器：Claude · 耗时：3秒\n用量：5小时 剩余 90%')
         self.assertTrue(rendered.startswith('正文'))
-        self.assertTrue(rendered.endswith('<blockquote expandable>执行器：Claude · 耗时：3秒\n用量：5小时 剩余 90%</blockquote>'))
+        self.assertTrue(rendered.endswith('<blockquote>执行器：Claude · 耗时：3秒\n用量：5小时 剩余 90%</blockquote>'))
 
     def test_markdown_quote_and_list(self):
         self.assertEqual(render_reply('> 注意\n> 第二行'), '<blockquote>注意\n第二行</blockquote>')
@@ -44,7 +44,7 @@ class ReplyStyleTest(unittest.TestCase):
 
     def test_html_is_still_escaped(self):
         self.assertEqual(render_reply('# <b>x</b>'), '🟦 <b>&lt;b&gt;x&lt;/b&gt;</b>')
-        self.assertEqual(render_reply(FOOTER_MARK + '\n<script>'), '<blockquote expandable>&lt;script&gt;</blockquote>')
+        self.assertEqual(render_reply(FOOTER_MARK + '\n<script>'), '<blockquote>&lt;script&gt;</blockquote>')
 
 
 if __name__ == '__main__':

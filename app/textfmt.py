@@ -127,7 +127,7 @@ def render_reply(text):
     if fence is not None:
         output.append('<pre>' + html.escape('\n'.join(code)) + '</pre>')
     if footer:
-        output.append('<blockquote expandable>' + '\n'.join(footer) + '</blockquote>')
+        output.append('<blockquote>' + '\n'.join(footer) + '</blockquote>')
     return '\n'.join(output).strip() or '正在生成…'
 
 
