@@ -154,7 +154,7 @@ KEYBOARD = {
 # 保留分组常量兼容旧入口，展示时直接平铺各组功能。
 MENU_GROUPS = {
     '设置': {
-        '任务与模型': ['模型', '账号模型', '思考强度', '模型供应商', '选择智能体'],
+        '任务与模型': ['模型', '账号模型', '思考强度', '规划执行', '模型供应商', '选择智能体'],
         '会话与文件': ['新建会话', '会话列表'],
         '账号登录': ['登录Claude', '登录CodeBuddy', '登录Codex', '退出账号', '账号状态', '渠道切换'],
         '版本更新': ['检查版本', '更新机器人'],
@@ -972,6 +972,106 @@ def effort_label(engine=None):
     return EFFORT_LABELS.get(value, value) + '（' + value + '）' if value else '默认'
 
 
+# 「规划执行」只对支持 --agents 子代理的执行器开放（Claude、CodeBuddy）；Codex 没有子代理。
+COLLAB_ENGINES = ('claude', 'codebuddy')
+COLLAB_STATE = WORK / 'collab.json'
+COLLAB_PROMPT = (
+    '本轮启用「规划执行」模式：你是主代理，负责理解需求、制定计划、审核结果并给出最终结论。'
+    '具体执行（运行命令、读写与修改文件、批量查询、跑测试）一律交给 executor 子代理：'
+    '用 Agent 工具、subagent_type 选 executor，把要做的步骤、涉及的路径和验收标准写清楚。'
+    '每次 executor 返回后你要复核：核对输出与改动是否达到验收标准，必要时自己做只读抽查；'
+    '有问题就把具体问题交回 executor 修正，直到确认无误。'
+    '最后由你汇总结论回复机主，说明做了什么、验证了什么。'
+    '简单问答、无需执行任何操作的问题可直接回答，不必委派。')
+
+
+def collab_key(engine=None):
+    """规划执行的设置按「执行器 + 后端」分开记：执行模型必须是当前这家能用的模型。"""
+    engine = engine or current_engine()
+    return engine + '|' + session_channel(engine)
+
+
+def collab_worker(engine=None):
+    """当前启用的执行模型；没启用返回空串。任务里以入队时的设置为准。"""
+    engine = engine or current_engine()
+    task = getattr(TASK_LOCAL, 'task', None)
+    if task and task['snapshot'].get('engine', 'claude') == engine and 'worker' in task['snapshot']:
+        return task['snapshot']['worker'] or ''
+    if engine not in COLLAB_ENGINES:
+        return ''
+    try:
+        data = json.loads(COLLAB_STATE.read_text())
+    except (OSError, ValueError):
+        return ''
+    entry = data.get(collab_key(engine)) if isinstance(data, dict) else None
+    if not isinstance(entry, dict) or not entry.get('enabled'):
+        return ''
+    worker = entry.get('worker')
+    return worker if isinstance(worker, str) else ''
+
+
+def collab_entry(engine=None):
+    engine = engine or current_engine()
+    try:
+        data = json.loads(COLLAB_STATE.read_text())
+    except (OSError, ValueError):
+        data = {}
+    entry = data.get(collab_key(engine)) if isinstance(data, dict) else None
+    return entry if isinstance(entry, dict) else {}
+
+
+def set_collab(engine, enabled=None, worker=None):
+    try:
+        data = json.loads(COLLAB_STATE.read_text())
+    except (OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    entry = dict(data.get(collab_key(engine)) or {})
+    if worker is not None:
+        entry['worker'] = worker
+    if enabled is not None:
+        if enabled and not entry.get('worker'):
+            raise MediaError('先选一个执行模型，再开启规划执行。')
+        entry['enabled'] = bool(enabled)
+    data[collab_key(engine)] = entry
+    atomic_json(COLLAB_STATE, data)
+
+
+def main_model_name(engine=None):
+    """主模型（负责规划与审核）的人读名字。"""
+    engine = engine or current_engine()
+    return account_model_label(engine) if auth_channel(engine) == 'account' else current_model()
+
+
+def worker_options(engine=None):
+    """可选的执行模型：账号渠道是账号模型清单，接口密钥渠道是当前供应商的模型目录。"""
+    engine = engine or current_engine()
+    if auth_channel(engine) == 'account':
+        return list(account_model_options(engine))
+    return [(item['id'], item['id']) for item in read_model_cache()]
+
+
+def worker_label(engine=None, worker=None):
+    engine = engine or current_engine()
+    worker = worker if worker is not None else collab_worker(engine)
+    if not worker:
+        return ''
+    if auth_channel(engine) == 'account':
+        return dict(account_model_options(engine)).get(worker, worker)
+    return worker
+
+
+def collab_agents(worker):
+    """传给 --agents 的 executor 子代理定义。model 写执行模型的 ID，CLI 原样请求它。"""
+    return json.dumps({'executor': {
+        'description': '执行者：按主代理给出的步骤执行具体操作（运行命令、读写与修改文件、批量查询、跑测试），'
+                       '完成后如实汇报输出、改动和遇到的问题。',
+        'prompt': '你是执行者。严格按主代理给定的步骤和验收标准执行，不擅自扩大范围；'
+                  '如实汇报命令输出、修改了哪些文件、哪些没做成以及原因。',
+        'model': worker}}, ensure_ascii=False)
+
+
 def account_model_label(engine=None):
     """账号模型的人读名字，例如「Opus 5.5 · 1M 上下文」；没选过是「官方默认」。"""
     engine = engine or current_engine()
@@ -1025,6 +1125,8 @@ def execution_footer(engine=None, started=None, started_wall=None):
     parts = ['执行器：' + label, '模型：' + str(model)]
     if current_effort(engine):
         parts.append('思考：' + effort_label(engine))
+    if collab_worker(engine):
+        parts.append('执行模型：' + worker_label(engine))
     elapsed = None
     if started is not None:
         try:
@@ -2518,6 +2620,10 @@ def engine_command(engine, text, instructions, chat, environment):
         command.extend(['--model', account_model(engine)])
     if current_effort(engine):
         command.extend(['--effort', current_effort(engine)])
+    worker = collab_worker(engine)
+    if worker:
+        command.extend(['--agents', collab_agents(worker)])
+        command[command.index('--append-system-prompt') + 1] = instructions + '\n' + COLLAB_PROMPT
     if session_id():
         command.extend(['--resume', session_id()])
     if environment.pop('_IMAGE_SERVER', None):
@@ -3697,7 +3803,7 @@ class TaskController:
             engine = current_engine()
             return {'model': current_model(), 'target': self.target, 'strategy': strategy_name(), 'engine': engine,
                     'auth_channel': auth_channel(engine), 'provider': active_provider_id(),
-                    'effort': current_effort(engine),
+                    'effort': current_effort(engine), 'worker': collab_worker(engine),
                     'session_key': key, 'session_id': stored_session(session, engine, session_channel(engine))}
 
     def enqueue(self, chat, text='', kind='agent', payload=None, update_id=None, snapshot=None):
@@ -4436,6 +4542,94 @@ class TaskController:
                        for mid, name in models)
         options.append(('调整思考强度', '思考强度'))
         send_options(chat, '\n'.join(lines), options)
+
+    @on_text('规划执行', '/collab')
+    def _cmd_规划执行(self, chat, text, update_id):
+        engine = current_engine()
+        label = engine_spec(engine)['label']
+        if engine not in COLLAB_ENGINES:
+            raise MediaError(label + ' 没有子代理功能，规划执行只支持 Claude 与 CodeBuddy。可到「选择智能体」切换。')
+        entry = collab_entry(engine)
+        worker = entry.get('worker') or ''
+        enabled = bool(entry.get('enabled') and worker)
+        lines = [label + ' 规划执行（' + ('接口密钥 · ' + (provider_record() or {}).get('name', '') if auth_channel(engine) != 'account' else '账号') + '）',
+                 '状态：' + ('已开启' if enabled else '未开启'),
+                 '主模型（规划 + 审核）：' + main_model_name(engine),
+                 '执行模型（执行具体操作）：' + (worker_label(engine, worker) if worker else '未选'),
+                 '',
+                 '开启后，主模型先制定计划，把跑命令、改文件等具体操作交给执行模型，'
+                 '再逐项复核结果，有问题让执行模型修正。主模型在「' + ('账号模型' if auth_channel(engine) == 'account' else '模型') + '」里换。']
+        options = [('选择执行模型', '选择执行模型')]
+        if worker:
+            options.insert(0, ('关闭规划执行', '关闭规划执行') if enabled else ('开启规划执行', '开启规划执行'))
+        send_options(chat, '\n'.join(lines), options)
+
+    @on_text('开启规划执行', '关闭规划执行')
+    def _cmd_开关规划执行(self, chat, text, update_id):
+        engine = current_engine()
+        if engine not in COLLAB_ENGINES:
+            raise MediaError('当前执行器不支持规划执行。')
+        set_collab(engine, enabled=(text == '开启规划执行'))
+        if text == '开启规划执行':
+            send(chat, '规划执行已开启：主模型 ' + main_model_name(engine) + ' 规划与审核，执行模型 '
+                 + worker_label(engine) + ' 执行。新任务生效。')
+        else:
+            send(chat, '规划执行已关闭，新任务由主模型独立完成。')
+
+    @on_text('选择执行模型')
+    def _cmd_选择执行模型(self, chat, text, update_id):
+        self._worker_page(chat, '', 0)
+
+    @on_text(match=lambda text: text.startswith(('执行模型页 ', '搜索执行模型 ')))
+    def _cmd_执行模型翻页(self, chat, text, update_id):
+        head, _, rest = text.partition(' ')
+        if head == '搜索执行模型':
+            self._worker_page(chat, rest.strip(), 0)
+        else:
+            keyword, _, page = rest.rpartition(' ')
+            self._worker_page(chat, keyword.strip(), int(page) if page.isdigit() else 0)
+
+    def _worker_page(self, chat, keyword, page):
+        engine = current_engine()
+        if engine not in COLLAB_ENGINES:
+            raise MediaError('当前执行器不支持规划执行。')
+        models = worker_options(engine)
+        if not models:
+            raise MediaError('还没有模型目录：先到「模型 → 模型列表」拉取一次。')
+        if keyword:
+            models = [item for item in models if keyword.casefold() in item[0].casefold()
+                      or keyword.casefold() in item[1].casefold()]
+            if not models:
+                raise MediaError('没有匹配「' + keyword + '」的模型。')
+        size = 12
+        pages = (len(models) + size - 1) // size
+        page = max(0, min(page, pages - 1))
+        current = collab_entry(engine).get('worker')
+        options = [(name + (' ·当前' if mid == current else ''), '执行模型 ' + mid)
+                   for mid, name in models[page * size:(page + 1) * size]]
+        if page > 0:
+            options.append(('上一页', '执行模型页 ' + keyword + ' ' + str(page - 1)))
+        if page + 1 < pages:
+            options.append(('下一页', '执行模型页 ' + keyword + ' ' + str(page + 1)))
+        title = ('选择执行模型（负责跑命令、改文件等具体操作）'
+                 + ('\n搜索：' + keyword if keyword else '') + '\n第 ' + str(page + 1) + '/' + str(pages) + ' 页，共 '
+                 + str(len(models)) + ' 个。也可以发「搜索执行模型 关键词」。'
+                 + '\n一般选比主模型更快、更省的模型。')
+        send_options(chat, title, options)
+
+    @on_text(match=lambda text: text.startswith('执行模型 '))
+    def _cmd_设置执行模型(self, chat, text, update_id):
+        engine = current_engine()
+        if engine not in COLLAB_ENGINES:
+            raise MediaError('当前执行器不支持规划执行。')
+        worker = text.partition(' ')[2].strip()
+        if worker not in {mid for mid, _ in worker_options(engine)}:
+            raise MediaError('这个模型不在当前可用清单里，请重新打开「选择执行模型」。')
+        set_collab(engine, worker=worker)
+        enabled = bool(collab_entry(engine).get('enabled'))
+        send_options(chat, '执行模型已设为：' + worker_label(engine, worker)
+                     + ('。新任务生效。' if enabled else '。规划执行还没开启。'),
+                     [] if enabled else [('开启规划执行', '开启规划执行')])
 
     @on_text('思考强度', '/effort')
     def _cmd_思考强度(self, chat, text, update_id):
