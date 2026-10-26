@@ -89,7 +89,9 @@ class ModelListTests(unittest.TestCase):
     def test_claude_account_models_are_aliases(self):
         # 2026-10-26 在 Pro 账号上逐个实测；别名跟着官方最新版走。
         self.assertEqual([item[0] for item in gh.CLAUDE_ACCOUNT_MODELS],
-                         ['opus', 'opus[1m]', 'sonnet', 'sonnet[1m]', 'haiku', 'opusplan', 'fable'])
+                         ['opus', 'opus[1m]', 'sonnet', 'sonnet[1m]', 'haiku', 'fable'])
+        # opusplan 在 -p 非交互模式下全程只用 Sonnet，名不副实，不能放进清单
+        self.assertNotIn('opusplan', [item[0] for item in gh.CLAUDE_ACCOUNT_MODELS])
         # 每一项都要有人读名字，不能只显示一个别名
         for model_id, name in gh.CLAUDE_ACCOUNT_MODELS:
             self.assertNotEqual(model_id, name)

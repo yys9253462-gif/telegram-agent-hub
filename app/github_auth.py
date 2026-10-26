@@ -825,13 +825,14 @@ CODEX_PLAN_LABELS = {
 # Claude 的 --model 接受别名，比写死版本号稳：官方换版本时别名照样有效。
 # Claude 账号模式可选模型（2026-10-26 在真实 Pro 账号上逐个实测，别名会跟着官方最新版走）。
 # fable 在 Pro 上要额外用量额度，未开通时官方直接拒绝，所以标注出来而不是藏掉。
+# 不放 opusplan：它只在交互式规划模式下才切到 Opus，机器人用 -p 非交互运行，实测全程只用
+# Sonnet。「主模型规划、另一个模型执行」改由「规划执行」模式（executor 子代理）实现。
 CLAUDE_ACCOUNT_MODELS = (
     ('opus', 'Opus 5.5'),
     ('opus[1m]', 'Opus 5.5 · 1M 上下文'),
     ('sonnet', 'Sonnet 5.5'),
     ('sonnet[1m]', 'Sonnet 5.5 · 1M 上下文'),
     ('haiku', 'Haiku 5.5'),
-    ('opusplan', 'Opus 规划 + Sonnet 执行'),
     ('fable', 'Fable 5.1（Pro 需额外额度）'),
 )
 # Codex 账号模式真实可用的模型（2026-10-26 在真实 Plus 账号上逐个实测）。
