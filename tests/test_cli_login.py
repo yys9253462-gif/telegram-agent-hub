@@ -4,6 +4,7 @@ import io
 import os
 import subprocess
 import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -357,12 +358,17 @@ class LoginSpinnerFloodTests(unittest.TestCase):
                 if piece:
                     self._write_lines(write_end, piece)
                 if wait_state:
-                    for _ in range(80):
+                    # 按截止时间等，不能用 self.done.wait(0.05) 当睡眠：done 一旦被置位，
+                    # wait 立刻返回，整个循环零等待就结束了。CI 机器慢，处理几十 KB 动画要好几秒，
+                    # 这正是这个用例偶发失败的原因。条件满足就提前退出，平时不变慢。
+                    deadline = time.monotonic() + 20
+                    while time.monotonic() < deadline:
                         if any(e['state'] == wait_state for e in self.events):
                             break
-                        self.done.wait(0.05)
+                        time.sleep(0.05)
             # 给主循环一点时间把最后一片数据读进缓冲再收尾。
-            for _ in range(20):
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
                 with manager._lock:
                     session = manager._sessions.get('codebuddy')
                 if session is not None:
@@ -370,7 +376,7 @@ class LoginSpinnerFloodTests(unittest.TestCase):
                         break
                     if not wait_for and len(session.buffer) > 0:
                         break
-                self.done.wait(0.05)
+                time.sleep(0.05)
             with manager._lock:
                 session = manager._sessions.get('codebuddy')
                 whole = session.buffer if session else ''
