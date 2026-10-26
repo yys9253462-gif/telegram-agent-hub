@@ -4545,57 +4545,105 @@ class TaskController:
 
     @on_text('规划执行', '/collab')
     def _cmd_规划执行(self, chat, text, update_id):
-        engine = current_engine()
-        label = engine_spec(engine)['label']
-        if engine not in COLLAB_ENGINES:
-            raise MediaError(label + ' 没有子代理功能，规划执行只支持 Claude 与 CodeBuddy。可到「选择智能体」切换。')
+        """入口：已开启时显示状态；没开启直接进入第 1 步选主模型。"""
+        engine = self._collab_engine()
         entry = collab_entry(engine)
-        worker = entry.get('worker') or ''
-        enabled = bool(entry.get('enabled') and worker)
-        lines = [label + ' 规划执行（' + ('接口密钥 · ' + (provider_record() or {}).get('name', '') if auth_channel(engine) != 'account' else '账号') + '）',
-                 '状态：' + ('已开启' if enabled else '未开启'),
-                 '主模型（规划 + 审核）：' + main_model_name(engine),
-                 '执行模型（执行具体操作）：' + (worker_label(engine, worker) if worker else '未选'),
-                 '',
-                 '开启后，主模型先制定计划，把跑命令、改文件等具体操作交给执行模型，'
-                 '再逐项复核结果，有问题让执行模型修正。主模型在「' + ('账号模型' if auth_channel(engine) == 'account' else '模型') + '」里换。']
-        options = [('选择执行模型', '选择执行模型')]
-        if worker:
-            options.insert(0, ('关闭规划执行', '关闭规划执行') if enabled else ('开启规划执行', '开启规划执行'))
-        send_options(chat, '\n'.join(lines), options)
+        if entry.get('enabled') and entry.get('worker'):
+            send_options(chat, self._collab_summary(engine, '规划执行已开启'),
+                         [('关闭规划执行', '关闭规划执行'), ('重新设置', '重新设置规划执行')])
+            return
+        self._collab_page(chat, 'main', '', 0)
+
+    @on_text('重新设置规划执行')
+    def _cmd_重新设置规划执行(self, chat, text, update_id):
+        self._collab_engine()
+        self._collab_page(chat, 'main', '', 0)
 
     @on_text('开启规划执行', '关闭规划执行')
     def _cmd_开关规划执行(self, chat, text, update_id):
-        engine = current_engine()
-        if engine not in COLLAB_ENGINES:
-            raise MediaError('当前执行器不支持规划执行。')
+        engine = self._collab_engine()
         set_collab(engine, enabled=(text == '开启规划执行'))
         if text == '开启规划执行':
-            send(chat, '规划执行已开启：主模型 ' + main_model_name(engine) + ' 规划与审核，执行模型 '
-                 + worker_label(engine) + ' 执行。新任务生效。')
+            send(chat, self._collab_summary(engine, '✅ 规划执行已开启') + '\n\n新任务生效。')
         else:
-            send(chat, '规划执行已关闭，新任务由主模型独立完成。')
+            send(chat, '规划执行已关闭，新任务由主模型 ' + main_model_name(engine) + ' 独立完成。')
 
     @on_text('选择执行模型')
     def _cmd_选择执行模型(self, chat, text, update_id):
-        self._worker_page(chat, '', 0)
+        self._collab_engine()
+        self._collab_page(chat, 'worker', '', 0)
 
-    @on_text(match=lambda text: text.startswith(('执行模型页 ', '搜索执行模型 ')))
-    def _cmd_执行模型翻页(self, chat, text, update_id):
+    @on_text(match=lambda text: text.startswith(('规划模型页 ', '搜索主模型 ', '搜索执行模型 ', '执行模型页 ')))
+    def _cmd_规划模型翻页(self, chat, text, update_id):
+        """翻页与搜索。格式：规划模型页 main|worker 关键词 页码；搜索主模型/搜索执行模型 关键词。"""
+        self._collab_engine()
         head, _, rest = text.partition(' ')
-        if head == '搜索执行模型':
-            self._worker_page(chat, rest.strip(), 0)
+        if head == '搜索主模型':
+            self._collab_page(chat, 'main', rest.strip(), 0)
+        elif head == '搜索执行模型':
+            self._collab_page(chat, 'worker', rest.strip(), 0)
         else:
+            kind, _, rest = rest.partition(' ') if head == '规划模型页' else ('worker', '', rest)
             keyword, _, page = rest.rpartition(' ')
-            self._worker_page(chat, keyword.strip(), int(page) if page.isdigit() else 0)
+            self._collab_page(chat, 'main' if kind == 'main' else 'worker', keyword.strip(),
+                              int(page) if page.isdigit() else 0)
 
-    def _worker_page(self, chat, keyword, page):
+    @on_text(match=lambda text: text.startswith('规划主模型 '))
+    def _cmd_规划主模型(self, chat, text, update_id):
+        """第 1 步选定主模型：账号渠道写账号模型，接口密钥渠道写当前供应商的模型。然后进入第 2 步。"""
+        engine = self._collab_engine()
+        model = text.partition(' ')[2].strip()
+        if model not in {mid for mid, _ in worker_options(engine)}:
+            raise MediaError('这个模型不在当前可用清单里，请重新打开「规划执行」。')
+        if auth_channel(engine) == 'account':
+            set_account_model(engine, model)
+        else:
+            atomic_json(MODEL_STATE, {'model': model})
+            remember_provider_model(model)
+        self._collab_page(chat, 'worker', '', 0, note='主模型已设为：' + main_model_name(engine))
+
+    @on_text(match=lambda text: text.startswith('执行模型 '))
+    def _cmd_设置执行模型(self, chat, text, update_id):
+        """第 2 步选定执行模型，然后进入第 3 步确认开启。"""
+        engine = self._collab_engine()
+        worker = text.partition(' ')[2].strip()
+        if worker not in {mid for mid, _ in worker_options(engine)}:
+            raise MediaError('这个模型不在当前可用清单里，请重新打开「规划执行」。')
+        set_collab(engine, worker=worker)
+        if collab_entry(engine).get('enabled'):
+            send(chat, self._collab_summary(engine, '执行模型已更新') + '\n\n新任务生效。')
+            return
+        send_options(chat, self._collab_summary(engine, '第 3 步 / 共 3 步：确认开启'),
+                     [('开启规划执行', '开启规划执行'), ('重新选择', '重新设置规划执行')])
+
+    def _collab_engine(self):
         engine = current_engine()
         if engine not in COLLAB_ENGINES:
-            raise MediaError('当前执行器不支持规划执行。')
+            raise MediaError(engine_spec(engine)['label'] + ' 没有子代理功能，规划执行只支持 Claude 与 CodeBuddy。'
+                             '可到「选择智能体」切换。')
+        return engine
+
+    def _collab_summary(self, engine, title):
+        channel = ('账号' if auth_channel(engine) == 'account'
+                   else '接口密钥 · ' + ((provider_record() or {}).get('name') or ''))
+        worker = collab_entry(engine).get('worker') or ''
+        return '\n'.join([
+            title + '（' + engine_spec(engine)['label'] + ' · ' + channel + '）',
+            '主模型（规划 + 审核）：' + main_model_name(engine),
+            '执行模型（执行具体操作）：' + (worker_label(engine, worker) if worker else '未选'),
+            '',
+            '主模型先制定计划，把跑命令、改文件等具体操作交给执行模型，再逐项复核结果，'
+            '有问题让执行模型修正，最后由主模型给出结论。'])
+
+    def _collab_page(self, chat, kind, keyword, page, note=''):
+        """分步引导里的选模型页：kind 为 main（第 1 步）或 worker（第 2 步）。"""
+        engine = current_engine()
         models = worker_options(engine)
         if not models:
-            raise MediaError('还没有模型目录：先到「模型 → 模型列表」拉取一次。')
+            # 第一次用、还没拉过当前供应商的模型目录：给个按钮直接拉，别让人卡在报错上。
+            send_options(chat, '还没有当前供应商的模型目录。点下面拉取一次，拉完再点「规划执行」继续。',
+                         ['模型列表', '规划执行'])
+            return
         if keyword:
             models = [item for item in models if keyword.casefold() in item[0].casefold()
                       or keyword.casefold() in item[1].casefold()]
@@ -4604,32 +4652,28 @@ class TaskController:
         size = 12
         pages = (len(models) + size - 1) // size
         page = max(0, min(page, pages - 1))
-        current = collab_entry(engine).get('worker')
-        options = [(name + (' ·当前' if mid == current else ''), '执行模型 ' + mid)
+        if kind == 'main':
+            current = account_model(engine) if auth_channel(engine) == 'account' else current_model()
+            command, search = '规划主模型 ', '搜索主模型'
+            head = ('第 1 步 / 共 3 步：选择主模型\n主模型负责理解需求、制定计划、审核结果，一般选最强的那个。'
+                    '\n当前：' + main_model_name(engine))
+        else:
+            current = collab_entry(engine).get('worker')
+            command, search = '执行模型 ', '搜索执行模型'
+            head = ('第 2 步 / 共 3 步：选择执行模型\n执行模型负责跑命令、改文件等具体操作，'
+                    '一般选比主模型更快、更省的。\n主模型：' + main_model_name(engine))
+        options = [(name + (' ·当前' if mid == current else ''), command + mid)
                    for mid, name in models[page * size:(page + 1) * size]]
         if page > 0:
-            options.append(('上一页', '执行模型页 ' + keyword + ' ' + str(page - 1)))
+            options.append(('上一页', '规划模型页 ' + kind + ' ' + keyword + ' ' + str(page - 1)))
         if page + 1 < pages:
-            options.append(('下一页', '执行模型页 ' + keyword + ' ' + str(page + 1)))
-        title = ('选择执行模型（负责跑命令、改文件等具体操作）'
-                 + ('\n搜索：' + keyword if keyword else '') + '\n第 ' + str(page + 1) + '/' + str(pages) + ' 页，共 '
-                 + str(len(models)) + ' 个。也可以发「搜索执行模型 关键词」。'
-                 + '\n一般选比主模型更快、更省的模型。')
-        send_options(chat, title, options)
-
-    @on_text(match=lambda text: text.startswith('执行模型 '))
-    def _cmd_设置执行模型(self, chat, text, update_id):
-        engine = current_engine()
-        if engine not in COLLAB_ENGINES:
-            raise MediaError('当前执行器不支持规划执行。')
-        worker = text.partition(' ')[2].strip()
-        if worker not in {mid for mid, _ in worker_options(engine)}:
-            raise MediaError('这个模型不在当前可用清单里，请重新打开「选择执行模型」。')
-        set_collab(engine, worker=worker)
-        enabled = bool(collab_entry(engine).get('enabled'))
-        send_options(chat, '执行模型已设为：' + worker_label(engine, worker)
-                     + ('。新任务生效。' if enabled else '。规划执行还没开启。'),
-                     [] if enabled else [('开启规划执行', '开启规划执行')])
+            options.append(('下一页', '规划模型页 ' + kind + ' ' + keyword + ' ' + str(page + 1)))
+        lines = ([note, ''] if note else []) + [head, '']
+        if keyword:
+            lines.append('搜索：' + keyword)
+        lines.append('第 ' + str(page + 1) + '/' + str(pages) + ' 页，共 ' + str(len(models))
+                     + ' 个' + ('，可发「' + search + ' 关键词」查找。' if pages > 1 or keyword else '。'))
+        send_options(chat, '\n'.join(lines), options)
 
     @on_text('思考强度', '/effort')
     def _cmd_思考强度(self, chat, text, update_id):
