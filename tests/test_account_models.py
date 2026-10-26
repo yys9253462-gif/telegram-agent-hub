@@ -87,8 +87,12 @@ class ModelListTests(unittest.TestCase):
             self.assertNotIn(rejected, ids)
 
     def test_claude_account_models_are_aliases(self):
+        # 2026-10-26 在 Pro 账号上逐个实测；别名跟着官方最新版走。
         self.assertEqual([item[0] for item in gh.CLAUDE_ACCOUNT_MODELS],
-                         ['default', 'opus', 'sonnet', 'haiku'])
+                         ['opus', 'opus[1m]', 'sonnet', 'sonnet[1m]', 'haiku', 'opusplan', 'fable'])
+        # 每一项都要有人读名字，不能只显示一个别名
+        for model_id, name in gh.CLAUDE_ACCOUNT_MODELS:
+            self.assertNotEqual(model_id, name)
 
     def test_codebuddy_has_no_hardcoded_list(self):
         self.assertEqual(gh.account_models('codebuddy'), ())
@@ -304,9 +308,11 @@ class ChannelSwitchPageTests(unittest.TestCase):
     def test_choosing_model_persists_and_reports(self):
         self.use('codex')
         bot.set_auth_channel('account', 'codex')
-        send, _ = self.send('账号模型 gpt-6-sol')
+        _, options = self.send('账号模型 gpt-6-sol')
         self.assertEqual(bot.account_model('codex'), 'gpt-6-sol')
-        self.assertIn('模型已设为：gpt-6-sol', send.call_args.args[1])
+        # 回复用人读名字，并顺手给出调整思考强度的按钮
+        self.assertIn('模型已设为：GPT-6 Sol', options.call_args.args[1])
+        self.assertIn('思考强度', self.page_commands(options))
 
     def test_choosing_model_in_gateway_mode_warns_it_is_inactive(self):
         self.use('codex')
