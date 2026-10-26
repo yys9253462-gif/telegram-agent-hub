@@ -491,7 +491,11 @@ def fetch_provider_models(base_url, api_key):
     if not isinstance(items, list):
         raise MediaError('这个地址返回的不是模型目录，请确认它兼容 Anthropic 或 OpenAI 接口。')
     models = list({item['id']: {'id': item['id'], 'provider': item.get('owned_by', '未标注'),
-                   'tools': item.get('supports_tool_call')}
+                   'tools': item.get('supports_tool_call'),
+                   # 网关目录里的输入上限（agent2api 叫 max_input_tokens）。Claude CLI 不认识
+                   # 自定义模型名时一律按 200k 算，进度条和自动压缩都会偏早，靠它纠正。
+                   'context': next((int(item[key]) for key in ('max_input_tokens', 'context_length', 'context_window')
+                                    if str(item.get(key) or '').isdigit()), None)}
                    for item in items if isinstance(item, dict) and item.get('id')}.values())
     if not models:
         raise MediaError('这个供应商的模型目录是空的。')
@@ -1852,6 +1856,14 @@ def await_token_input(chat, text, update_id=None):
     return True
 
 
+def model_context_window(model):
+    """网关目录里登记的上下文上限；没有登记返回 0，交给 CLI 自己判断。"""
+    for item in read_model_cache():
+        if item.get('id') == model and isinstance(item.get('context'), int) and item['context'] > 0:
+            return item['context']
+    return 0
+
+
 def model_environment():
     model = current_model()
     # 后台子代理/后台命令在 -p 一次性运行里会随进程退出被杀，任务就「中断」了，统一关掉。
@@ -1859,6 +1871,9 @@ def model_environment():
     environment.update({name: model for name in MODEL_PIN_VARS})
     if auth_channel() == 'account':
         return account_environment(environment, current_engine())
+    window = model_context_window(model)
+    if window:
+        environment['CLAUDE_CODE_MAX_CONTEXT_TOKENS'] = str(window)
     record = provider_record()
     for name in GATEWAY_VARS + ('OPENAI_API_KEY', 'CODEX_API_KEY', 'CODEBUDDY_API_KEY'):
         register_secret(environment.get(name))
