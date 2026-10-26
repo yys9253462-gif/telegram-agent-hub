@@ -752,13 +752,20 @@ def looks_like_login_code(text):
 
 CREDENTIALS = WORK / 'credentials.json'
 # 设备码流程只需要 client_id，不需要 client_secret（GitHub 官方文档明确写着）。
-# client_id 本身就是公开标识，不构成机密，所以这里预置一个公共 App 的 client_id：
-# 开箱即用，不必让机主先去注册一个 OAuth App。
-# 想独享每小时 50 次的设备码配额，或换成自己名下的 App，用 GITHUB_CLIENT_ID 覆盖即可。
-GITHUB_CLIENT_ID = os.environ.get('GITHUB_CLIENT_ID') or 'Iv1.b231c327f1eaa229'
-# 申请的权限：repo 用于仓库读写，read:org 用于确认组织成员身份，gist 用于片段。
-# 刻意不申请 workflow 与 delete_repo —— 默认给最小集合，需要时再用 scope 追加。
-GITHUB_SCOPE = os.environ.get('GITHUB_SCOPE', 'repo read:org gist')
+# 这里用的是官方 GitHub CLI（gh）的公开 OAuth client_id —— 任务里真正拿令牌干活的
+# 就是 gh，授权页上显示「GitHub CLI」名副其实。
+#
+# 原来用的是一个 GitHub App（Iv1. 开头）。GitHub App 会**完全忽略 scope 参数**，
+# 权限只取决于 App 作者配置了什么，而且令牌 8 小时过期，申请多少权限都没用。
+# OAuth App 才按 scope 授权，令牌也不会定时过期。
+# 想换成自己名下的 OAuth App，用 GITHUB_CLIENT_ID 覆盖即可。
+GITHUB_CLIENT_ID = os.environ.get('GITHUB_CLIENT_ID') or '178c6fc778ccc68e1d6a'
+# 申请完整权限：机主要的是「智能体能替我做 GitHub 上的任何事」，包括改 Actions 工作流、
+# 管组织与 webhook、发包、删仓库。用 GITHUB_SCOPE 可以收窄。
+GITHUB_SCOPE = os.environ.get('GITHUB_SCOPE', ' '.join((
+    'repo', 'workflow', 'write:packages', 'delete:packages', 'admin:org', 'admin:public_key',
+    'admin:repo_hook', 'admin:org_hook', 'gist', 'notifications', 'user', 'delete_repo',
+    'write:discussion', 'codespace', 'project', 'admin:gpg_key', 'admin:ssh_signing_key', 'audit_log')))
 # Cloudflare 走的是 wrangler（官方 CLI）的公开 client_id，同样只需要 client_id。
 # 用它换来的是 OAuth 访问令牌，可续期、权限由授权页统一授予；
 # 想换成自己注册的 OAuth 客户端，用 CLOUDFLARE_CLIENT_ID 覆盖即可。
@@ -1228,6 +1235,19 @@ def usage_overview_text():
     return '\n'.join(lines)
 
 
+def needs_full_reauth(provider, record):
+    """旧版本申请的授权权限不全：GitHub 走的是 GitHub App，Cloudflare 只申请了只读。"""
+    if not record.get('value'):
+        return False
+    if provider == 'github':
+        client = record.get('client_id') or ''
+        return client.startswith('Iv1.') or (client == '' and bool(record.get('refresh')))
+    if provider == 'cloudflare':
+        granted = set(str(record.get('scope') or '').split())
+        return bool(granted) and 'workers:write' not in granted
+    return False
+
+
 def auth_status_text():
     """授权总览。只显示指纹与范围，任何情况下都不回显凭据原文。"""
     store = credentials()
@@ -1249,7 +1269,14 @@ def auth_status_text():
             detail.append('到期前自动续期' if record.get('refresh') else '无刷新令牌，需重新授权')
         if name == 'github' and summary.get('authorized'):
             record = store.get('github') or {}
-            detail.append('到期前自动续期' if record.get('refresh') else '无刷新令牌，需重新授权')
+            if record.get('refresh'):
+                detail.append('到期前自动续期')
+            elif not record.get('expires_at'):
+                detail.append('长期有效')
+            else:
+                detail.append('无刷新令牌，需重新授权')
+        if needs_full_reauth(name, store.get(name) or {}):
+            detail.append('⚠ 这是旧版授权，权限不全，请点「撤销授权」后重新授权以获得完整权限')
         lines.append('，'.join(detail))
     active = DEVICE_FLOW.get('provider')
     if active:

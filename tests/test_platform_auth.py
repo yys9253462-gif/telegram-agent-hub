@@ -350,7 +350,7 @@ class StartFlowGuardTest(unittest.TestCase):
         """
         import subprocess
         source = Path(bot.__file__).read_text(encoding='utf-8')
-        self.assertIn("os.environ.get('GITHUB_CLIENT_ID') or 'Iv1.", source,
+        self.assertIn("os.environ.get('GITHUB_CLIENT_ID') or '", source,
                       'GITHUB_CLIENT_ID 必须有内置默认值，否则又要机主先注册 App')
 
     def test_running_flow_is_reused_not_restarted(self):
@@ -871,18 +871,46 @@ class OAuthTokenShapedCredentialTest(unittest.TestCase):
 class CloudflareScopeTest(unittest.TestCase):
     """缺陷：申请的权限里没有 user:read，/user 校验返回 403，令牌被误判为不可用。
 
-    官方（wrangler）可申请的权限只有 account:read、user:read、workers:write、
-    workers_kv:write、workers_routes:write、workers_scripts:write、
-    workers_tail:read、zone:read 这几项。
+    wrangler 的 client_id 只接受白名单里的权限名，写错一个整个请求就 400。
+    下面的集合是 2026-10-26 对授权端点逐项实测通过的名字。
     """
 
     def test_scope_includes_user_read(self):
         self.assertIn('user:read', cloudflare_auth.DEFAULT_SCOPE.split())
 
+    def test_scope_includes_write_access(self):
+        """机主要求完整权限：DNS 与 Workers 必须能写，而不是只读。"""
+        scopes = cloudflare_auth.DEFAULT_SCOPE.split()
+        for needed in ('dns_records:edit', 'workers:write', 'pages:write', 'd1:write'):
+            self.assertIn(needed, scopes)
+
+
+class GitHubScopeTest(unittest.TestCase):
+    """GitHub App 会忽略 scope，必须用 OAuth App 的 client_id，并申请完整权限。"""
+
+    def test_client_is_oauth_app_not_github_app(self):
+        self.assertFalse(bot.GITHUB_CLIENT_ID.startswith('Iv1.'), 'GitHub App 会忽略 scope 参数')
+
+    def test_scope_is_full(self):
+        scopes = bot.GITHUB_SCOPE.split()
+        for needed in ('repo', 'workflow', 'admin:org', 'delete_repo', 'write:packages', 'gist', 'user'):
+            self.assertIn(needed, scopes)
+
+    def test_old_grants_are_flagged_for_reauth(self):
+        self.assertTrue(bot.needs_full_reauth('github', {'value': 'x', 'client_id': 'Iv1.abc'}))
+        self.assertFalse(bot.needs_full_reauth('github', {'value': 'x', 'client_id': bot.GITHUB_CLIENT_ID}))
+        self.assertTrue(bot.needs_full_reauth('cloudflare', {'value': 'x', 'scope': 'offline_access zone:read'}))
+        self.assertFalse(bot.needs_full_reauth('cloudflare', {'value': 'x', 'scope': cloudflare_auth.DEFAULT_SCOPE}))
+
     def test_scope_uses_only_official_scopes(self):
-        official = {'account:read', 'user:read', 'workers:write', 'workers_kv:write',
+        official = {'offline_access', 'account:read', 'user:read', 'zone:read', 'dns_records:read',
+                    'dns_records:edit', 'ssl_certs:write', 'workers:write', 'workers_kv:write',
                     'workers_routes:write', 'workers_scripts:write', 'workers_tail:read',
-                    'zone:read', 'offline_access'}
+                    'workers_observability:write', 'workers_builds:write', 'd1:write', 'pages:write',
+                    'ai:write', 'queues:write', 'pipelines:write', 'secrets_store:write',
+                    'containers:write', 'cloudchamber:write', 'connectivity:admin', 'email_routing:write',
+                    'vectorize:write', 'browser:write', 'images:write', 'access:write', 'billing:read',
+                    'artifacts:write'}
         for scope in cloudflare_auth.DEFAULT_SCOPE.split():
             self.assertIn(scope, official, '不是官方有效的权限名：' + scope)
 

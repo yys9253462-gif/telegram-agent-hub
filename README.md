@@ -135,17 +135,17 @@ Codex 那条最容易写错：只把文件里的 `tokens` 置空、甚至把 `au
 
 ## 外部平台授权（GitHub / Cloudflare）
 
-让机器人在任务里代替你操作 GitHub 与 Cloudflare。入口在「更多 → 平台授权」。
+让机器人在任务里代替你操作 GitHub 与 Cloudflare。入口在「授权管理」。两家都**申请完整权限**，开箱即用，不用注册任何应用。
 
-**GitHub 走设备码流程**，不需要回调地址，也不需要 client secret。**开箱即用：不用注册任何 OAuth App。** 点「授权GitHub」后机器人直接给一条消息，里面是「点一下就进授权页」的链接和「点一下就复制」的 8 位码，你点链接、粘贴码、确认，机器人自己等到授权完成并通知你，不需要回填任何东西。
+**GitHub 走设备码流程**，用的是官方 GitHub CLI（gh）的公开 OAuth client_id，授权页上显示「GitHub CLI」。点「授权GitHub」后机器人给一条消息，里面是授权页链接和 8 位码，你点链接、粘贴码、确认即可。申请的权限：仓库读写、Actions 工作流、组织与 webhook、发布/删除包、gist、通知、用户资料、删除仓库、讨论、Codespaces、Projects、GPG/SSH 公钥、审计日志。令牌长期有效。想收窄权限用环境变量 `GITHUB_SCOPE`，想换成自己的 OAuth App 用 `GITHUB_CLIENT_ID`（必须是 OAuth App 并勾选 Enable Device Flow；GitHub App 会忽略权限范围）。
 
-之所以能免注册：设备码流程只要 client_id（GitHub 官方文档明确写着不需要 secret），而 client_id 本身就是公开标识，所以代码里预置了一个公共 App 的 client_id 作为默认值。想独享每小时 50 次的设备码配额，或换成自己名下的 App，注册一个 OAuth App 并勾选 **Enable Device Flow**，把 client_id 填到安装配置的 `github_client_id` 覆盖即可。
+安装器会装好最新的 **gh CLI**（GitHub 官方 apt 源），并让 git 访问 github.com 时向 gh 取凭据；授权后任务里的 `gh`、`git clone/push` 私有仓库都直接可用，令牌不写进任何配置文件。
 
-**Cloudflare 也走设备码流程，同样开箱即用。** 点「授权Cloudflare」后机器人给一条消息，链接里**已经带好了用户码**，你点进去只剩一个「允许」按钮，确认完机器人自己收到令牌并通知你。用的是 wrangler（Cloudflare 官方 CLI）的公开 client_id，不需要你去注册 OAuth 客户端。
+**Cloudflare 也走设备码流程。** 点「授权Cloudflare」后链接里已带好用户码，点进去只剩一个「允许」按钮。用的是 wrangler（Cloudflare 官方 CLI）的公开 client_id，申请它允许的**全部权限**：DNS 记录读写、Workers / Pages / D1 / KV / Queues / AI / Vectorize / 证书 / Access / 邮件路由等写权限，令牌到期前自动续期。用户码只有 **5 分钟**，过期就再发一次。
 
-有两点和 GitHub 不同，值得知道：用户码只有 **5 分钟**（GitHub 是 15 分钟），过期就再发一次；换回来的是 **OAuth 访问令牌**，约几天后过期，会附带 refresh_token，但当前版本不自动续期，过期后重新授权即可。
+wrangler 这个客户端拿不到站点设置、防火墙/WAF、账号成员等权限。需要这些时走**备选路径**：「手动填令牌」，到控制台「我的个人资料 → API 令牌 → 创建自定义令牌」勾选所需权限（要全部就逐项勾满），把整段令牌发给机器人。不接受账号密码和 Global API Key。
 
-如果只想要某个站点的最小权限、或者不想要会过期的令牌，走**备选路径**：菜单里的「云flare粘贴令牌」，到控制台「我的个人资料 → API 令牌」按需勾权限，把整段令牌发给机器人。不接受账号密码和 Global API Key。
+2026-10-26 之前做过的授权权限不全（GitHub 当时用的是会忽略权限范围的 GitHub App，Cloudflare 只申请了只读），「授权状态」会标出来；点「撤销授权」后重新授权一次即可。
 
 凭据去向：
 
