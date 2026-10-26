@@ -383,13 +383,43 @@ class ReplyFooterTests(unittest.TestCase):
     def test_duration_only_appears_when_started_is_known(self):
         bot.set_auth_channel('gateway', 'claude')
         self.assertNotIn('耗时', bot.execution_footer('claude'))
-        line = bot.execution_footer('claude', started=time.time() - 37)
+        line = bot.execution_footer('claude', started=time.monotonic() - 37)
         self.assertIn('耗时：37秒', line)
 
     def test_negative_duration_is_clamped_to_zero(self):
         # 机器时钟回拨会让耗时变成负数，显示「-3秒」比不显示更糟。
         bot.set_auth_channel('gateway', 'claude')
-        self.assertIn('耗时：0秒', bot.execution_footer('claude', started=time.time() + 60))
+        self.assertIn('耗时：0秒', bot.execution_footer('claude', started=time.monotonic() + 60))
+
+    def test_wall_clock_is_never_mixed_with_monotonic(self):
+        """monotonic 读数只能用 monotonic 减。
+
+        线上真实事故：把 time.time()（约 17 亿）减掉 monotonic 读数，
+        得出「耗时 1792918791 秒」直接显示给用户。这个用例就是钉住这条：
+        传一个 monotonic 读数进去，耗时必须是正常量级。
+        """
+        bot.set_auth_channel('gateway', 'claude')
+        line = bot.execution_footer('claude', started=time.monotonic() - 5)
+        self.assertIn('耗时：5秒', line)
+        # 再说一遍反向：绝不能出现六七位数以上的秒数。
+        digits = line.split('耗时：')[1].rstrip('秒').split('分')[0]
+        self.assertLess(int(digits), 600, '耗时算出了天文数字：' + line)
+
+    def test_wall_clock_fallback_for_persisted_tasks(self):
+        """拿不到 monotonic 时退回墙钟。任务状态从磁盘读回来就属于这种。"""
+        bot.set_auth_channel('gateway', 'claude')
+        line = bot.execution_footer('claude', started=None,
+                                    started_wall=time.time() - 42)
+        self.assertIn('耗时：42秒', line)
+
+    def test_elapsed_formatting(self):
+        self.assertEqual(bot.format_elapsed(0), '0秒')
+        self.assertEqual(bot.format_elapsed(59), '59秒')
+        self.assertEqual(bot.format_elapsed(60), '1分0秒')
+        self.assertEqual(bot.format_elapsed(134), '2分14秒')
+        self.assertEqual(bot.format_elapsed(3600), '1小时0分')
+        self.assertEqual(bot.format_elapsed(3780), '1小时3分')
+        self.assertEqual(bot.format_elapsed(-9), '0秒')
 
     def test_account_channel_shows_official_default_when_unset(self):
         # 账号模式没选模型时用的是官方默认，不能显示成网关那个模型名。
@@ -406,14 +436,14 @@ class ReplyFooterTests(unittest.TestCase):
 
     def test_gateway_reply_has_no_usage_line(self):
         bot.set_auth_channel('gateway', 'claude')
-        text = bot.reply_footer('claude', started=time.time() - 5)
+        text = bot.reply_footer('claude', started=time.monotonic() - 5)
         self.assertIn('执行器：Claude', text)
         self.assertNotIn('用量', text)
 
     def test_account_reply_puts_usage_on_its_own_line(self):
         bot.set_auth_channel('account', 'claude')
         with patch.object(bot, 'usage_footer_for', return_value='用量：5小时 剩余 75%'):
-            text = bot.reply_footer('claude', started=time.time() - 12)
+            text = bot.reply_footer('claude', started=time.monotonic() - 12)
         lines = text.split('\n')
         self.assertEqual(len(lines), 2)
         self.assertIn('执行器：Claude', lines[0])
@@ -424,7 +454,7 @@ class ReplyFooterTests(unittest.TestCase):
         # 用量读不到时执行摘要仍必须在：那是本地就能算出来的确定信息。
         bot.set_auth_channel('account', 'claude')
         with patch.object(bot, 'usage_footer_for', return_value=''):
-            text = bot.reply_footer('claude', started=time.time() - 3)
+            text = bot.reply_footer('claude', started=time.monotonic() - 3)
         self.assertIn('执行器：Claude', text)
         self.assertIn('耗时：3秒', text)
         self.assertEqual(text.count('\n'), 0)
