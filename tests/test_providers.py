@@ -16,8 +16,8 @@ from unittest.mock import patch
 
 import bot
 
-KEY = 'sk-test-0123456789abcdefWXYZ'
-NEW_KEY = 'sk-new-9876543210fedcbaQRST'
+KEY = 'testkey-0123456789abcdefWXYZ'
+NEW_KEY = 'testkey-9876543210fedcbaQRST'
 MODELS = [{'id': 'model-a', 'provider': 'x', 'tools': True}, {'id': 'model-b', 'provider': 'x', 'tools': True}]
 
 
@@ -32,7 +32,7 @@ class ProviderTest(unittest.TestCase):
         bot.MODEL_CACHE = self.folder / 'model-catalog.json'
         bot.AUTH_STATE = self.folder / 'auth-channel.json'
         self.env = patch.dict(os.environ, {'ANTHROPIC_BASE_URL': 'https://install.example.com',
-                                           'ANTHROPIC_API_KEY': 'sk-install-key-000000001111',
+                                           'ANTHROPIC_API_KEY': 'testkey-install-000000001111',
                                            'ANTHROPIC_AUTH_TOKEN': 'old-token', 'ANTHROPIC_MODEL': 'install-model'})
         self.env.start()
         self.sent, self.deleted = [], []
@@ -86,7 +86,7 @@ class ProviderTest(unittest.TestCase):
     def test_bad_key_is_not_saved(self):
         bot.start_provider_input(1, 'url')
         bot.provider_input(1, 'https://api.other.com')
-        self.assertTrue(bot.provider_input(1, 'sk-wrong-key-00000000000000'))
+        self.assertTrue(bot.provider_input(1, 'testkey-wrong-00000000000000'))
         self.assertEqual(len(bot.provider_list()), 1, '验证不过不能保存')
         self.assertTrue(any('验证没通过' in text for text in self.sent))
         self.assertIn(1, bot.PROVIDER_INPUT, '验证失败后仍可重发密钥')
