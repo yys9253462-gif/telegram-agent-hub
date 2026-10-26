@@ -260,13 +260,20 @@ class ConcurrencyTests(unittest.TestCase):
             for name in self.b.MODEL_PIN_VARS:
                 self.assertEqual(observed[index][1][name], 'model-' + str(index))
 
-    def test_stream_label_survives_edits_and_rate_limit_fallback(self):
+    def test_stream_label_survives_edits_and_rate_limit_backoff(self):
+        """流式编辑都带任务标签；遇到限流要退避后重试，而不是改成整段重发。
+
+        旧行为是「限流就 send_formatted 整段补一条」。改成后台发送器之后
+        这条路会**把同一段内容发两遍**：编辑本身最终会成功，再补一条整段
+        消息就是重复。正确的做法是退避，等窗口过去接着用编辑。
+        """
         task = self.c.enqueue(1, '输入摘要')
         for limited in (False, True):
             with self.subTest(limited=limited):
                 calls, sent = [], []
                 process = Mock(returncode=0)
                 bound = threading.Event()
+                limiter = {'remaining': 1 if limited else 0}
                 def write_prompt(value):
                     if not bound.is_set():
                         raise RuntimeError('写入前未登记进程')
@@ -274,9 +281,11 @@ class ConcurrencyTests(unittest.TestCase):
                 process.stdout = io.StringIO('{"type":"result","result":"测试结果"}\n')
                 def api(method, payload):
                     calls.append((method, payload))
-                    if method == 'editMessageText' and limited:
-                        raise urllib.error.HTTPError('https://example.invalid', 429, '限流', {},
-                                                     io.BytesIO(b'{"parameters":{"retry_after":60}}'))
+                    if method == 'editMessageText' and limiter['remaining'] > 0:
+                        limiter['remaining'] -= 1
+                        raise urllib.error.HTTPError(
+                            'https://example.invalid', 429, '限流', {},
+                            io.BytesIO(b'{"parameters":{"retry_after":0}}'))
                     return {'message_id': 1}
                 self.b.TASK_LOCAL.task = task
                 self.b.TASK_LOCAL.cancel = threading.Event()
@@ -299,9 +308,11 @@ class ConcurrencyTests(unittest.TestCase):
                 edits = [payload for method, payload in calls if method == 'editMessageText']
                 self.assertTrue(edits)
                 self.assertTrue(all(task['id'] in payload['text'] for payload in edits))
-                if limited:
-                    self.assertTrue(sent)
-                    self.assertTrue(all(task['id'] in text for text in sent))
+                # 限流不该退化成「再发一条整段」——那就是重复内容。
+                self.assertEqual(sent, [],
+                                 '限流后又整段补发了一条，用户会看到重复内容：' + str(sent))
+                # 最终答案仍然通过编辑呈现，且带标签。
+                self.assertIn('测试结果', edits[-1]['text'])
 
     def test_concurrency_environment_bounds(self):
         for raw, expected in [('0', 1), ('99', 6), ('2', 2), ('invalid', 3)]:

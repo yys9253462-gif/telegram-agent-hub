@@ -686,12 +686,22 @@ def set_account_model(engine, model):
 USAGE = UsageReporter(credential=usage_credential)
 
 
-def execution_footer(engine=None, started=None):
+def execution_footer(engine=None, started=None, started_wall=None):
     """会话底部那一行：执行器 · 模型 · 耗时，后面接用量。
 
     这些信息以前是靠入队时单独发一条「已加入队列」消息给出的，
     每轮对话多一条刷屏的噪音，而且用户要往上翻才知道这轮用了什么。
     现在统一压到最后一条回复的底部，与用量同行，翻到底就一目了然。
+
+    耗时的两个入参来自两个不同的时钟，**不能混用**：
+      - `started` 是 `time.monotonic()` 的读数，只在进程内存活期间有意义，
+        适合算差；
+      - `started_wall` 是 `time.time()` 的读数，是能跨进程存盘的墙钟时间。
+    这里优先用 monotonic 相减。只有拿不到 monotonic（比如任务状态是从磁盘
+    读回来的，那个读数已经不成立）时才退回墙钟。两者都不给就不显示耗时。
+
+    这个区分不是洁癖：线上真实事故是把 `time.time()` 减掉 monotonic 读数，
+    得出「耗时 1792918791 秒」——那是 unix 时间戳本身的大小。
     """
     engine = engine or current_engine()
     label = engine_spec(engine)['label']
@@ -700,9 +710,38 @@ def execution_footer(engine=None, started=None):
     else:
         model = current_model()
     parts = ['执行器：' + label, '模型：' + str(model)]
+    elapsed = None
     if started is not None:
-        parts.append('耗时：' + str(int(max(0, time.time() - started))) + '秒')
+        try:
+            elapsed = time.monotonic() - float(started)
+        except (TypeError, ValueError):
+            elapsed = None
+    if elapsed is None and started_wall is not None:
+        try:
+            elapsed = time.time() - float(started_wall)
+        except (TypeError, ValueError):
+            elapsed = None
+    if elapsed is not None:
+        parts.append('耗时：' + format_elapsed(elapsed))
     return ' · '.join(parts)
+
+
+def format_elapsed(seconds):
+    """把秒数写成「37秒」「2分14秒」「1小时3分」这类人读的时长。
+
+    负数一律当 0：墙钟会被 NTP 校准往回拨，算出来 -1 秒纯属时钟问题，
+    显示成一个负的耗时只会让人以为出错了。
+    """
+    try:
+        total = int(max(0, float(seconds)))
+    except (TypeError, ValueError):
+        total = 0
+    if total < 60:
+        return str(total) + '秒'
+    if total < 3600:
+        return str(total // 60) + '分' + str(total % 60) + '秒'
+    hours, rest = divmod(total, 3600)
+    return str(hours) + '小时' + str(rest // 60) + '分'
 
 
 def usage_footer_for(engine=None, force=False):
@@ -725,7 +764,7 @@ def usage_footer_for(engine=None, force=False):
         return ''
 
 
-def reply_footer(engine=None, started=None, force=False):
+def reply_footer(engine=None, started=None, force=False, started_wall=None):
     """回复末尾那一段：执行摘要一行 + 用量一行（有就读）。
 
     合并成一整块而不是两条消息：用户要的是「这条回复是谁产出、花了多久、
@@ -733,7 +772,7 @@ def reply_footer(engine=None, started=None, force=False):
     用量读不到时只留执行摘要——它是本地就能算出来的确定信息，不该因为
     用量接口失败而一起消失。
     """
-    lines = [execution_footer(engine, started)]
+    lines = [execution_footer(engine, started, started_wall)]
     usage = usage_footer_for(engine, force=force)
     if usage:
         lines.append(usage)
@@ -2103,6 +2142,15 @@ def engine_command(engine, text, instructions, chat, environment):
 # 留 3 倍余量（72000）既能完整覆盖最终上限，又给了流式预览足够的回看窗口。
 STREAM_CONTENT_CAP = 72000
 
+# 流式刷新的两个节奏。值不能拍脑袋定，得对着真实链路看：
+#   - Telegram 对同一聊天大约限 30 次/秒、对单条消息的编辑更严，
+#     250 毫秒（4 次/秒）离限流线很远，实测也不会被判 429；
+#   - 模型吐字本身通常几十毫秒一个 delta，250ms 一次意味着每次刷新
+#     能带出两三字以上——肉眼就是「连续往外冒」，不是整块蹦。
+# 正文没变化时没必要这么勤，放宽到 600 毫秒，只在状态文字上打转。
+STREAM_EDIT_MIN = 0.25      # 正文有新增时的最短刷新间隔（秒）
+STREAM_EDIT_IDLE = 0.6      # 仅有状态变化时的最短刷新间隔（秒）
+
 
 def append_content(state, chunk):
     """把新片段接到流式正文末尾，并把总量控制在 STREAM_CONTENT_CAP 以内。"""
@@ -2116,21 +2164,61 @@ def append_content(state, chunk):
 
 
 def parse_claude_event(event, state):
-    """解析 Claude/CodeBuddy 的 stream-json 事件，就地更新累积状态。"""
+    """解析 Claude/CodeBuddy 的 stream-json 事件，就地更新累积状态。
+
+    真实事件形态（生产抓包确认，不是照着文档猜的）：
+        {"type":"stream_event","event":{"type":"content_block_start",
+          "index":0,"content_block":{"type":"thinking",...}}}
+        {"type":"stream_event","event":{"type":"content_block_delta",
+          "index":0,"delta":{"type":"thinking_delta","thinking":"用户"}}}
+        {"type":"stream_event","event":{"type":"content_block_start",
+          "index":1,"content_block":{"type":"text","text":""}}}
+        {"type":"stream_event","event":{"type":"content_block_delta",
+          "index":1,"delta":{"type":"text_delta","text":"1"}}}
+
+    两个容易写错的地方：
+      1. **content_block 只在 content_block_start 里出现**，
+         delta 事件里没有 content_block 字段。所以不能靠 block 判断当前块。
+      2. **thinking 与 text 用的是不同的 delta 类型与字段名**：
+         thinking_delta → delta['thinking']，text_delta → delta['text']。
+         只认 text_delta 会让整段思考看起来什么都没发生。
+
+    这里把思考也记进 state['thinking']（只用于显示「正在思考」，
+    不混进正文，否则推理摘要会污染最终答案）。
+    """
     if event.get('type') == 'stream_event':
         stream = event.get('event', {})
-        block = stream.get('content_block', {})
-        if block.get('type') == 'text':
-            # 只在真正开启正文块时补段落分隔；工具块不触发。
-            append_content(state, start_text_block(state['content']))
-        elif block.get('type') == 'tool_use':
-            tool = str(block.get('name', '工具'))
-            state['activity'] = '正在执行工具：' + tool
-            record_tool(tool)
-        delta = stream.get('delta', {})
-        if delta.get('type') == 'text_delta':
-            append_content(state, delta.get('text', ''))
-            state['activity'] = '正在生成回复'
+        stream_type = stream.get('type')
+        block = stream.get('content_block') or {}
+        delta = stream.get('delta') or {}
+        if stream_type == 'content_block_start':
+            if block.get('type') == 'text':
+                # 只在真正开启正文块时补段落分隔；思考块与工具块都不触发。
+                append_content(state, start_text_block(state['content']))
+                state['activity'] = '正在生成回复'
+            elif block.get('type') == 'thinking':
+                state['activity'] = '正在思考'
+            elif block.get('type') == 'tool_use':
+                tool = str(block.get('name', '工具'))
+                state['activity'] = '正在执行工具：' + tool
+                record_tool(tool)
+        elif stream_type == 'content_block_delta':
+            kind = delta.get('type')
+            if kind == 'text_delta':
+                append_content(state, delta.get('text', ''))
+                state['activity'] = '正在生成回复'
+            elif kind == 'thinking_delta':
+                # 思考内容是推理摘要，不写进正文；但要记下来，
+                # 否则等待期间界面上什么都看不到，用户会以为卡住了。
+                thought = str(delta.get('thinking') or '')
+                if thought:
+                    state['thinking'] = (state.get('thinking', '') + thought)[-600:]
+                state['activity'] = '正在思考'
+            elif kind == 'input_json_delta':
+                # 工具参数是流式拼出来的 JSON 片段，逐片显示没有意义，
+                # 只更新活动提示，让用户知道还在动。
+                tool = str((state.get('tool_name') or '工具'))
+                state['activity'] = '正在准备工具参数：' + tool
     elif event.get('type') == 'assistant':
         for block in event.get('message', {}).get('content', []):
             if isinstance(block, dict) and block.get('type') == 'tool_use':
@@ -2225,43 +2313,92 @@ def run_stream(chat, text):
             events.put(None)
     threading.Thread(target=read_events, daemon=True).start()
     started = time.monotonic()
+    # 单调用 monotonic 算差（不受系统时间校准影响），墙钟那份只给
+    # 「跨进程/存盘后才读回来」的场景兜底。两个都取，避免混用。
+    started_wall = time.time()
     last_edit = 0
-    shown = initial
+    last_content_len = 0
+    block_finished = False
     state_kind = engine_spec(engine)['kind']
     # 把流式累积状态收进一个字典，两种协议的解析函数都只改这里，主循环读同一份。
-    state = {'content': '', 'final': None, 'activity': '等待模型响应', 'failed': ''}
+    state = {'content': '', 'final': None, 'activity': '等待模型响应', 'failed': '',
+             'thinking': ''}
     content = ''
     final = None
     activity = '等待模型响应'
-    update_after = 0
-    def edit(value):
-        nonlocal shown, last_edit, update_after
+
+    # ---- 后台发送器 ----
+    # 编辑走同步 api()，一次往返 100~600 毫秒。原来是在主循环里直接调用，
+    # 于是每次刷新都卡住主循环这么久；这期间读线程早把后面的事件全塞进
+    # 队列了，等 edit 返回、再取事件时已经是「一大段」——流式就此退化成
+    # 整块蹦出，而且模型吐字越快、积压越严重。
+    #
+    # 改成一个「只留最新一帧」的后台发送器：主循环只把最新预览丢进去就继续
+    # 处理事件，中间被覆盖的旧帧直接丢弃（反正它们下一秒就过时了）。
+    # 这样网络快慢只影响画面刷新率，不再影响正文累积的及时性。
+    frames = threading.Condition()
+    latest = {'value': None, 'closed': False}
+    send_state = {'shown': initial, 'hold_until': 0.0}
+
+    def sender():
+        while True:
+            with frames:
+                while latest['value'] is None and not latest['closed']:
+                    frames.wait(0.5)
+                if latest['closed'] and latest['value'] is None:
+                    return
+                value = latest['value']
+                latest['value'] = None
+            push_edit(value)
+
+    def push_edit(value):
         value = label + redact(value)
-        if value == shown or time.monotonic() < update_after:
+        if value == send_state['shown'] or not value.strip():
             return
-        # 空文本会被 Telegram 拒绝（400），直接跳过，避免无谓请求。
-        if not value.strip():
+        # 退避期内不发：反复撞限流只会让 Telegram 把窗口拉得更长。
+        if time.monotonic() < send_state.get('hold_until', 0):
             return
         # 单条文本上限 4000 字符（留出余量），超出必然 400，截断后再发。
         if len(value) > 4000:
             value = value[:4000]
         try:
-            api('editMessageText', {'chat_id': chat, 'message_id': message_id, 'text': render_reply(value), 'parse_mode': 'HTML'})
-            shown = value
+            api('editMessageText', {'chat_id': chat, 'message_id': message_id,
+                                    'text': render_reply(value), 'parse_mode': 'HTML'})
+            send_state['shown'] = value
         except urllib.error.HTTPError as exc:
-            data = {}
+            raw = {}
             try:
-                data = json.loads(exc.read())
+                raw = json.loads(exc.read())
             except Exception:
-                data = {}
-            # 只有真正的限流才退避等待；其他 400（格式错误等）不占用退避窗口，
-            # 否则每次失败都会白等数秒，导致后续更新被整体拖慢。
-            if exc.code == 429 or 'retry_after' in data.get('parameters', {}):
-                delay = data.get('parameters', {}).get('retry_after', 3)
-                update_after = time.monotonic() + delay
+                raw = {}
+            # 只有真正的限流才退避等待；其他 400 不占用退避窗口。
+            # 退避状态放在 send_state 里，主循环与后台线程共用同一份。
+            if exc.code == 429 or 'retry_after' in (raw.get('parameters') or {}):
+                delay = (raw.get('parameters') or {}).get('retry_after', 3)
+                send_state['hold_until'] = time.monotonic() + delay
         except Exception:
-            update_after = time.monotonic() + 3
-        last_edit = time.monotonic()
+            send_state['hold_until'] = time.monotonic() + 3
+
+    sender_thread = threading.Thread(target=sender, daemon=True)
+    sender_thread.start()
+
+    def edit(value):
+        """只负责「登记最新一帧」，不在这里等网络。"""
+        with frames:
+            latest['value'] = value
+            frames.notify()
+
+    def close_sender():
+        """收尾：把最后一帧发完再退出，避免最后几个字丢掉。
+
+        幂等：正常路径调一次，finally 里再调一次兜底，第二次直接返回。
+        """
+        with frames:
+            if not latest['closed']:
+                latest['closed'] = True
+                frames.notify()
+        if sender_thread.is_alive():
+            sender_thread.join(timeout=6)
     try:
         if stdin_text:
             # 先登记进程，再写入；停止或关闭可终止因管道写满而阻塞的任务。
@@ -2291,16 +2428,48 @@ def run_stream(chat, text):
                     parse_codex_event(event, state)
                 else:
                     parse_claude_event(event, state)
+                # 一段正文收尾时要立刻结算一次：否则最后几个字可能因为
+                # 没赶上刷新窗口而一直不显示，直到下一段开头才一起冒出来。
+                inner = event.get('event') or {}
+                if (event.get('type') == 'stream_event'
+                        and inner.get('type') == 'content_block_stop'):
+                    block_finished = True
                 content = state['content']
                 activity = state['activity']
                 final = state['final']
-            interval = 1.0 if activity == '正在生成回复' else 2.0
-            if time.monotonic() - last_edit >= interval:
-                seconds = int(time.monotonic() - started)
+            # 节流从「固定 1~2 秒」改成「按实际产出快慢自适应」。
+            #
+            # 原来的写法有个不易察觉的后果：真实流式里一段正文往往只持续
+            # 零点几秒（生产实测三段分别是 0.36s / 0.49s / 4.88s，中间隔着
+            # 工具执行的几秒停顿），全部短于 1 秒的刷新间隔——于是这一段
+            # 从头到尾一次都没刷过，等下次刷新时它已经是完整的一段了。
+            # 界面上就是「咔嚓一下整块出现」，看着完全不像流式。
+            #
+            # 现在的节奏：
+            #   - 正文有新增 → 最快 STREAM_EDIT_MIN 一次，让字真的往外冒；
+            #   - 只有状态在变（思考/换工具）→ 放宽到 STREAM_EDIT_IDLE，
+            #     这类更新本来就不需要那么频繁，也能省下编辑配额；
+            #   - 一段正文结束（content_block_stop）→ 立即结算一次，
+            #     保证每段都以完整形态定格，不会停在半句话上。
+            now = time.monotonic()
+            grew = len(content) > last_content_len
+            interval = STREAM_EDIT_MIN if grew else STREAM_EDIT_IDLE
+            settled = block_finished and len(content) > last_content_len
+            if settled or now - last_edit >= interval:
+                last_edit = now
+                last_content_len = len(content)
+                block_finished = False
+                seconds = int(now - started)
                 progress = activity + ' · 已运行' + str(seconds) + '秒'
                 # 预览同样压缩空行，避免流式过程中气泡被空行撑高。
                 clean_content = tidy_stream_text(content)
                 preview = clean_content if len(clean_content) <= 1800 else '（显示最新生成内容）\n' + clean_content[-1800:]
+                if not preview:
+                    # 正文还没开始（思考阶段）。这时候别只留一行进度，
+                    # 把最近一小段思考摆出来，让「正在思考」有实感。
+                    thought = tidy_stream_text(str(state.get('thinking') or ''))
+                    if thought:
+                        preview = '（思考中）' + thought[-300:].replace('\n', ' ')
                 edit((preview + '\n\n' if preview else '') + progress)
         process.wait(timeout=10)
         answer = (final or {}).get('result') or content or '任务未返回内容，请检查模型接口。'
@@ -2320,20 +2489,27 @@ def run_stream(chat, text):
         answer = redact(answer[:24000])
         # 末尾统一压一段：执行器、模型、耗时 + 用量（账号渠道才有）。
         # 这几项以前分散在入队消息与「查看进度」里，用户要翻上翻下才拼得出来。
-        footer = reply_footer(engine, started)
+        # started 是 monotonic 读数，只有它在这次进程里算得对；墙钟那份交给
+        # started_wall 兜底，两者不能互相顶替。
+        footer = reply_footer(engine, started, started_wall=started_wall)
         if footer:
             answer = answer + '\n\n' + footer
         pieces = split_message(answer)
         head = pieces[0] if pieces else answer
-        if time.monotonic() < update_after:
-            # 上一次编辑被限流，直接按分片整段发送，避免重复编辑再被拒。
-            send_formatted(chat, label + answer)
-        else:
-            edit(head)
-            # 首片已通过编辑消息呈现，其余分片补发；不论首片是否编辑成功都要补。
-            for piece in pieces[1:]:
-                send_formatted(chat, label + piece)
+        # 先把最终答案交给后台发送器，等它把这一帧发完再决定要不要补发分片。
+        # 这里必须等一次：不等的话，尾部的执行摘要可能在分片消息之后才到达，
+        # 顺序就乱了（用户看到「结果 → 摘要 → 结果的后半段」）。
+        edit(head)
+        close_sender()
+        # 首片已通过编辑消息呈现，其余分片补发。
+        for piece in pieces[1:]:
+            send_formatted(chat, label + piece)
     finally:
+        # 异常路径也要把发送线程收干净，否则它会一直挂在条件变量上。
+        try:
+            close_sender()
+        except Exception:
+            pass
         terminate_process(process)
         unbind_process(process)
         # 读线程会一直阻塞在 for line in process.stdout 上，进程结束后管道到达 EOF，
