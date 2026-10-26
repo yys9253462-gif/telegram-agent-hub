@@ -26,7 +26,27 @@ def format_elapsed(seconds):
     return str(hours) + '小时' + str(rest // 60) + '分'
 
 
+# 结构标记：bot.py 拼回复时用它们标出「任务标题」「进度行」「执行信息」三种块，
+# render_reply 据此套样式。用不可见分隔符包住，正常文字里不会出现；纯文本兜底时剥掉。
+TITLE_MARK = '\u2063title\u2063'
+PROGRESS_MARK = '\u2063progress\u2063'
+FOOTER_MARK = '\u2063footer\u2063'
+MARKS = (TITLE_MARK, PROGRESS_MARK, FOOTER_MARK)
+
+
+def strip_marks(text):
+    for mark in MARKS:
+        text = text.replace(mark + '\n', '').replace(mark, '')
+    return text
+
+
 def render_reply(text):
+    """把模型的 Markdown 风格正文转成电报 HTML，并给各层套上能区分的样式：
+
+    - 任务标题：📌 加粗；正文标题：一二级 🟦、三级以下 🔹，加粗；
+    - 进度行：⏳ 斜体；执行信息与用量：可折叠引用块（彩色竖条，点开看全部）；
+    - 正文里的 > 引用：引用块；- / * 列表：• ；带语言的代码块：语法高亮。
+    """
     def inline(value):
         tokens = re.split(r'(`[^`\n]+`|\*\*[^*\n]+\*\*|\[[^\]\n]+\]\(https?://[^\s)]+\))', value)
         output = []
@@ -42,33 +62,72 @@ def render_reply(text):
                 else:
                     output.append(html.escape(token))
         return ''.join(output)
+
     output = []
     code = []
     fence = None
+    language = ''
+    quote = []
+    footer = None
+
+    def flush_quote():
+        if quote:
+            output.append('<blockquote>' + '\n'.join(quote) + '</blockquote>')
+            quote.clear()
+
     for line in text.splitlines():
         stripped = line.lstrip()
+        if footer is not None:
+            if stripped:
+                footer.append(inline(line))
+            continue
         if stripped.startswith(('```', '~~~')):
             mark = stripped[:3]
             if fence is None:
+                flush_quote()
                 fence = mark
                 code = []
+                language = re.sub(r'[^A-Za-z0-9_+-]', '', stripped[3:].strip())[:20]
                 continue
             if mark == fence:
-                output.append('<pre>' + html.escape('\n'.join(code)) + '</pre>')
+                body = html.escape('\n'.join(code))
+                output.append('<pre><code class="language-' + language + '">' + body + '</code></pre>'
+                              if language else '<pre>' + body + '</pre>')
                 fence = None
                 continue
         if fence is not None:
             code.append(line)
             continue
-        heading = re.match(r'^#{1,6}\s+(.+)', stripped)
+        if stripped == FOOTER_MARK:
+            flush_quote()
+            footer = []
+            continue
+        if stripped.startswith('>'):
+            quote.append(inline(stripped[1:].lstrip()))
+            continue
+        flush_quote()
+        if stripped.startswith(TITLE_MARK):
+            output.append('<b>📌 ' + inline(stripped[len(TITLE_MARK):]) + '</b>')
+            continue
+        if stripped.startswith(PROGRESS_MARK):
+            output.append('<i>⏳ ' + inline(stripped[len(PROGRESS_MARK):]) + '</i>')
+            continue
+        heading = re.match(r'^(#{1,6})\s+(.+)', stripped)
         if heading:
-            output.append('<b>' + inline(heading[1]) + '</b>')
+            icon = '🟦 ' if len(heading[1]) <= 2 else '🔹 '
+            output.append(icon + '<b>' + inline(heading[2]) + '</b>')
         elif re.fullmatch(r'[-*_]{3,}', stripped):
             output.append('────────────')
+        elif re.match(r'^[-*]\s+\S', stripped):
+            indent = '  ' * min(3, (len(line) - len(stripped)) // 2)
+            output.append(indent + '• ' + inline(stripped[1:].lstrip()))
         else:
             output.append(inline(line))
+    flush_quote()
     if fence is not None:
         output.append('<pre>' + html.escape('\n'.join(code)) + '</pre>')
+    if footer:
+        output.append('<blockquote expandable>' + '\n'.join(footer) + '</blockquote>')
     return '\n'.join(output).strip() or '正在生成…'
 
 
@@ -158,6 +217,7 @@ def clamp_rendered(pieces):
 
 
 def clean_reply(text):
+    text = strip_marks(text)
     lines = []
     fenced = False
     marker = ''

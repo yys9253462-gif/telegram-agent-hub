@@ -28,7 +28,7 @@ import github_auth
 from github_auth import LoginManager, UsageReporter, usage_footer, usage_line, usage_merge
 from credentials import PROVIDERS, CredentialStore, fingerprint, looks_like
 # 纯文本处理（排版、切片、脱敏、耗时格式）已拆到 textfmt.py。
-from textfmt import (RENDER_LIMIT, clamp_rendered, clean_reply, format_elapsed, redact, register_secret, render_reply, split_message, tidy_stream_text)
+from textfmt import (FOOTER_MARK, PROGRESS_MARK, RENDER_LIMIT, TITLE_MARK, clamp_rendered, clean_reply, format_elapsed, redact, register_secret, render_reply, split_message, strip_marks, tidy_stream_text)
 
 # 导入模块不读取认证信息、不创建目录、不启动网络请求。
 TOKEN = ''
@@ -2654,7 +2654,7 @@ def stream_interval(elapsed, grew):
 
 def stream_preview(content, thinking, activity, elapsed):
     """流式过程中气泡里显示的那一帧：最新正文（或思考片段）+ 进度行。"""
-    progress = activity + ' · 已运行' + str(int(elapsed)) + '秒'
+    progress = PROGRESS_MARK + activity + ' · 已运行' + str(int(elapsed)) + '秒'
     # 预览同样压缩空行，避免流式过程中气泡被空行撑高。
     clean_content = tidy_stream_text(content)
     preview = clean_content if len(clean_content) <= 1800 else '（显示最新生成内容）\n' + clean_content[-1800:]
@@ -2798,12 +2798,15 @@ class StreamMessage:
 
 def run_stream(chat, text):
     task = getattr(TASK_LOCAL, 'task', None)
-    label = ('任务 ' + task['id'] + ' · ' + redact(text).replace('\n', ' ')[:80] + '\n') if task else ''
+    label = (TITLE_MARK + '任务 ' + task['id'] + ' · ' + redact(text).replace('\n', ' ')[:80] + '\n') if task else ''
     engine = current_engine()
     # 开头就说清这轮是谁在跑：执行器与模型在任务开始时就已确定，
     # 不必等结束才告诉用户。耗时在结束时补进同一条消息的末尾。
     initial = label + execution_footer(engine) + '\n已接收，正在生成…'
-    status = api('sendMessage', {'chat_id': chat, 'text': initial})
+    try:
+        status = api('sendMessage', {'chat_id': chat, 'text': render_reply(initial), 'parse_mode': 'HTML'})
+    except urllib.error.HTTPError:
+        status = api('sendMessage', {'chat_id': chat, 'text': strip_marks(initial)})
     message_id = status['message_id']
     instructions = agent_instructions()
     history = task['snapshot'].get('handoff', []) if task else []
@@ -2926,7 +2929,7 @@ def run_stream(chat, text):
             if state['failed'] and answer in ('', '任务未返回内容，请检查模型接口。'):
                 # 整轮失败且没有正文时，把失败原因直接给出来，比一句「未返回内容」有用得多。
                 answer = state['failed']
-            answer = '本轮执行未成功。\n' + answer + '\n' + failure_hint(state['failed'] or answer) + '已执行的操作不会自动回滚，请先核对结果。'
+            answer = '❌ **本轮执行未成功**\n' + answer + '\n' + failure_hint(state['failed'] or answer) + '已执行的操作不会自动回滚，请先核对结果。'
         if crashed and session_history_incompatible(state['failed'] or answer):
             state['session_invalid'] = True
         if state.get('session_invalid'):
@@ -2949,7 +2952,8 @@ def run_stream(chat, text):
         # started_wall 兜底，两者不能互相顶替。
         footer = reply_footer(engine, started, started_wall=started_wall)
         if footer:
-            answer = answer + '\n\n' + footer
+            # 执行信息与用量放进可折叠引用块，和正文分开（见 textfmt.FOOTER_MARK）。
+            answer = answer + '\n\n' + FOOTER_MARK + '\n' + footer
         pieces = split_message(answer)
         head = pieces[0] if pieces else answer
         # 先把最终答案交给后台发送器，等它把这一帧发完再决定要不要补发分片。
