@@ -141,9 +141,11 @@ def api(method, payload, retries=None):
 # 配置和授权入口使用消息内联按钮，首页底部键盘保持六项常用操作。
 KEYBOARD = {
     'keyboard': [
-        ['新任务', '当前任务'],
-        ['停止', '服务器状态'],
-        ['设置', '更多'],
+        # 「开始任务」只是一句说明（直接发消息就是开始任务），换成更常用的会话操作；
+        # 授权管理收进设置里的「平台授权」分类。
+        ['当前任务', '停止'],
+        ['新建会话', '压缩上下文'],
+        ['服务器状态', '设置'],
     ],
     'resize_keyboard': True,
     'is_persistent': True,
@@ -158,8 +160,6 @@ MENU_GROUPS = {
         '会话与文件': ['新建会话', '会话列表', '压缩上下文'],
         '账号登录': ['登录Claude', '登录CodeBuddy', '登录Codex', '退出账号', '账号状态', '渠道切换'],
         '版本更新': ['检查版本', '更新机器人'],
-    },
-    '更多': {
         '平台授权': ['授权GitHub', '授权Cloudflare', '授权状态', '撤销授权'],
     },
 }
@@ -209,6 +209,10 @@ MENU_LABELS = {
     '返回主菜单': '返回首页',
 }
 ALIASES.update({label: command for command, label in MENU_LABELS.items()})
+# 底部常驻键盘的文案单独一张表：带图标更好认，又不影响内联菜单标题里的「模型与会话」等叫法。
+HOME_LABELS = {'当前任务': '📋 任务进度', '停止': '⏹ 停止任务', '新建会话': '💬 新会话',
+               '压缩上下文': '🗜 压缩上下文', '服务器状态': '🖥 主机状态', '设置': '⚙️ 设置'}
+ALIASES.update({label: command for command, label in HOME_LABELS.items()})
 
 GROUP_DESCRIPTIONS = {
     '任务与模型': '选择执行目标、模型和智能体，管理待办任务。',
@@ -226,7 +230,7 @@ GROUP_DESCRIPTIONS = {
 def menu_keyboard():
     """统一渲染首页按钮，内部命令常量保持不变。"""
     return {**KEYBOARD, 'keyboard': [
-        [MENU_LABELS.get(label, label) for label in row]
+        [HOME_LABELS.get(label, MENU_LABELS.get(label, label)) for label in row]
         for row in KEYBOARD['keyboard']]}
 
 
@@ -239,7 +243,7 @@ def home_menu_text():
             '会话状态  ·  ' + ('继续当前会话' if session_id() else '准备开始') + '\n'
             '────────────────\n'
             '直接发送文字、语音或图片开始任务。\n'
-            '查看进度了解执行情况，模型与会话调整工作方式。')
+            '任务进度看执行情况，设置里调整模型、会话、账号和授权。')
 
 
 MENU_STATE = WORK / 'menu-visible.json'
@@ -2474,7 +2478,8 @@ def quick_action(chat, text):
     elif text in ('设置', '更多设置', '/settings'):
         send_group_menu(chat, group_title('设置', '设置'), MENU_GROUPS['设置'])
     elif text == '更多':
-        send_group_menu(chat, group_title('更多', '更多'), MENU_GROUPS['更多'])
+        # 旧键盘上的「授权管理」：已并入设置，直接打开平台授权分类。
+        expand_group(chat, '平台授权')
     elif expand_group(chat, text):
         # 分组名展开：命中并已渲染。
         pass
@@ -4594,7 +4599,7 @@ class TaskController:
 
     @on_text('更多')
     def _cmd_更多(self, chat, text, update_id):
-        send_group_menu(chat, group_title('更多', '更多'), MENU_GROUPS['更多'])
+        expand_group(chat, '平台授权')
 
     @on_text('登录Claude', '登录 Claude', '/login')
     def _cmd_登录Claude(self, chat, text, update_id):
