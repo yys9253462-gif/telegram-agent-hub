@@ -619,9 +619,9 @@ class MenuEntryTest(unittest.TestCase):
     """缺陷：菜单里有按钮但没分支，点下去毫无反应。"""
 
     def test_provider_group_present(self):
-        self.assertIn('平台授权', bot.MENU_GROUPS['更多'])
+        self.assertIn('平台授权', bot.MENU_GROUPS['设置'])
         for label in ('授权GitHub', '授权Cloudflare', '授权状态', '撤销授权'):
-            self.assertIn(label, bot.MENU_GROUPS['更多']['平台授权'])
+            self.assertIn(label, bot.MENU_GROUPS['设置']['平台授权'])
 
     def test_cloudflare_paste_entry_present(self):
         """粘贴令牌这条路必须仍然可达，否则只想要单站点最小权限的机主无路可走。"""
@@ -629,7 +629,7 @@ class MenuEntryTest(unittest.TestCase):
         self.assertIn("@on_text('云flare粘贴令牌')", Path(bot.__file__).read_text(encoding='utf-8'))
 
     def test_aliases_point_to_real_buttons(self):
-        labels = set(bot.MENU_GROUPS['更多']['平台授权'])
+        labels = set(bot.MENU_GROUPS['设置']['平台授权'])
         for alias in ('/gh', '/cf', '/auth'):
             self.assertIn(bot.ALIASES[alias], labels)
 

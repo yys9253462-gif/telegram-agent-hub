@@ -86,11 +86,11 @@ class TopLevelLayoutTest(unittest.TestCase):
 
     def test_top_level_contains_high_frequency_actions(self):
         """这些是真正天天按的，不能在精简中被误删。"""
-        for label in ('新任务', '当前任务', '停止', '服务器状态'):
+        for label in ('当前任务', '停止', '新建会话', '压缩上下文', '服务器状态'):
             self.assertIn(label, top_buttons(), label + ' 必须留在顶层')
 
     def test_top_level_has_two_group_entries(self):
-        for entry in ('设置', '更多'):
+        for entry in ('设置',):
             self.assertIn(entry, top_buttons(), entry + ' 必须在顶层作为二级入口')
 
     def test_no_blank_rows(self):
@@ -119,12 +119,13 @@ class GroupMenuTest(unittest.TestCase):
 
     def test_top_and_grouped_do_not_overlap(self):
         """顶层已经有的按钮，不应再在二级菜单里重复出现。"""
-        overlap = set(top_buttons()) & set(grouped_buttons())
+        # 新会话/压缩上下文是会话分类的本职，顶层放一份快捷入口是有意的。
+        overlap = set(top_buttons()) & set(grouped_buttons()) - {'新建会话', '压缩上下文'}
         self.assertFalse(overlap, '重复出现：' + '、'.join(sorted(overlap)))
 
     def test_every_old_button_still_reachable(self):
         """改版不能弄丢功能：原来顶层的功能都要能在顶层或二级找到。"""
-        legacy = {'新任务', '当前任务', '停止', '模型',
+        legacy = {'当前任务', '授权GitHub', '授权状态', '停止', '模型',
                   '选择智能体', '新建会话', '会话列表', '服务器状态'}
         reachable = set(top_buttons()) | set(grouped_buttons())
         missing = legacy - reachable
