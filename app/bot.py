@@ -154,7 +154,7 @@ KEYBOARD = {
 # 保留分组常量兼容旧入口，展示时直接平铺各组功能。
 MENU_GROUPS = {
     '设置': {
-        '任务与模型': ['模型', '选择智能体'],
+        '任务与模型': ['模型', '模型供应商', '选择智能体'],
         '会话与文件': ['新建会话', '会话列表'],
         '账号登录': ['登录Claude', '登录CodeBuddy', '登录Codex', '退出账号', '账号状态', '渠道切换', '账号模型'],
         '版本更新': ['检查版本', '更新机器人'],
@@ -339,7 +339,7 @@ def session_id():
         return task['snapshot'].get('session_id')
     if CONTROL is not None:
         session = CONTROL.active_session()
-        return stored_session(session, current_engine(), auth_channel(current_engine()))
+        return stored_session(session, current_engine(), session_channel())
     try:
         return json.loads(SESSION_STATE.read_text()).get('session_id')
     except (OSError, ValueError):
@@ -374,6 +374,151 @@ def clear_session():
 
 MODEL_STATE = WORK / 'selected-model.json'
 MODEL_CACHE = WORK / 'model-catalog.json'
+
+PROVIDER_STATE = WORK / 'providers.json'
+# 安装时写进服务环境变量的那一家。它没有存进 providers.json，
+# 但可以在这里覆盖密钥（overrides），所以在菜单里和其它供应商一样能换密钥。
+BUILTIN_PROVIDER = 'builtin'
+PROVIDER_LOCK = threading.RLock()
+
+
+def provider_state():
+    """读供应商记录：{'active': id, 'items': {id: {...}}}。缺失或损坏当成只有内置一家。"""
+    try:
+        data = json.loads(PROVIDER_STATE.read_text())
+    except (OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    items = data.get('items') if isinstance(data.get('items'), dict) else {}
+    active = data.get('active') if data.get('active') in items or data.get('active') == BUILTIN_PROVIDER else BUILTIN_PROVIDER
+    return {'active': active, 'items': items}
+
+
+def save_provider_state(state):
+    # atomic_json 以 0600 落盘：这个文件里有密钥原文。
+    atomic_json(PROVIDER_STATE, state)
+
+
+def active_provider_id():
+    task = getattr(TASK_LOCAL, 'task', None)
+    if task:
+        return task['snapshot'].get('provider', BUILTIN_PROVIDER)
+    return provider_state()['active']
+
+
+def provider_record(provider_id=None):
+    """某家供应商的完整配置：名称、地址、密钥、上次选的模型。内置那家从环境变量补齐。"""
+    provider_id = provider_id or active_provider_id()
+    state = provider_state()
+    stored = dict(state['items'].get(provider_id) or {})
+    if provider_id == BUILTIN_PROVIDER:
+        return {'id': BUILTIN_PROVIDER, 'name': stored.get('name') or '安装时配置',
+                'base_url': stored.get('base_url') or os.environ.get('ANTHROPIC_BASE_URL', ''),
+                'api_key': stored.get('api_key') or os.environ.get('ANTHROPIC_API_KEY', ''),
+                'model': stored.get('model') or os.environ.get('ANTHROPIC_MODEL', 'auto'),
+                'overridden': bool(stored.get('api_key'))}
+    if not stored:
+        return None
+    stored['id'] = provider_id
+    return stored
+
+
+def provider_list():
+    state = provider_state()
+    ids = [BUILTIN_PROVIDER] + [key for key in state['items'] if key != BUILTIN_PROVIDER]
+    return [provider_record(key) for key in ids]
+
+
+def key_tail(value):
+    """密钥只露最后四位，够认出是哪一枚，不够拿去用。"""
+    value = str(value or '')
+    return ('…' + value[-4:]) if len(value) > 8 else '已设置' if value else '未设置'
+
+
+def normalize_base_url(text):
+    value = str(text or '').strip().rstrip('/')
+    if value.endswith('/v1'):
+        value = value[:-3].rstrip('/')
+    parsed = urllib.parse.urlsplit(value)
+    if parsed.scheme != 'https' and not (parsed.scheme == 'http' and parsed.hostname in ('127.0.0.1', 'localhost')):
+        raise MediaError('地址必须是 https:// 开头（本机调试可用 http://127.0.0.1）。')
+    if not parsed.hostname or parsed.query or parsed.fragment or parsed.username:
+        raise MediaError('地址格式不对，形如 https://api.example.com（不带 /v1）。')
+    return value
+
+
+def fetch_provider_models(base_url, api_key):
+    """用这对地址+密钥拉一次模型目录，顺便验证密钥。失败抛 MediaError，带人能看懂的原因。"""
+    request = urllib.request.Request(base_url.rstrip('/') + '/v1/models', headers={
+        'Authorization': 'Bearer ' + api_key, 'x-api-key': api_key,
+        'anthropic-version': '2023-06-01', 'Accept': 'application/json'})
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            data = json.load(response)
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            raise MediaError('密钥无效或没有权限（HTTP ' + str(exc.code) + '）。') from None
+        raise MediaError('供应商接口返回 HTTP ' + str(exc.code) + '，请确认地址是否正确。') from None
+    except (urllib.error.URLError, OSError, TimeoutError):
+        raise MediaError('连不上这个地址，请检查地址或服务器网络。') from None
+    except ValueError:
+        raise MediaError('这个地址返回的不是模型目录，请确认它兼容 Anthropic 或 OpenAI 接口。') from None
+    items = data.get('data') if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        raise MediaError('这个地址返回的不是模型目录，请确认它兼容 Anthropic 或 OpenAI 接口。')
+    models = list({item['id']: {'id': item['id'], 'provider': item.get('owned_by', '未标注'),
+                   'tools': item.get('supports_tool_call')}
+                   for item in items if isinstance(item, dict) and item.get('id')}.values())
+    if not models:
+        raise MediaError('这个供应商的模型目录是空的。')
+    return models
+
+
+def model_cache_path(provider_id=None):
+    provider_id = provider_id or active_provider_id()
+    if provider_id == BUILTIN_PROVIDER:
+        return MODEL_CACHE
+    return WORK / ('model-catalog-' + provider_id + '.json')
+
+
+def session_channel(engine=None, channel=None, provider=None):
+    """会话绑定的「后端身份」。
+
+    接口密钥渠道下换了供应商，背后就是另一家模型服务，旧会话的历史可能被拒收
+    （和换渠道是同一个问题），所以供应商也要算进来。内置供应商仍记成 gateway，
+    与旧记录兼容。
+    """
+    engine = engine or current_engine()
+    channel = channel or auth_channel(engine)
+    if channel == 'account':
+        return 'account'
+    provider = provider or active_provider_id()
+    return 'gateway' if provider == BUILTIN_PROVIDER else 'gateway:' + provider
+
+
+def remember_provider_model(model):
+    with PROVIDER_LOCK:
+        state = provider_state()
+        state['items'].setdefault(state['active'], {})['model'] = model
+        save_provider_state(state)
+
+
+def switch_provider(provider_id):
+    """切到另一家：记下当前模型，换回那一家上次用的模型。"""
+    with PROVIDER_LOCK:
+        state = provider_state()
+        if provider_id != BUILTIN_PROVIDER and provider_id not in state['items']:
+            raise MediaError('没有这个供应商。')
+        old = state['active']
+        state['items'].setdefault(old, {})['model'] = current_model()
+        state['active'] = provider_id
+        save_provider_state(state)
+        model = provider_record(provider_id).get('model') or ''
+        if model:
+            atomic_json(MODEL_STATE, {'model': model})
+        return model
+
 
 def current_model():
     task = getattr(TASK_LOCAL, 'task', None)
@@ -778,7 +923,9 @@ def model_label(engine=None, channel=None, gateway_model=None):
     channel = channel or auth_channel(engine)
     if channel == 'account':
         return engine_spec(engine)['label'] + ' · 账号 · ' + (account_model(engine) or '官方默认')
-    return engine_spec(engine)['label'] + ' · 接口密钥 · ' + str(gateway_model or current_model())
+    record = provider_record() or {}
+    name = record.get('name') if record.get('id') != BUILTIN_PROVIDER else '接口密钥'
+    return engine_spec(engine)['label'] + ' · ' + (name or '接口密钥') + ' · ' + str(gateway_model or current_model())
 
 
 def execution_footer(engine=None, started=None, started_wall=None):
@@ -1361,6 +1508,99 @@ def pending_token(chat):
     return True
 
 
+PROVIDER_INPUT = {}
+PROVIDER_INPUT_TTL = 300
+
+
+def start_provider_input(chat, step, provider_id=None, base_url=None):
+    PROVIDER_INPUT[chat] = {'step': step, 'provider': provider_id, 'base_url': base_url,
+                            'expires': time.monotonic() + PROVIDER_INPUT_TTL}
+
+
+def cancel_provider_input(chat):
+    return PROVIDER_INPUT.pop(chat, None) is not None
+
+
+def provider_input(chat, text):
+    """在等供应商地址或密钥时，把这条文字当成输入。返回 True 表示已处理。"""
+    pending = PROVIDER_INPUT.get(chat)
+    if not pending:
+        return False
+    if pending['expires'] < time.monotonic():
+        PROVIDER_INPUT.pop(chat, None)
+        return False
+    value = text.strip()
+    # 不像地址/密钥的文字（一句话、带空格或中文）照常当任务处理，不能被吞掉，
+    # 更不能把机主的任务消息当成密钥删掉。等待态保留到超时或取消。
+    if pending['step'] == 'url' and not value.lower().startswith(('http://', 'https://')):
+        return False
+    if pending['step'] == 'key' and (len(value) < 16 or any(ch.isspace() or ord(ch) > 127 for ch in value)):
+        return False
+    if pending['step'] == 'url':
+        try:
+            base_url = normalize_base_url(value)
+        except MediaError as exc:
+            send(chat, str(exc) + '\n重新发送地址，或发「取消」放弃。')
+            return True
+        start_provider_input(chat, 'key', base_url=base_url)
+        send(chat, '地址：' + base_url + '\n\n第 2 步：发送这家的 API 密钥。\n发出后我会立刻删除那条消息，密钥不会留在聊天记录里。')
+        return True
+    # 第二步：密钥。不管成败都先删消息，密钥不留在聊天记录里。
+    deleted = delete_incoming(chat)
+    record = provider_record(pending['provider']) if pending['provider'] else None
+    base_url = pending['base_url'] or (record or {}).get('base_url', '')
+    send(chat, '正在用这枚密钥连接 ' + base_url + ' 验证…')
+    try:
+        models = fetch_provider_models(base_url, value)
+    except MediaError as exc:
+        send(chat, '验证没通过：' + str(exc) + '\n可以重新发送密钥，或发「取消」放弃。')
+        return True
+    PROVIDER_INPUT.pop(chat, None)
+    with PROVIDER_LOCK:
+        state = provider_state()
+        if pending['provider']:
+            provider_id = pending['provider']
+            entry = state['items'].setdefault(provider_id, {})
+            entry['api_key'] = value
+            if provider_id == BUILTIN_PROVIDER:
+                entry['base_url'] = base_url
+            action = '密钥已更换'
+        else:
+            provider_id = uuid.uuid4().hex[:8]
+            host = urllib.parse.urlsplit(base_url).hostname or base_url
+            names = {item.get('name') for item in state['items'].values()}
+            name = host if host not in names else host + ' ' + provider_id[:4]
+            state['items'][provider_id] = {'name': name, 'base_url': base_url, 'api_key': value, 'model': ''}
+            action = '已添加供应商「' + name + '」'
+        save_provider_state(state)
+    atomic_json(model_cache_path(provider_id), models)
+    note = '' if deleted else '\n（没能自动删除密钥消息，请手动删掉那条。）'
+    name = provider_record(provider_id)['name']
+    if provider_id == active_provider_id():
+        send(chat, action + '，验证通过，共 ' + str(len(models)) + ' 个模型。新任务立即使用新密钥。' + note)
+    else:
+        send_options(chat, action + '，验证通过，共 ' + str(len(models)) + ' 个模型。' + note,
+                     ['使用供应商 ' + name, '模型供应商'])
+    return True
+
+
+def provider_overview():
+    active = active_provider_id()
+    lines = ['模型供应商（接口密钥渠道使用）', '']
+    for item in provider_list():
+        mark = '▶ ' if item['id'] == active else '　 '
+        lines.append(mark + item['name'] + '\n　 ' + (item.get('base_url') or '未设置地址')
+                     + ' · 密钥 ' + key_tail(item.get('api_key')) + ' · 模型 ' + (item.get('model') or '未选'))
+    lines.append('')
+    lines.append('切换后新任务生效，运行中的任务保持原供应商；换供应商会自动开新会话。')
+    return '\n'.join(lines)
+
+
+def provider_by_name(name):
+    name = name.strip()
+    return next((item for item in provider_list() if item['name'] == name), None)
+
+
 def await_token_input(chat, text, update_id=None):
     """如果在等令牌且这段文本确实像令牌，就当成回填处理并返回 True。
 
@@ -1387,7 +1627,16 @@ def model_environment():
     environment = {**os.environ, 'DISABLE_AUTOUPDATER': '1'}
     environment.update({name: model for name in MODEL_PIN_VARS})
     if auth_channel() == 'account':
-        environment = account_environment(environment, current_engine())
+        return account_environment(environment, current_engine())
+    record = provider_record()
+    if record and (record['id'] != BUILTIN_PROVIDER or record.get('overridden')):
+        # 换了供应商或换了密钥：用它覆盖安装时的地址与密钥。AUTH_TOKEN 要一并去掉，
+        # 否则 CLI 会优先用那枚旧令牌去请求新地址。
+        environment['ANTHROPIC_BASE_URL'] = record['base_url']
+        environment['ANTHROPIC_API_KEY'] = record['api_key']
+        environment.pop('ANTHROPIC_AUTH_TOKEN', None)
+        for name in ('OPENAI_API_KEY', 'OPENAI_BASE_URL', 'CODEX_API_KEY'):
+            environment.pop(name, None)
     return environment
 
 def read_model_cache():
@@ -1396,10 +1645,11 @@ def read_model_cache():
     缓存是「上次拉取结果的快照」，损坏只说明快照不可信，重新刷新即可；
     若在这里抛 ValueError，点击「切换模型」这类纯读操作会直接失败。
     """
-    if not MODEL_CACHE.exists():
+    path = model_cache_path()
+    if not path.exists():
         return []
     try:
-        models = json.loads(MODEL_CACHE.read_text())
+        models = json.loads(path.read_text())
     except (OSError, ValueError):
         return []
     if not isinstance(models, list):
@@ -1410,21 +1660,13 @@ def read_model_cache():
 def catalog(refresh=False):
     if auth_channel() == 'account':
         return [{'id': 'default', 'provider': engine_spec(current_engine())['label'] + ' 账号'}]
-    if not refresh and MODEL_CACHE.exists():
+    if not refresh and model_cache_path().exists():
         return read_model_cache()
-    base_url = os.environ.get('ANTHROPIC_BASE_URL')
-    api_key = os.environ.get('ANTHROPIC_API_KEY')
-    if not base_url or not api_key:
-        raise MediaError('缺少网关地址或密钥，无法拉取模型目录，请重新运行安装器。')
-    url = base_url.rstrip('/') + '/v1/models'
-    request = urllib.request.Request(url, headers={'Authorization': 'Bearer ' + api_key})
-    with urllib.request.urlopen(request, timeout=20) as response:
-        data = json.load(response)
-    models = list({item['id']: {'id': item['id'], 'provider': item.get('owned_by', '未标注'),
-                   'tools': item.get('supports_tool_call')} for item in data['data']}.values())
-    if not models:
-        raise ValueError('模型列表为空')
-    atomic_json(MODEL_CACHE, models)
+    record = provider_record() or {}
+    if not record.get('base_url') or not record.get('api_key'):
+        raise MediaError('当前供应商缺少地址或密钥：到「模型与会话 → 模型供应商」补上。')
+    models = fetch_provider_models(record['base_url'], record['api_key'])
+    atomic_json(model_cache_path(), models)
     return models
 
 def show_models(chat, page=0, key=None):
@@ -3251,7 +3493,7 @@ class TaskController:
             session = self.data['sessions'][key]
             engine = current_engine()
             session.setdefault('engine_sessions', {})[engine] = value
-            session.setdefault('engine_channels', {})[engine] = auth_channel(engine)
+            session.setdefault('engine_channels', {})[engine] = session_channel(engine)
             if engine == 'claude':
                 session['session_id'] = value
             else:
@@ -3295,8 +3537,8 @@ class TaskController:
             session = self.data['sessions'].get(key) or {}
             engine = current_engine()
             return {'model': current_model(), 'target': self.target, 'strategy': strategy_name(), 'engine': engine,
-                    'auth_channel': auth_channel(engine),
-                    'session_key': key, 'session_id': stored_session(session, engine, auth_channel(engine))}
+                    'auth_channel': auth_channel(engine), 'provider': active_provider_id(),
+                    'session_key': key, 'session_id': stored_session(session, engine, session_channel(engine))}
 
     def enqueue(self, chat, text='', kind='agent', payload=None, update_id=None, snapshot=None):
         with self.condition:
@@ -3414,7 +3656,8 @@ class TaskController:
                 # 固定会话身份，仅解析同一会话在前一项任务完成后的续接ID。
                 session = self.data['sessions'][task['snapshot']['session_key']]
                 engine = task['snapshot'].get('engine', 'claude')
-                task['snapshot']['session_id'] = stored_session(session, engine, task['snapshot'].get('auth_channel', 'gateway'))
+                task['snapshot']['session_id'] = stored_session(session, engine, session_channel(
+                    engine, task['snapshot'].get('auth_channel', 'gateway'), task['snapshot'].get('provider', BUILTIN_PROVIDER)))
                 task['snapshot']['handoff'] = list(session.get('handoff', []))
                 self.persist()
             TASK_LOCAL.task = task
@@ -3524,6 +3767,9 @@ class TaskController:
             # 分组展开：只在确实是分组名时才响应，避免和功能名冲突。
             pass
         elif quick_action(chat, text):
+            pass
+        elif provider_input(chat, text):
+            # 供应商地址/密钥输入：同样必须在入队之前拦下，密钥不能进任务记录。
             pass
         elif await_token_input(chat, text, update_id=update_id):
             # 令牌回填：必须在 enqueue 之前拦下，否则整串令牌会被当成任务
@@ -4033,7 +4279,77 @@ class TaskController:
     @on_text('取消授权', '取消')
     def _cmd_取消授权(self, chat, text, update_id):
         PENDING_TOKEN.update({'provider': '', 'chat': None, 'expires_at': 0})
+        if cancel_provider_input(chat):
+            send(chat, '已取消供应商设置，没有保存任何内容。')
+            return
         send(chat, '已取消本次授权输入。')
+
+    @on_text('模型供应商', '/provider')
+    def _cmd_模型供应商(self, chat, text, update_id):
+        active = active_provider_id()
+        others = ['使用供应商 ' + item['name'] for item in provider_list() if item['id'] != active]
+        send_options(chat, provider_overview(), others + ['添加供应商', '更换密钥', '删除供应商'])
+
+    @on_text('添加供应商')
+    def _cmd_添加供应商(self, chat, text, update_id):
+        start_provider_input(chat, 'url')
+        send(chat, '添加模型供应商（兼容 Anthropic 或 OpenAI 接口的网关）\n\n第 1 步：发送接口地址，形如 https://api.example.com（不带 /v1）。\n五分钟内有效，发「取消」放弃。')
+
+    @on_text(match=lambda text: text.startswith('使用供应商 '))
+    def _cmd_使用供应商(self, chat, text, update_id):
+        item = provider_by_name(text.partition(' ')[2])
+        if item is None:
+            raise MediaError('没有这个供应商，请重新打开「模型供应商」。')
+        if item['id'] == active_provider_id():
+            send(chat, '已经在用「' + item['name'] + '」。')
+            return
+        model = switch_provider(item['id'])
+        if auth_channel() == 'account':
+            send(chat, '已切到「' + item['name'] + '」。注意：' + engine_spec(current_engine())['label']
+                 + ' 当前走账号渠道，要用供应商请到「渠道切换」改回接口密钥。')
+        elif model:
+            send(chat, '已切到「' + item['name'] + '」，模型：' + model + '。新任务生效，会自动开新会话。')
+        else:
+            send(chat, '已切到「' + item['name'] + '」。请选这一家的模型：')
+            show_models(chat)
+
+    @on_text('更换密钥')
+    def _cmd_更换密钥(self, chat, text, update_id):
+        send_options(chat, '要更换哪一家的密钥？', ['更换密钥 ' + item['name'] for item in provider_list()])
+
+    @on_text(match=lambda text: text.startswith('更换密钥 '))
+    def _cmd_更换指定密钥(self, chat, text, update_id):
+        item = provider_by_name(text.partition(' ')[2])
+        if item is None:
+            raise MediaError('没有这个供应商，请重新打开「模型供应商」。')
+        if not item.get('base_url'):
+            raise MediaError('这一家还没有地址，请用「添加供应商」重新添加。')
+        start_provider_input(chat, 'key', provider_id=item['id'])
+        send(chat, '更换「' + item['name'] + '」的密钥（当前 ' + key_tail(item.get('api_key')) + '）\n\n发送新的 API 密钥。发出后我会立刻删除那条消息；验证通过才会替换旧密钥。\n发「取消」放弃。')
+
+    @on_text('删除供应商')
+    def _cmd_删除供应商(self, chat, text, update_id):
+        active = active_provider_id()
+        names = [item['name'] for item in provider_list() if item['id'] not in (BUILTIN_PROVIDER, active)]
+        if not names:
+            send(chat, '没有可删除的供应商：安装时配置的那一家和正在使用的那一家不能删。')
+            return
+        send_options(chat, '删除后它的地址和密钥会从本机清除。要删除哪一家？', ['确认删除供应商 ' + name for name in names])
+
+    @on_text(match=lambda text: text.startswith('确认删除供应商 '))
+    def _cmd_确认删除供应商(self, chat, text, update_id):
+        item = provider_by_name(text.partition(' ')[2])
+        if item is None or item['id'] in (BUILTIN_PROVIDER, active_provider_id()):
+            raise MediaError('这一家不能删除（不存在、是安装时配置，或正在使用）。')
+        with PROVIDER_LOCK:
+            state = provider_state()
+            state['items'].pop(item['id'], None)
+            save_provider_state(state)
+        try:
+            model_cache_path(item['id']).unlink()
+        except OSError:
+            pass
+        send(chat, '已删除供应商「' + item['name'] + '」，它的密钥已从本机清除。')
 
     @on_text('授权状态')
     def _cmd_授权状态(self, chat, text, update_id):
@@ -4114,6 +4430,22 @@ def show_model_items(chat, models, page=0, key=None):
          + '，共' + str(len(models)) + '项。新任务生效，目录不保证套餐或工具兼容性。', 'reply_markup': {'inline_keyboard': rows}})
 
 
+# 当前正在处理的那条消息（主循环单线程处理更新）。只用来删除机主发来的密钥消息。
+INCOMING = {'message_id': None}
+
+
+def delete_incoming(chat):
+    message_id = INCOMING.get('message_id')
+    if not message_id:
+        return False
+    try:
+        api('deleteMessage', {'chat_id': chat, 'message_id': message_id}, retries=1)
+        return True
+    except Exception as exc:
+        log_swallowed('删除含密钥的消息', exc)
+        return False
+
+
 def answer_callback(callback, text=None):
     """回执按钮点击，只为让客户端停止转圈。
 
@@ -4145,6 +4477,7 @@ def handle_update(update):
     # 而 next_offset 已经推进 —— 这条更新连同其后的消息全部丢失。
     chat = message.get('chat', {}).get('id')
     update_id = update.get('update_id')
+    INCOMING['message_id'] = None if callback else message.get('message_id')
     if chat is None or update_id is None:
         print('更新缺少必要字段，已跳过', flush=True)
         return
@@ -4191,6 +4524,7 @@ def handle_update(update):
                 send(chat, '模型菜单已过期，请刷新模型列表。')
             else:
                 atomic_json(MODEL_STATE, {'model': model})
+                remember_provider_model(model)
                 send(chat, '新任务模型已切换为：' + model + '。已有任务保留原模型。')
         elif fields[0] == 'mp' and len(fields) == 3:
             with CONTROL.lock:
