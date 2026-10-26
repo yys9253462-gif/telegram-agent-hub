@@ -1,0 +1,59 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: 测试通过后把 version.txt 定型到当前提交
+        type: boolean
+        default: false
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: 逐个运行测试文件
+        run: |
+          failed=0
+          for t in test_*.py; do
+            # test_integration.py 是安装验收用的假消息服务，不是单元测试。
+            [ "$t" = test_integration.py ] && continue
+            echo "::group::$t"
+            if ! timeout 600 python3 "$t"; then
+              echo "::error::$t 失败"
+              failed=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $failed
+
+  release:
+    # 只在手动触发且勾选 release 时运行，并且必须在测试通过之后。
+    if: github.event_name == 'workflow_dispatch' && inputs.release
+    needs: test
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: 计算发布归档摘要并定型 version.txt
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          commit=$(git rev-parse HEAD)
+          # 与 updater.py 下载的是同一个地址，摘要才对得上。
+          curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/tarball/$commit" -o release.tgz
+          printf '%s\nsha256:%s\n' "$commit" "$(sha256sum release.tgz | cut -d' ' -f1)" > version.txt
+          git config user.name github-actions
+          git config user.email github-actions@users.noreply.github.com
+          git add version.txt
+          git commit -m "version.txt 定型到 ${commit:0:7}"
+          git push
