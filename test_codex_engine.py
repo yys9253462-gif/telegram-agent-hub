@@ -135,6 +135,23 @@ class CodexEventParseTest(unittest.TestCase):
         self.assertEqual(state['content'].count('\n'), 2,
                          '两段正文之间应当只补一个空行，实际换行数不对')
 
+    def test_agent_message_separator_ignores_sentence_end(self):
+        """codex 的分段不能借用 claude 那套「看句末标点」的逻辑。
+
+        agent_message 是整条消息，模型完全可能写「第一段」这种不成句的内容。
+        如果这里也跟着按标点判断，两段会被空格黏成「第一段 第二段」——
+        看起来就像根本没换行（2026-10-26 引入句子边界判断时踩到过）。
+        """
+        for text in ('第一段', '第一段。', '结尾是数字 32'):
+            self.assertEqual(self.module.agent_message_separator(text), '\n\n',
+                             'codex 的两条消息之间必须分段：' + text)
+
+    def test_claude_block_boundary_does_use_sentence_end(self):
+        """反向钉住：claude 那边仍然要按句子边界判断，两套逻辑不能合并。"""
+        self.assertEqual(self.module.start_text_block('结尾是数字 32'), '',
+                         'claude 的块边界断在数字中间时既不分段也不补空格')
+        self.assertEqual(self.module.start_text_block('这一段说完了。'), '\n\n')
+
     def test_reasoning_does_not_pollute_content(self):
         """推理摘要不能混进正文，否则用户看到一堆思考内容。"""
         state = self.new_state()

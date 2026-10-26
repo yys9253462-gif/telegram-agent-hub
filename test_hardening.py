@@ -173,10 +173,16 @@ class PruneTest(unittest.TestCase):
 class StreamBlankLineTest(unittest.TestCase):
     """缺陷：旧代码在每次 message_start 时无条件追加 '\\n\\n'，而 agent 每完成
     一次工具调用都会产生一个 message_start，连续工具调用期间没有任何正文插入，
-    空行便不断叠加（线上实测出现过 153 个连续换行，气泡被撑到极高）。"""
+    空行便不断叠加（线上实测出现过 153 个连续换行，气泡被撑到极高）。
+
+    2026-10-26 补一层：光「不叠加」还不够，块边界还要分清是不是句子边界。
+    生产实测见过上一块停在「剩 32」、下一块接着「G，占用 15%」——无条件补
+    空行会把一个数量词劈成两段。所以现在按末尾字符决定补空行还是补空格。
+    """
 
     def test_repeated_tool_calls_do_not_accumulate(self):
-        buffer = '初始正文'
+        # 句末标点之后才补空行；连续 20 次也只有一个段落分隔。
+        buffer = '初始正文。'
         for _ in range(20):
             buffer += bot.start_text_block(buffer)
         self.assertEqual(buffer.count('\n'), 2, '连续 20 次工具调用后应只保留一个段落分隔')
@@ -193,6 +199,35 @@ class StreamBlankLineTest(unittest.TestCase):
 
     def test_no_separator_when_already_spaced(self):
         self.assertEqual(bot.start_text_block('正文\n\n'), '', '末尾已有空行时不应再叠加')
+
+    def test_sentence_end_starts_new_paragraph(self):
+        for text in ('说完了。', '英文句号.', '问一句？', '感叹！'):
+            self.assertEqual(bot.start_text_block(text), '\n\n',
+                             '句末标点后应当另起一段：' + text)
+
+    def test_mid_sentence_boundary_continues_inline(self):
+        # 线上真实形态：数字被切开的地方绝不能补空行。
+        # 也绝不能补空格——块边界是流式切片的产物，可能落在标识符中间，
+        # 塞空格会凭空造出「claude -telegram」「机器 很空闲」这种错字。
+        for text in ('剩 32', '可用 32', '注意，', '`claude'):
+            self.assertEqual(bot.start_text_block(text), '',
+                             '不是句子边界时应原样接续，不补任何字符：' + text)
+
+    def test_inline_separator_does_not_split_a_number(self):
+        """端到端：块边界落在数字中间时，最终正文不能出现空行。"""
+        buffer = '根分区 40G，已用 5.6G，剩 32'
+        buffer += bot.start_text_block(buffer)
+        buffer += 'G，占用 15%，空间充足。'
+        self.assertNotIn('\n', buffer)
+        self.assertIn('剩 32G', buffer)
+
+    def test_inline_separator_does_not_inject_a_space(self):
+        """端到端：块边界落在标识符中间时，不能凭空多出一个空格。"""
+        buffer = '`/opt` 下只有一个 `claude'
+        buffer += bot.start_text_block(buffer)
+        buffer += '-telegram`。'
+        self.assertNotIn('claude -telegram', buffer)
+        self.assertIn('claude-telegram', buffer)
 
     def test_tidy_collapses_excess_newlines(self):
         self.assertEqual(bot.tidy_stream_text('a' + '\n' * 153 + 'b'), 'a\n\nb')

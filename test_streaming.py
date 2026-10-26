@@ -55,8 +55,10 @@ def thinking_delta(index, text):
 
 
 def fresh_state():
+    # 与 run_stream 里的初始字典保持一致，包括 tool_name：
+    # 少了它，input_json_delta 阶段就只能显示兜底词。
     return {'content': '', 'final': None, 'activity': '等待模型响应',
-            'failed': '', 'thinking': ''}
+            'failed': '', 'thinking': '', 'tool_name': ''}
 
 
 class ParseTestBase(unittest.TestCase):
@@ -168,6 +170,75 @@ class TextDeltaTest(ParseTestBase):
         state = self.feed([stream_event({'type': 'message_start', 'message': {}}),
                            stream_event({'type': 'message_stop'})])
         self.assertEqual(state['content'], '')
+
+
+class ToolNameTest(ParseTestBase):
+    """工具名只在 content_block_start 里出现，必须记下来。
+
+    漏记的后果是参数阶段显示「正在准备工具参数：工具」——兜底词本身没意义，
+    用户看不出到底在准备哪个工具（2026-10-26 生产实测踩到）。
+    """
+
+    def test_tool_name_is_remembered_from_block_start(self):
+        state = self.feed([block_start(2, 'tool_use', name='Bash')])
+        self.assertEqual(state['tool_name'], 'Bash')
+
+    def test_input_json_delta_shows_real_tool_name(self):
+        state = self.feed([block_start(2, 'tool_use', name='Bash'),
+                           stream_event({'type': 'content_block_delta', 'index': 2,
+                                         'delta': {'type': 'input_json_delta',
+                                                   'partial_json': '{"command"'}})])
+        self.assertEqual(state['activity'], '正在准备工具参数：Bash')
+
+    def test_missing_tool_name_degrades_without_placeholder(self):
+        # 上游省略了 content_block_start 时，宁可少一个词，也别冒出「工具」这种废字。
+        state = self.feed([stream_event({'type': 'content_block_delta', 'index': 2,
+                                         'delta': {'type': 'input_json_delta',
+                                                   'partial_json': '{'}})])
+        self.assertEqual(state['activity'], '正在准备工具参数')
+        self.assertNotIn('：工具', state['activity'])
+
+
+class FinalAnswerSelectionTest(unittest.TestCase):
+    """最终回复该用「累积正文」还是「CLI 收尾答复」。
+
+    线上真实事故（2026-10-26 生产复现）：让 agent 依次执行三条命令、
+    每条说一句话，流式过程中三段都正确显示了，收尾却只剩最后一句。
+    原因是 `answer = result or content` —— result 永远非空，
+    于是累积正文被整体丢弃。
+    """
+
+    def test_keeps_accumulated_body_when_longer(self):
+        content = '第一段说明。\n\n第二段说明。\n\n第三段总结。'
+        final = '第三段总结。'
+        self.assertEqual(bot.pick_final_answer(final, content), content,
+                         '累积正文更长时必须用它，否则中间段落全丢')
+
+    def test_falls_back_to_final_when_no_content(self):
+        self.assertEqual(bot.pick_final_answer('只有收尾答复', ''), '只有收尾答复')
+
+    def test_falls_back_to_final_when_final_is_richer(self):
+        # 有些执行器的 result 是整理过的完整答复，比碎片式累积更完整。
+        self.assertEqual(bot.pick_final_answer('完整答复正文', '零碎'), '完整答复正文')
+
+    def test_placeholder_when_both_empty(self):
+        self.assertIn('未返回内容', bot.pick_final_answer('', ''))
+
+    def test_reproduces_the_production_case(self):
+        """复现生产现场：三段正文 + 一句话收尾，结果必须保留三段。"""
+        content = '`/opt` 下只有一个目录：`claude-telegram`。\n\n根分区 40G，已用 5.6G，剩余 32G，使用率 15%。\n\n负载很低，机器空闲。'
+        final = '负载很低，机器空闲。'
+        answer = bot.pick_final_answer(final, content)
+        self.assertIn('claude-telegram', answer)
+        self.assertIn('根分区', answer)
+        self.assertIn('机器空闲', answer)
+
+    def test_run_stream_uses_the_helper(self):
+        import inspect
+        body = inspect.getsource(bot.run_stream)
+        self.assertIn('pick_final_answer', body)
+        # 反向钉住：不能再退回「result 优先」的写法。
+        self.assertNotIn("answer = (final or {}).get('result') or content", body)
 
 
 class EditPacingTest(ParseTestBase):
