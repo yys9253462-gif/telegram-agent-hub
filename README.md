@@ -141,9 +141,9 @@ Codex 那条最容易写错：只把文件里的 `tokens` 置空、甚至把 `au
 
 安装器会装好最新的 **gh CLI**（GitHub 官方 apt 源），并让 git 访问 github.com 时向 gh 取凭据；授权后任务里的 `gh`、`git clone/push` 私有仓库都直接可用，令牌不写进任何配置文件。
 
-**Cloudflare 也走设备码流程。** 点「授权Cloudflare」后链接里已带好用户码，点进去只剩一个「允许」按钮。用的是 wrangler（Cloudflare 官方 CLI）的公开 client_id，申请它允许的**全部权限**：DNS 记录读写、Workers / Pages / D1 / KV / Queues / AI / Vectorize / 证书 / Access / 邮件路由等写权限，令牌到期前自动续期。用户码只有 **5 分钟**，过期就再发一次。
+**Cloudflare 也走设备码流程。** 点「授权Cloudflare」后链接里已带好用户码，点进去只剩一个「允许」按钮。用的是 wrangler（Cloudflare 官方 CLI）的公开 client_id，申请与 `wrangler login` 相同的全部权限：Workers / Pages / D1 / KV / Queues / AI / Pipelines / 证书 / Secrets Store / Containers 等写权限，站点与账号只读，令牌到期前自动续期。用户码只有 **5 分钟**，过期就再发一次。
 
-wrangler 这个客户端拿不到站点设置、防火墙/WAF、账号成员等权限。需要这些时走**备选路径**：「手动填令牌」，到控制台「我的个人资料 → API 令牌 → 创建自定义令牌」勾选所需权限（要全部就逐项勾满），把整段令牌发给机器人。不接受账号密码和 Global API Key。
+wrangler 这个客户端拿不到 DNS 记录写入、站点设置、防火墙/WAF、账号成员等权限。需要这些时走**备选路径**：「手动填令牌」，到控制台「我的个人资料 → API 令牌 → 创建自定义令牌」勾选所需权限（要全部就逐项勾满），把整段令牌发给机器人。不接受账号密码和 Global API Key。
 
 2026-10-26 之前做过的授权权限不全（GitHub 当时用的是会忽略权限范围的 GitHub App，Cloudflare 只申请了只读），「授权状态」会标出来；点「撤销授权」后重新授权一次即可。
 

@@ -871,17 +871,17 @@ class OAuthTokenShapedCredentialTest(unittest.TestCase):
 class CloudflareScopeTest(unittest.TestCase):
     """缺陷：申请的权限里没有 user:read，/user 校验返回 403，令牌被误判为不可用。
 
-    wrangler 的 client_id 只接受白名单里的权限名，写错一个整个请求就 400。
-    下面的集合是 2026-10-26 对授权端点逐项实测通过的名字。
+    wrangler 的 client_id 只接受它自己的权限名。申请设备码那一步不校验，
+    机主打开授权页时才报 Unknown oauth scope、整页失败，所以只能用 wrangler 官方默认清单。
     """
 
     def test_scope_includes_user_read(self):
         self.assertIn('user:read', cloudflare_auth.DEFAULT_SCOPE.split())
 
     def test_scope_includes_write_access(self):
-        """机主要求完整权限：DNS 与 Workers 必须能写，而不是只读。"""
+        """机主要求完整权限：wrangler 能给的写权限都要申请，而不是只读。"""
         scopes = cloudflare_auth.DEFAULT_SCOPE.split()
-        for needed in ('dns_records:edit', 'workers:write', 'pages:write', 'd1:write'):
+        for needed in ('workers:write', 'pages:write', 'd1:write', 'ssl_certs:write', 'queues:write'):
             self.assertIn(needed, scopes)
 
 
@@ -903,14 +903,11 @@ class GitHubScopeTest(unittest.TestCase):
         self.assertFalse(bot.needs_full_reauth('cloudflare', {'value': 'x', 'scope': cloudflare_auth.DEFAULT_SCOPE}))
 
     def test_scope_uses_only_official_scopes(self):
-        official = {'offline_access', 'account:read', 'user:read', 'zone:read', 'dns_records:read',
-                    'dns_records:edit', 'ssl_certs:write', 'workers:write', 'workers_kv:write',
-                    'workers_routes:write', 'workers_scripts:write', 'workers_tail:read',
-                    'workers_observability:write', 'workers_builds:write', 'd1:write', 'pages:write',
-                    'ai:write', 'queues:write', 'pipelines:write', 'secrets_store:write',
-                    'containers:write', 'cloudchamber:write', 'connectivity:admin', 'email_routing:write',
-                    'vectorize:write', 'browser:write', 'images:write', 'access:write', 'billing:read',
-                    'artifacts:write'}
+        official = {'offline_access', 'account:read', 'user:read', 'zone:read', 'ssl_certs:write',
+                    'workers:write', 'workers_kv:write', 'workers_routes:write', 'workers_scripts:write',
+                    'workers_tail:read', 'd1:write', 'pages:write', 'ai:write', 'queues:write',
+                    'pipelines:write', 'secrets_store:write', 'containers:write', 'cloudchamber:write',
+                    'connectivity:admin'}
         for scope in cloudflare_auth.DEFAULT_SCOPE.split():
             self.assertIn(scope, official, '不是官方有效的权限名：' + scope)
 

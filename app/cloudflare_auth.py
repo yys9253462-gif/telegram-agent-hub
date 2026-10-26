@@ -40,22 +40,22 @@ GRANT_TYPE = 'urn:ietf:params:oauth:grant-type:device_code'
 # 顺带解决 dash.cloudflare.com 的机器人拦截（缺 UA 必定 403）。
 CLIENT_UA = 'wrangler/4.42.0'
 ACCEPT = 'application/json'
-# 申请的权限：wrangler 这个 client_id 允许的全部权限（2026-10-26 逐项实测，
-# 授权端点对每一项都返回了设备码；不在白名单里的名字会让整个请求 400 invalid_scope）。
-# 机主要的是「智能体能替我管 Cloudflare」：DNS 记录、Workers、Pages、D1、KV、R2 以外的
-# 存储、证书、Access、邮件路由等都能写。
+# 申请的权限：与官方 `wrangler login` 默认申请的清单完全一致（wrangler 4.x 源码里的
+# DefaultScopes），这是这个 client_id 在授权页上确定能通过的全集。
+#
+# ⚠ 不要往里加清单外的名字：申请设备码那一步不校验权限名，什么都返回成功；
+# 真正校验在机主打开的授权页上，一个未知名字整页报 Unknown oauth scope、授权失败
+# （2026-10-26 线上踩过：加了 billing:read、dns_records:edit 等，授权页直接拒绝）。
 #
 # - offline_access 是拿 refresh_token 的前提，没有它访问令牌一过期就得重新授权；
 # - user:read 必须包含在内，/user 接口只认它，少了校验会返回 403；
-# - 这个客户端拿不到的：站点设置（zone:edit）、防火墙/WAF、账号成员等。需要这些时，
+# - 这个客户端拿不到 DNS 记录写入、站点设置、防火墙/WAF、账号成员等权限。需要这些时，
 #   用「手动填令牌」粘贴一枚自己在控制台创建的全权限 API 令牌。
 DEFAULT_SCOPE = ' '.join((
-    'offline_access', 'account:read', 'user:read', 'zone:read', 'dns_records:read', 'dns_records:edit',
-    'ssl_certs:write', 'workers:write', 'workers_kv:write', 'workers_routes:write', 'workers_scripts:write',
-    'workers_tail:read', 'workers_observability:write', 'workers_builds:write', 'd1:write', 'pages:write',
-    'ai:write', 'queues:write', 'pipelines:write', 'secrets_store:write', 'containers:write',
-    'cloudchamber:write', 'connectivity:admin', 'email_routing:write', 'vectorize:write', 'browser:write',
-    'images:write', 'access:write', 'billing:read', 'artifacts:write'))
+    'offline_access', 'account:read', 'user:read', 'zone:read', 'ssl_certs:write',
+    'workers:write', 'workers_kv:write', 'workers_routes:write', 'workers_scripts:write', 'workers_tail:read',
+    'd1:write', 'pages:write', 'ai:write', 'queues:write', 'pipelines:write', 'secrets_store:write',
+    'containers:write', 'cloudchamber:write', 'connectivity:admin'))
 
 
 class CloudflareError(Exception):
