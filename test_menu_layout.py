@@ -155,6 +155,34 @@ class HandlerCoverageTest(unittest.TestCase):
                       '选择智能体标题里应当显示当前执行器')
 
 
+class CommandTableTest(unittest.TestCase):
+    """命令表按定义顺序匹配，第一个命中的处理。"""
+
+    def route(self, text):
+        import bot
+        for names, match, handler in bot.TEXT_COMMANDS:
+            if text in names or (match is not None and match(text)):
+                return handler.__name__
+        return None
+
+    def test_exact_and_prefix_commands_do_not_shadow_each_other(self):
+        self.assertEqual(self.route('停止'), '_cmd_停止')
+        self.assertEqual(self.route('停止任务 abc'), '_cmd_停止任务')
+        self.assertEqual(self.route('退出账号'), '_cmd_退出账号')
+        self.assertEqual(self.route('退出账号 claude'), '_cmd_退出指定账号')
+
+    def test_plain_task_text_falls_through(self):
+        self.assertIsNone(self.route('帮我看看 nginx 为什么 502'))
+
+    def test_exact_names_are_registered_once(self):
+        import bot
+        seen = {}
+        for names, _match, handler in bot.TEXT_COMMANDS:
+            for name in names:
+                self.assertNotIn(name, seen, name + ' 同时登记在 ' + str(seen.get(name)) + ' 和 ' + handler.__name__)
+                seen[name] = handler.__name__
+
+
 class DuplicateTailTest(unittest.TestCase):
     """消息内联按钮不应覆盖首页键盘或追加导航尾部。"""
 

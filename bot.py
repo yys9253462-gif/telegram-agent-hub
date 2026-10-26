@@ -87,6 +87,19 @@ ACTION_UI_LOCK = threading.Lock()
 ACTION_UI_LIMIT = 512
 ACTION_UI_TTL = 300
 
+def log_swallowed(where, exc):
+    """被吞掉的异常至少留一行日志：类型 + 脱敏后的前 160 字。
+
+    这些地方故意不让异常冒上去（用量、续期、版本检查都是附加功能），
+    但原来什么都不记，出了问题日志里一片空白，只能靠猜。
+    """
+    try:
+        detail = redact(str(exc)).replace('\n', ' ')[:160]
+    except Exception:
+        detail = ''
+    print(where + '失败：' + type(exc).__name__ + (('：' + detail) if detail else ''), flush=True)
+
+
 API_RETRIES = 3
 
 
@@ -723,7 +736,8 @@ def account_model_options(engine):
     if engine == 'codebuddy':
         try:
             return [(item['id'], item['id']) for item in catalog() if item.get('id')]
-        except Exception:
+        except Exception as exc:
+            log_swallowed('读取 CodeBuddy 模型目录', exc)
             return []
     return []
 
@@ -817,13 +831,15 @@ def usage_footer_for(engine=None, force=False):
         return ''
     try:
         state = USAGE.snapshot(engine, force=force)
-    except Exception:
+    except Exception as exc:
+        log_swallowed('读取套餐用量', exc)
         return ''
     if not state:
         return ''
     try:
         return usage_footer(state)
-    except Exception:
+    except Exception as exc:
+        log_swallowed('生成用量行', exc)
         return ''
 
 
@@ -910,7 +926,8 @@ def renew_credential(provider, force=False, store=None):
         try:
             body = renew_provider_token(provider, renew_client_id(provider, record),
                                         record['refresh'])
-        except Exception:
+        except Exception as exc:
+            log_swallowed('令牌续期', exc)
             return None
         value = body.get('access_token')
         if not value:
@@ -964,7 +981,8 @@ def credential_renew_worker():
         for provider in ('github', 'cloudflare'):
             try:
                 renew_check_once(provider)
-            except Exception:
+            except Exception as exc:
+                log_swallowed('令牌续期巡检', exc)
                 pass
 
 
@@ -1017,7 +1035,8 @@ def usage_overview_text():
             continue
         try:
             state = USAGE.snapshot(name)
-        except Exception:
+        except Exception as exc:
+            log_swallowed('读取套餐用量', exc)
             state = None
         if not state:
             lines.append(label + '：暂不支持读取。')
@@ -1717,7 +1736,8 @@ def check_bot_version(chat, prepare=False):
                              ['确认更新机器人', '检查版本'])
             else:
                 send(chat, version_text(info))
-        except Exception:
+        except Exception as exc:
+            log_swallowed('检查版本', exc)
             if prepare:
                 UPDATE_PENDING.pop(chat, None)
             send(chat, '检查版本失败，请稍后重试，或请管理员检查安装信息与网络。')
@@ -1771,7 +1791,8 @@ def confirm_bot_update(chat):
         UPDATE_PENDING.pop(chat, None)
         watch_update_result(baseline, controller)
         reserved = False
-    except Exception:
+    except Exception as exc:
+        log_swallowed('启动更新', exc)
         text = '无法启动更新，请管理员检查安装元数据及 sudo/systemd 权限后重试。'
         if command:
             text += '\n管理员可执行：\n' + shlex.join([arg for arg in command if arg != '-n'])
@@ -2445,7 +2466,8 @@ class StreamMessage:
             # 只有真正的限流才退避等待；其他 400 不占用退避窗口。
             if exc.code == 429 or 'retry_after' in (raw.get('parameters') or {}):
                 self._back_off(raw)
-        except Exception:
+        except Exception as exc:
+            log_swallowed('流式刷新', exc)
             self.hold_until = time.monotonic() + 3
 
     def deliver_final(self, value):
@@ -2477,7 +2499,8 @@ class StreamMessage:
                     self._back_off(raw)
                     continue
                 break
-            except Exception:
+            except Exception as exc:
+                log_swallowed('发送最终答案', exc)
                 break
         send_formatted(self.chat, full)
 
@@ -3413,6 +3436,7 @@ class TaskController:
                 task['result'] = '处理超时，所属执行进程已终止。已执行操作未自动回滚。'
                 self.notify(task['chat'], task['result'])
             except Exception as exc:
+                log_swallowed('执行任务', exc)
                 status = 'failed'
                 task['result'] = str(exc) if isinstance(exc, MediaError) else '处理失败：' + type(exc).__name__ + '。请核对环境或模型后重试。'
                 self.notify(task['chat'], task['result'])
@@ -3568,7 +3592,7 @@ class TaskController:
                      [ENGINES[name]['button'] for name in names])
 
     @on_text(match=lambda text: text in [spec['button'] for spec in ENGINES.values()])
-    def _cmd_button(self, chat, text, update_id):
+    def _cmd_切换执行器(self, chat, text, update_id):
         desired = next(name for name, spec in ENGINES.items() if spec['button'] == text)
         if desired not in enabled_engines():
             raise MediaError('这个执行器未安装，请重新运行安装器启用。')
@@ -3607,7 +3631,8 @@ class TaskController:
             if auth_channel(name) == 'account':
                 try:
                     USAGE.snapshot(name, force=True)
-                except Exception:
+                except Exception as exc:
+                    log_swallowed('刷新用量', exc)
                     pass
         send(chat, usage_overview_text())
 
@@ -3666,7 +3691,7 @@ class TaskController:
                            + hint, ['目标本机', '目标远程服务器'])
 
     @on_text('目标本机', '目标远程服务器')
-    def _cmd_目标本机(self, chat, text, update_id):
+    def _cmd_设置目标(self, chat, text, update_id):
         if text == '目标远程服务器':
             # 判据用 ssh_targets()：密钥与 config 都在的情况下不能因为
             # 环境变量没设就拦住机主。
@@ -3686,7 +3711,7 @@ class TaskController:
         send_options(chat, '模型操作。搜索格式：搜索模型 关键词；收藏格式：收藏模型 模型ID；移除格式：取消收藏 模型ID。', ['模型列表', '收藏列表', '当前模型', '刷新模型'])
 
     @on_text(match=lambda text: text in ('模型列表', '刷新模型', '收藏列表') or text.startswith('搜索模型 '))
-    def _cmd_模型列表(self, chat, text, update_id):
+    def _cmd_模型目录(self, chat, text, update_id):
         kind = {'模型列表': 'models', '刷新模型': 'refresh_models', '收藏列表': 'favorites'}.get(text, 'model_search')
         task = self.enqueue(chat, text.partition(' ')[2], kind, update_id=update_id)
         if task:
@@ -3842,7 +3867,7 @@ class TaskController:
         send_options(chat, '\n'.join(lines), options)
 
     @on_text(match=lambda text: text.startswith('退出账号 '))
-    def _cmd_退出账号_2(self, chat, text, update_id):
+    def _cmd_退出指定账号(self, chat, text, update_id):
         engine = text.partition(' ')[2].strip()
         if engine not in ENGINES:
             raise MediaError('未知执行器。')
@@ -3911,7 +3936,7 @@ class TaskController:
         send_options(chat, '\n'.join(lines), options)
 
     @on_text(match=lambda text: text in ('使用接口密钥', '使用Claude账号', '使用CodeBuddy账号', '使用Codex账号') or text.startswith(('使用接口密钥 ', '使用账号 ')))
-    def _cmd_使用接口密钥(self, chat, text, update_id):
+    def _cmd_切换渠道(self, chat, text, update_id):
         # 跨执行器切换时，文本里带引擎名；直接点「使用Claude账号」这类旧按钮时按标签反查。
         # 两者都认不出来就明确报错，不要在这里抛 StopIteration 糊掉。
         engine = ''
@@ -3968,7 +3993,7 @@ class TaskController:
         send_options(chat, '\n'.join(lines), options)
 
     @on_text(match=lambda text: text.startswith('账号模型 '))
-    def _cmd_账号模型_2(self, chat, text, update_id):
+    def _cmd_设置账号模型(self, chat, text, update_id):
         engine = current_engine()
         choice = text.partition(' ')[2].strip()
         model = '' if choice in ('默认', 'default') else choice
@@ -4050,7 +4075,7 @@ class TaskController:
         send(chat, '定时巡检尚未启用，未创建任何定时任务。可先说明目标机器、检查项目、频率和告警方式，再另行配置。手动查询请点“主机状态”。')
 
     @on_text(match=lambda text: text in CHECKS or text in ('服务器状态', '/resources'))
-    def _cmd_服务器状态(self, chat, text, update_id):
+    def _cmd_主机检查(self, chat, text, update_id):
         task = self.enqueue(chat, text, 'quick', update_id=update_id)
         if task:
             send(chat, '只读状态查询已排队：' + task['id'])
