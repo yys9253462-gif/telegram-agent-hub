@@ -604,24 +604,27 @@ class LoginManager:
                     if not chunk:
                         # 这一块整个都是半个字符，等下一块补齐再处理。
                         continue
-                try:
-                    output.put_nowait(chunk)
-                except queue.Full:
+                # 队列满时等，不丢数据。原来是「挤掉最旧的一块」：CodeBuddy 的登录链接就在
+                # 输出最开头，后面紧跟几十 KB 动画，处理稍慢队列一满，最先被扔掉的正是带链接的
+                # 那几块——机主等不到链接，测试也因此偶发失败（2026-10-26 查实）。
+                # 读线程停下来等，管道写满后 CLI 自己会阻塞，不会丢任何内容。
+                while not session.stopped.is_set():
                     try:
-                        output.get_nowait()
-                    except queue.Empty:
-                        pass
-                    try:
-                        output.put_nowait(chunk)
+                        output.put(chunk, timeout=0.2)
+                        break
                     except queue.Full:
-                        pass
+                        continue
         except (OSError, ValueError):
             pass
         finally:
-            try:
-                output.put_nowait(None)
-            except queue.Full:
-                pass
+            # 结束标记同样不能丢，否则主循环要等到超时才知道进程已经退出。
+            for _ in range(50):
+                try:
+                    output.put(None, timeout=0.2)
+                    break
+                except queue.Full:
+                    if session.stopped.is_set():
+                        break
 
     def _run(self, session, binary, env):
         reader = None
