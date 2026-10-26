@@ -55,7 +55,7 @@ class InlineMenuTests(unittest.TestCase):
             self.assertEqual(bot.ACTION_UI[button['callback_data'][3:]]['command'], command)
 
     def test_settings_and_auth_are_flat(self):
-        for owner, expected in [('设置', ['模型', '选择智能体', '新建会话', '会话列表', '登录Claude', '登录CodeBuddy', '登录Codex', '退出账号', '账号状态', '渠道切换', '账号模型', '检查版本', '更新机器人']),
+        for owner, expected in [('设置', ['模型', '模型供应商', '选择智能体', '新建会话', '会话列表', '登录Claude', '登录CodeBuddy', '登录Codex', '退出账号', '账号状态', '渠道切换', '账号模型', '检查版本', '更新机器人']),
                                 ('更多', ['授权GitHub', '授权Cloudflare', '授权状态', '撤销授权'])]:
             bot.send_group_menu(123, '入口', bot.MENU_GROUPS[owner])
             self.assertEqual([bot.ACTION_UI[button['callback_data'][3:]]['command']
@@ -154,7 +154,8 @@ class InlineMenuTests(unittest.TestCase):
         with patch.object(bot, 'read_model_cache', return_value=[{'id': model}]), \
                 patch.object(bot, 'atomic_json') as save:
             bot.handle_update(self.update('choose:' + digest))
-            save.assert_called_once_with(bot.MODEL_STATE, {'model': model})
+            # 选模型时还会把它记进当前供应商（providers.json），所以只核对模型这一笔。
+            save.assert_any_call(bot.MODEL_STATE, {'model': model})
         self.controller.ui['list'] = ['first', 'second']
         with patch.object(bot, 'show_model_items') as show:
             bot.handle_update(self.update('mp:list:1', 2))
