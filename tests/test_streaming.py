@@ -357,7 +357,7 @@ class FinalDeliveryTest(unittest.TestCase):
         def api(method, payload, retries=None):
             raise urllib.error.HTTPError('u', 400, 'bad', {}, io.BytesIO(b'{"description": "message to edit not found"}'))
         fallback = []
-        with patch.object(bot, 'api', side_effect=api),              patch.object(bot, 'send_formatted', side_effect=lambda chat, text: fallback.append(text)):
+        with patch.object(bot, 'api', side_effect=api),              patch.object(bot, 'send_formatted', side_effect=lambda chat, text, markup=None: fallback.append(text)):
             stream = bot.StreamMessage(1, 2, '', '')
             stream.close()
             stream.deliver_final('最终答案')

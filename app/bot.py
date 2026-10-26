@@ -2113,7 +2113,64 @@ def agent_instructions():
             + image_hint + auth_hint +
             '负载控制：本机只有2GiB内存，避免并行构建、常驻浏览器集群和大型本地模型。'
             '任务产物优先放当前工作目录，回复列出路径。回复先给结论，再给必要的证据和下一步；每段两三句，避免长篇流水账。使用简短标题和少量双星号突出关键结果，命令用代码块、路径用行内代码。不要用大表格和多层列表；代码命令原样保留。'
-            '当前执行策略：' + strategy_name() + '。' + STRATEGIES[strategy_name()])
+            '当前执行策略：' + strategy_name() + '。' + STRATEGIES[strategy_name()]
+            + SUGGEST_PROMPT)
+
+# 回复末尾的「建议下一步」。模型按约定写一行，机器人把它摘掉换成按钮。
+SUGGEST_PROMPT = ('回复最后可以另起一行，按格式「' + '【建议】' + '选项一｜选项二｜选项三」给出机主下一步最可能让你做的事，'
+                  '最多3个，每个不超过16个字，写成机主会直接发给你的指令（例如「把修复部署上线」）；'
+                  '没有合适的下一步就不写这一行。')
+SUGGEST_LINE = re.compile(r'\n?[ \t>*_]*【建议】[:：]?\s*(.+?)\s*$')
+REPLY_BUTTON_TTL = 86400
+
+
+def extract_suggestions(answer):
+    """摘掉末尾的【建议】行，返回 (正文, 建议列表)。只认最后一行，正文中间出现不处理。"""
+    stripped = answer.rstrip()
+    match = SUGGEST_LINE.search(stripped)
+    if not match or '\n' in match.group(1):
+        return answer, []
+    items = []
+    for item in re.split(r'[｜|]', match.group(1)):
+        item = item.strip().strip('*_`「」"').strip()
+        if item and item not in items:
+            items.append(item[:40])
+    return stripped[:match.start()].rstrip(), items[:3]
+
+
+def context_bar(used, window):
+    if not used or not window:
+        return ''
+    ratio = min(used / window, 1)
+    filled = round(ratio * 10)
+    def short(value):
+        return (str(round(value / 1000000, 1)).rstrip('0').rstrip('.') + 'M') if value >= 1000000 else str(round(value / 1000)) + 'k'
+    return ('上下文 ' + '▰' * filled + '▱' * (10 - filled) + ' ' + str(round(ratio * 100)) + '%'
+            + ' · ' + short(used) + ' / ' + short(window))
+
+
+def reply_buttons(chat, suggestions, compact=True):
+    """建议按钮各占一行，最后一行固定「压缩上下文」。点击等同于机主发了这句话。"""
+    rows = [[item] for item in suggestions]
+    if compact:
+        rows.append([('🗜 压缩上下文', '压缩上下文')])
+    if not rows:
+        return None
+    now = time.monotonic()
+    keyboard = []
+    with ACTION_UI_LOCK:
+        for row in rows:
+            buttons = []
+            for item in row:
+                label, command = item if isinstance(item, tuple) else ('👉 ' + item, item)
+                token = uuid.uuid4().hex
+                ACTION_UI[token] = {'chat': chat, 'command': command, 'expires': now + REPLY_BUTTON_TTL}
+                buttons.append({'text': label, 'callback_data': 'ui:' + token})
+            keyboard.append(buttons)
+        while len(ACTION_UI) > ACTION_UI_LIMIT:
+            ACTION_UI.pop(next(iter(ACTION_UI)))
+    return {'inline_keyboard': keyboard}
+
 
 def send_options(chat, title, labels):
     labels = [label for label in labels if label not in ('返回主菜单', '返回首页', '收起菜单')]
@@ -2444,11 +2501,14 @@ def quick_action(chat, text):
     return True
 
 
-def send_formatted(chat, text):
+def send_formatted(chat, text, markup=None):
     text = redact(text)
-    for piece in split_message(text):
+    pieces = split_message(text)
+    for number, piece in enumerate(pieces):
+        # 内联按钮只挂在最后一片上，跟在回复正文的末尾。
+        last = markup if markup and number == len(pieces) - 1 else None
         payload = {'chat_id': chat, 'text': render_reply(piece), 'parse_mode': 'HTML',
-                   'reply_markup': menu_keyboard() if menu_visible() else {'remove_keyboard': True}}
+                   'reply_markup': last or (menu_keyboard() if menu_visible() else {'remove_keyboard': True})}
         try:
             api('sendMessage', payload)
         except urllib.error.HTTPError as exc:
@@ -2833,6 +2893,11 @@ def parse_claude_event(event, state):
         # 值就是主模型派它出去的那次 Agent 调用的 id。并行时靠它分清是哪个执行模型。
         parent = event.get('parent_tool_use_id')
         agents = state.setdefault('agents', {})
+        usage = (event.get('message') or {}).get('usage') or {}
+        if not parent and usage:
+            # 主模型这一次请求的全部输入 = 当前会话上下文的实际占用。子代理的不算。
+            state['context_used'] = sum(int(usage.get(key) or 0) for key in
+                                        ('input_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens'))
         for block in event.get('message', {}).get('content', []):
             if isinstance(block, dict) and block.get('type') == 'tool_use':
                 record_tool(str(block.get('name', '工具')))
@@ -2862,8 +2927,18 @@ def parse_claude_event(event, state):
             if running and tool_id in running:
                 running.discard(tool_id)
                 state['activity'] = agents_activity(state) if running else '主模型复核中'
+    elif event.get('type') == 'system' and event.get('subtype') == 'compact_boundary':
+        state['compacted'] = event.get('compact_metadata') or {}
+    elif event.get('type') == 'system' and event.get('status') == 'compacting':
+        state['activity'] = '正在压缩上下文'
     elif event.get('type') == 'result':
         state['final'] = event
+        # 规划执行时有两个模型，用量最大的那个是主模型，取它的上下文窗口。
+        models = [item for item in (event.get('modelUsage') or {}).values() if isinstance(item, dict)]
+        if models:
+            main = max(models, key=lambda item: sum(int(item.get(key) or 0) for key in
+                                                     ('inputTokens', 'cacheReadInputTokens', 'cacheCreationInputTokens')))
+            state['context_window'] = int(main.get('contextWindow') or 0)
         if event.get('session_id'):
             save_session(event['session_id'])
     elif event.get('type') == 'error':
@@ -3016,10 +3091,13 @@ class StreamMessage:
                 self.latest = None
             self._push(value)
 
-    def _edit_request(self, text):
+    def _edit_request(self, text, markup=None):
         # 不走 api() 内部的限流重试：那会在封禁期内提前重试、让窗口越拉越长。
-        api('editMessageText', {'chat_id': self.chat, 'message_id': self.message_id,
-                                'text': render_reply(text), 'parse_mode': 'HTML'}, retries=1)
+        payload = {'chat_id': self.chat, 'message_id': self.message_id,
+                   'text': render_reply(text), 'parse_mode': 'HTML'}
+        if markup:
+            payload['reply_markup'] = markup
+        api('editMessageText', payload, retries=1)
 
     @staticmethod
     def _error_body(exc):
@@ -3054,7 +3132,7 @@ class StreamMessage:
             log_swallowed('流式刷新', exc)
             self.hold_until = time.monotonic() + 3
 
-    def deliver_final(self, value):
+    def deliver_final(self, value, markup=None):
         """最终答案必须送达，不能像流式帧那样「丢一帧无所谓」。
 
         原来最终答案也走普通帧：正赶上限流退避期就被直接跳过，
@@ -3072,7 +3150,7 @@ class StreamMessage:
                     break
                 time.sleep(hold)
             try:
-                self._edit_request(full[:4000])
+                self._edit_request(full[:4000], markup)
                 self.shown = full
                 return
             except urllib.error.HTTPError as exc:
@@ -3086,7 +3164,7 @@ class StreamMessage:
             except Exception as exc:
                 log_swallowed('发送最终答案', exc)
                 break
-        send_formatted(self.chat, full)
+        send_formatted(self.chat, full, markup)
 
 
 def run_stream(chat, text):
@@ -3216,6 +3294,15 @@ def run_stream(chat, text):
         answer = pick_final_answer((final or {}).get('result'), content)
         # 收尾统一压缩空行：模型输出与流式累积都可能带出多余空行。
         answer = tidy_stream_text(answer)
+        answer, suggestions = extract_suggestions(answer)
+        compacting = text.strip() == '/compact'
+        if compacting and state.get('compacted') is not None:
+            meta = state['compacted']
+            answer = ('✅ **上下文已压缩**\n'
+                      + (str(round((meta.get('pre_tokens') or 0) / 1000)) + 'k → '
+                         + str(round((meta.get('post_tokens') or 0) / 1000)) + 'k，' if meta.get('pre_tokens') else '')
+                      + '之前的对话已整理成摘要，继续发消息即可。')
+            state['context_used'] = meta.get('post_tokens') or state.get('context_used')
         # codex 用 turn.failed 表达失败，退出码未必非零；两种都要算进来。
         crashed = process.returncode != 0 or bool((final or {}).get('is_error')) or bool(state['failed'])
         if crashed:
@@ -3244,6 +3331,10 @@ def run_stream(chat, text):
         # started 是 monotonic 读数，只有它在这次进程里算得对；墙钟那份交给
         # started_wall 兜底，两者不能互相顶替。
         footer = reply_footer(engine, started, started_wall=started_wall)
+        window = state.get('context_window') or (200000 if state.get('context_used') else 0)
+        bar = context_bar(state.get('context_used'), window)
+        if bar:
+            footer = (footer + '\n' if footer else '') + bar
         if footer:
             # 执行信息与用量放进可折叠引用块，和正文分开（见 textfmt.FOOTER_MARK）。
             answer = answer + '\n\n' + FOOTER_MARK + '\n' + footer
@@ -3253,10 +3344,12 @@ def run_stream(chat, text):
         # 这里必须等一次：不等的话，尾部的执行摘要可能在分片消息之后才到达，
         # 顺序就乱了（用户看到「结果 → 摘要 → 结果的后半段」）。
         stream.close()
-        stream.deliver_final(head)
-        # 首片已通过编辑消息呈现，其余分片补发。
-        for piece in pieces[1:]:
-            send_formatted(chat, label + piece)
+        can_compact = state_kind != 'codex' and not crashed
+        markup = reply_buttons(chat, [] if crashed else suggestions, compact=can_compact)
+        stream.deliver_final(head, markup if len(pieces) <= 1 else None)
+        # 首片已通过编辑消息呈现，其余分片补发；按钮挂在最后一片。
+        for number, piece in enumerate(pieces[1:], 2):
+            send_formatted(chat, label + piece, markup if number == len(pieces) else None)
     finally:
         # 异常路径也要把发送线程收干净，否则它会一直挂在条件变量上。
         try:
@@ -4395,6 +4488,17 @@ class TaskController:
             self.data['active_session'] = key
             self.persist()
         send(chat, '已新建并切换会话：' + key + '。已有任务继续使用原会话。')
+
+    @on_text('压缩上下文', '/compact')
+    def _cmd_压缩上下文(self, chat, text, update_id):
+        if engine_spec(current_engine())['kind'] == 'codex':
+            send(chat, '当前执行器是 Codex，不支持压缩上下文。需要清空可以发送“新建会话”。')
+            return
+        if not session_id():
+            send(chat, '当前会话还没有对话记录，不需要压缩。')
+            return
+        # 走任务队列：和正在跑的任务用同一个会话，必须排在它后面，不能并发改同一份记录。
+        self.enqueue(chat, '/compact', update_id=update_id)
 
     @on_text('会话列表')
     def _cmd_会话列表(self, chat, text, update_id):
