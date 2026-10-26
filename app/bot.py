@@ -1089,7 +1089,10 @@ def collab_agents(worker):
                   "远程主机用一次 ssh 主机 'bash -s' <<'EOF' … EOF 把多条命令写进同一个脚本，"
                   '每段输出前 echo 一个分隔标题；需要读多个文件时一次读完；命令输出已经说明结果的，'
                   '不要再单独跑一步去确认。只有后一条命令依赖前一条的结果时才分步。',
-        'model': worker}}, ensure_ascii=False)
+        'model': worker,
+        # 思考强度跟主模型同一档。不写的话子代理按模型默认推理，长任务里实测一个执行模型
+        # 能想出 50 万字推理、只发 8 万字命令，时间大头都耗在这上面。
+        **({'effort': current_effort()} if current_effort() else {})}}, ensure_ascii=False)
 
 
 def account_model_label(engine=None):
