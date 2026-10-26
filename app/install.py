@@ -344,6 +344,33 @@ def install_cli(name, user, home):
         target.unlink(missing_ok=True)
 
 
+# gh 的官方 apt 源。发行版自带的 gh 很旧（Debian 12 是 2023 年的 2.23），缺不少子命令，
+# 所以优先装官方版本。签名公钥固定校验值：对不上就不信任这个源，退回发行版的 gh。
+GH_KEYRING_URL = 'https://cli.github.com/packages/githubcli-archive-keyring.gpg'
+GH_KEYRING_SHA256 = '6084d5d7bd8e288441e0e94fc6275570895da18e6751f70f057485dc2d1a811b'
+GH_KEYRING = Path('/usr/share/keyrings/githubcli-archive-keyring.gpg')
+
+
+def ensure_gh_cli():
+    """装 GitHub CLI。机器人授权 GitHub 后，任务里靠它（读 GH_TOKEN）操作仓库、PR、Actions。"""
+    try:
+        with urllib.request.urlopen(GH_KEYRING_URL, timeout=30) as response:
+            keyring = response.read(64 * 1024)
+        if hashlib.sha256(keyring).hexdigest() != GH_KEYRING_SHA256:
+            raise InstallError('gh 签名公钥校验值不符')
+        GH_KEYRING.parent.mkdir(parents=True, exist_ok=True)
+        GH_KEYRING.write_bytes(keyring)
+        GH_KEYRING.chmod(0o644)
+        arch = subprocess.run(['dpkg', '--print-architecture'], text=True, stdout=subprocess.PIPE).stdout.strip()
+        atomic_write(Path('/etc/apt/sources.list.d/github-cli.list'),
+                     'deb [arch=' + arch + ' signed-by=' + str(GH_KEYRING) + '] https://cli.github.com/packages stable main\n', 0o644)
+        run(['apt-get', 'update'], quiet=True)
+    except Exception:
+        # 官方源不可用（网络、校验值变化）时不中断安装，装发行版自带的版本。
+        print('提示：GitHub CLI 官方源不可用，改装系统自带版本。')
+    run(['apt-get', 'install', '-y', 'gh'], quiet=True)
+
+
 def ensure_node_runtime():
     """Codex CLI 需要 node/npm。
 
@@ -462,6 +489,19 @@ def configure_ssh(c, user, home, uid, gid, yes):
     run(['ssh', '-o', 'ConnectTimeout=15', c['remote_alias'], 'true'], user=user, home=home, quiet=True)
 
 
+def configure_git_credentials(user, home):
+    """让 git 访问 github.com 时向 gh 要凭据。
+
+    gh 读任务环境里的 GH_TOKEN（机器人授权后注入），于是 git clone / push 私有仓库
+    不需要另外配置令牌，令牌也不落进 .gitconfig。没装 gh 时跳过。
+    """
+    if not shutil.which('gh'):
+        return
+    run(['git', 'config', '--global', 'credential.https://github.com.helper', ''], user=user, home=home, quiet=True)
+    run(['git', 'config', '--global', '--add', 'credential.https://github.com.helper', '!gh auth git-credential'],
+        user=user, home=home, quiet=True)
+
+
 def shared_memory(source, home, uid, gid):
     memory = home / 'memory'
     memory.mkdir(mode=0o700, exist_ok=True)
@@ -563,6 +603,7 @@ def install(args, c):
         dependencies = list(APT_DEPENDENCIES)
         run(['apt-get', 'update'], quiet=True)
         run(['apt-get', 'install', '-y'] + dependencies, quiet=True)
+        ensure_gh_cli()
         if c['enable_codex']:
             ensure_node_runtime()
     try:
@@ -629,6 +670,7 @@ def install(args, c):
         else:
             os.environ.pop('AGENT_MEMORY_BUNDLE', None)
         shared_memory(source, home, uid, gid)
+        configure_git_credentials(user, home)
         configure_ssh(c, user, home, uid, gid, args.yes)
         if models:
             atomic_write(home / '.codebuddy/models.json', json_text(models), 0o600, uid, gid)
