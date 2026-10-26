@@ -272,13 +272,30 @@ def current_engine():
         return CONTROL.data.get('engine', default_engine())
     return default_engine()
 
+def stored_session(session, engine, channel):
+    """取会话记录里该执行器的会话 ID，但只在渠道一致时才给。
+
+    同一个执行器的接口密钥渠道与账号渠道背后是不同的模型服务：网关模型
+    写出的会话里有空的、没有签名的 thinking 块，拿到官方接口续接会直接
+    400（each thinking block must contain non-whitespace thinking）。
+    所以会话必须绑定创建它的渠道，切换渠道就开新会话，靠交接摘要保留上下文。
+    没有渠道记录的旧会话都是早期网关渠道产出的，按 gateway 处理。
+    """
+    if not isinstance(session, dict):
+        return None
+    value = session.get('engine_sessions', {}).get(engine, session.get('session_id') if engine == 'claude' else None)
+    if not value:
+        return None
+    recorded = session.get('engine_channels', {}).get(engine, 'gateway')
+    return value if recorded == channel else None
+
 def session_id():
     task = getattr(TASK_LOCAL, 'task', None)
     if task:
         return task['snapshot'].get('session_id')
     if CONTROL is not None:
         session = CONTROL.active_session()
-        return session.get('engine_sessions', {}).get(current_engine(), session.get('session_id') if current_engine() == 'claude' else None)
+        return stored_session(session, current_engine(), auth_channel(current_engine()))
     try:
         return json.loads(SESSION_STATE.read_text()).get('session_id')
     except (OSError, ValueError):
@@ -989,6 +1006,9 @@ def usage_overview_text():
         parts = [usage_line(item) for item in readings]
         parts = [part for part in parts if part]
         lines.append(label + '：' + '；'.join(parts))
+        plan = github_auth.usage_plan_text(state.get('plan'))
+        if plan:
+            lines.append('　' + plan)
         updated = state.get('at')
         if updated:
             lines.append('　刷新于 ' + time.strftime('%H:%M:%S', time.localtime(updated)))
@@ -2281,6 +2301,17 @@ def session_error_is_recoverable(message):
     session = ('conversation', 'session')
     return any(word in text for word in missing) and any(word in text for word in session)
 
+def session_history_incompatible(message):
+    """会话历史本身被接口拒收（多半是换了渠道或模型后续接旧会话）。
+
+    典型报错：thinking 块为空或签名无效。这种会话再怎么重试都会 400，
+    只能清掉会话 ID 开新会话。只认带 thinking 与 400/invalid 的报错，不误伤其它失败。
+    """
+    text = str(message or '').lower()
+    if 'thinking' not in text:
+        return False
+    return any(word in text for word in ('non-whitespace thinking', 'invalid signature', 'signature', 'thinking block'))
+
 def parse_claude_event(event, state):
     """解析 Claude/CodeBuddy 的 stream-json 事件，就地更新累积状态。
 
@@ -2621,6 +2652,8 @@ def run_stream(chat, text):
                 # 整轮失败且没有正文时，把失败原因直接给出来，比一句「未返回内容」有用得多。
                 answer = state['failed']
             answer = '本轮执行未成功。\n' + answer + '\n可检查当前模型的套餐权限、额度和工具兼容性；也可以切换模型后重试。已执行的操作不会自动回滚，请先核对结果。'
+        if crashed and session_history_incompatible(state['failed'] or answer):
+            state['session_invalid'] = True
         if state.get('session_invalid'):
             # 会话记录失效：清掉本地存的会话 ID，让下一轮自动开新会话。
             # 必须在回复之前清好，否则用户重试时仍带着旧 ID，撞同一堵墙。
@@ -3257,6 +3290,7 @@ class TaskController:
             session = self.data['sessions'][key]
             engine = current_engine()
             session.setdefault('engine_sessions', {})[engine] = value
+            session.setdefault('engine_channels', {})[engine] = auth_channel(engine)
             if engine == 'claude':
                 session['session_id'] = value
             else:
@@ -3289,6 +3323,7 @@ class TaskController:
                 return
             engine = current_engine()
             session.get('engine_sessions', {}).pop(engine, None)
+            session.get('engine_channels', {}).pop(engine, None)
             if engine == 'claude':
                 session.pop('session_id', None)
             self.persist()
@@ -3300,7 +3335,7 @@ class TaskController:
             engine = current_engine()
             return {'model': current_model(), 'target': self.target, 'strategy': strategy_name(), 'engine': engine,
                     'auth_channel': auth_channel(engine),
-                    'session_key': key, 'session_id': session.get('session_id')}
+                    'session_key': key, 'session_id': stored_session(session, engine, auth_channel(engine))}
 
     def enqueue(self, chat, text='', kind='agent', payload=None, update_id=None, snapshot=None):
         with self.condition:
@@ -3409,7 +3444,7 @@ class TaskController:
                 # 固定会话身份，仅解析同一会话在前一项任务完成后的续接ID。
                 session = self.data['sessions'][task['snapshot']['session_key']]
                 engine = task['snapshot'].get('engine', 'claude')
-                task['snapshot']['session_id'] = session.get('engine_sessions', {}).get(engine, session.get('session_id') if engine == 'claude' else None)
+                task['snapshot']['session_id'] = stored_session(session, engine, task['snapshot'].get('auth_channel', 'gateway'))
                 task['snapshot']['handoff'] = list(session.get('handoff', []))
                 self.persist()
             TASK_LOCAL.task = task

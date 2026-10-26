@@ -826,6 +826,9 @@ class LoginManager:
 
 USAGE_CLAUDE_URL = 'https://api.anthropic.com/api/oauth/usage'
 USAGE_CLAUDE_BETA = 'oauth-2025-04-20'
+# 套餐身份：has_claude_max / has_claude_pro、subscription_status、subscription_created_at。
+# 官方不给到期日，按订阅创建日逐月推算下一个续费日（Stripe 月付以创建日为锚点）。
+USAGE_CLAUDE_PROFILE_URL = 'https://api.anthropic.com/api/oauth/profile'
 # Codex 账号用量。必须同时带 chatgpt-account-id，只有 Bearer 会 403。
 # 同域的 /backend-api/codex/usage 是 403、/backend-api/wham/rate-limits 是 404，
 # 别拿它们试（实测）。
@@ -1030,6 +1033,66 @@ def _usage_window_label(minutes, fallback):
     return str(value) + '分钟'
 
 
+def next_monthly_renewal(created, now=None):
+    """从订阅创建时间逐月往后推，返回第一个晚于 now 的续费时间戳。"""
+    if created is None:
+        return None
+    now = time.time() if now is None else now
+    start = datetime.datetime.fromtimestamp(created, datetime.timezone.utc)
+    for months in range(0, 1200):
+        total = start.month - 1 + months
+        year, month = start.year + total // 12, total % 12 + 1
+        day = start.day
+        while True:
+            try:
+                candidate = start.replace(year=year, month=month, day=day)
+                break
+            except ValueError:
+                day -= 1
+        if candidate.timestamp() > now:
+            return int(candidate.timestamp())
+    return None
+
+
+def claude_plan_from_profile(payload, now=None):
+    """解析 /api/oauth/profile，得出套餐名、订阅状态与预计续费日。读不懂返回 None。"""
+    if not isinstance(payload, dict):
+        return None
+    account = payload.get('account') if isinstance(payload.get('account'), dict) else {}
+    org = payload.get('organization') if isinstance(payload.get('organization'), dict) else {}
+    kind = str(org.get('organization_type') or '')
+    if account.get('has_claude_max') or 'max' in kind:
+        plan = 'Max'
+    elif account.get('has_claude_pro') or 'pro' in kind:
+        plan = 'Pro'
+    elif kind:
+        plan = kind
+    else:
+        return None
+    status = str(org.get('subscription_status') or '')
+    renews = None
+    if status == 'active' and org.get('billing_type') == 'stripe_subscription':
+        renews = next_monthly_renewal(_usage_reset(org.get('subscription_created_at')), now)
+    return {'plan': plan, 'status': status, 'renews_at': renews,
+            'trial_ends_at': _usage_reset(org.get('claude_code_trial_ends_at'))}
+
+
+def usage_plan_text(plan):
+    """「套餐：Claude Pro · 订阅有效 · 预计 2026-11-22 续费」。"""
+    if not plan:
+        return ''
+    status = {'active': '订阅有效', 'past_due': '扣费失败待补缴', 'canceled': '已取消',
+              'cancelled': '已取消', 'trialing': '试用中'}.get(plan.get('status'), plan.get('status') or '')
+    parts = ['套餐：Claude ' + plan.get('plan', '?')]
+    if status:
+        parts.append(status)
+    if plan.get('renews_at'):
+        parts.append('预计 ' + time.strftime('%Y-%m-%d', time.localtime(plan['renews_at'])) + ' 续费（按月推算）')
+    if plan.get('trial_ends_at'):
+        parts.append('试用到 ' + time.strftime('%Y-%m-%d', time.localtime(plan['trial_ends_at'])))
+    return ' · '.join(parts)
+
+
 def usage_merge(windows):
     """同一 key 出现多次时保留信息更全的那条（先到的优先，后到的补空字段）。"""
     merged = {}
@@ -1097,6 +1160,9 @@ def usage_line(item, now=None):
         return text + '（已到刷新点，重新拉取即可看到新窗口）'
     if left:
         return text + '（' + left + '后刷新）'
+    if not item.get('used_percent'):
+        # 窗口没被用过时官方不给 resets_at：计时从下一次请求才开始，并不是「未知」。
+        return text + '（未开始计时）'
     return text + '（刷新时间未知）'
 
 
@@ -1343,7 +1409,22 @@ class UsageReporter:
             return self._store(key, {'provider': 'claude', 'ok': False, 'windows': [],
                                      'error': '读取用量时出错。', 'at': self.clock()})
         return self._store(key, {'provider': 'claude', 'ok': True, 'windows': windows,
-                                 'error': '', 'at': self.clock()})
+                                 'error': '', 'at': self.clock(), 'plan': self.claude_plan(headers)})
+
+    def claude_plan(self, headers):
+        """套餐信息一小时才变一次也嫌多，单独缓存；读不到不影响用量。"""
+        hit = self._cached('claude-plan')
+        if hit is not None:
+            return hit.get('plan')
+        try:
+            payload, _headers = self.fetcher(USAGE_CLAUDE_PROFILE_URL, headers)
+            plan = claude_plan_from_profile(payload, self.clock())
+        except Exception:
+            plan = None
+        with self.lock:
+            self.cache['claude-plan'] = {'value': {'plan': plan},
+                                         'expires': self.clock() + (3600 if plan else self.error_ttl)}
+        return plan
 
     def codex(self, force=False):
         """Codex 账号用量：GET /backend-api/wham/usage。
@@ -1418,4 +1499,6 @@ def usage_footer(state, now=None):
     lines = [line for line in lines if line]
     if not lines:
         return '用量：暂无可读窗口数据。'
-    return '用量：' + '；'.join(lines)
+    text = '用量：' + '；'.join(lines)
+    plan = usage_plan_text(state.get('plan'))
+    return text + '\n' + plan if plan else text
