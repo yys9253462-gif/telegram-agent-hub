@@ -197,23 +197,25 @@ bash -n get.sh && bash -n install.sh
 
 | 文件 | 内容 |
 |---|---|
-| `bot.py` | 电报收发、菜单、任务队列（`TaskController`）、执行器命令、流式回复（`StreamMessage`） |
-| `textfmt.py` | 回复排版、切片、脱敏、耗时格式等纯函数 |
-| `usage.py` | 订阅用量（5 小时 / 7 天窗口）与套餐、续费日 |
-| `github_auth.py` | GitHub 设备码授权、执行器账号登录与身份 |
-| `cloudflare_auth.py` / `credentials.py` | Cloudflare 授权、平台凭据存取与注入 |
-| `updater.py` / `bootstrap.py` / `install.py` | 菜单升级、归档校验、交互式安装 |
+| `app/bot.py` | 电报收发、菜单、任务队列（`TaskController`）、执行器命令、流式回复（`StreamMessage`） |
+| `app/textfmt.py` | 回复排版、切片、脱敏、耗时格式等纯函数 |
+| `app/usage.py` | 订阅用量（5 小时 / 7 天窗口）与套餐、续费日 |
+| `app/github_auth.py` | GitHub 设备码授权、执行器账号登录与身份 |
+| `app/cloudflare_auth.py` / `app/credentials.py` | Cloudflare 授权、平台凭据存取与注入 |
+| `app/updater.py` / `app/bootstrap.py` / `app/install.py` | 菜单升级、归档校验、交互式安装 |
 | `tests/` | 全部测试（`python3 tests/test_xxx.py` 逐个运行）与测试数据 |
 | `scripts/` | 开发辅助：提交前敏感信息扫描、授权保护的反向验证 |
 | `memory/` | 安装时复制给执行器的共享说明 |
 
-程序文件必须留在仓库根目录：已安装机器的升级器按归档根目录取文件，挪进子目录会让旧版本升级失败。
+根目录只留入口：`get.sh`（一条命令安装）、`install.sh`（已克隆仓库时安装）、`version.txt`（发布版本）。程序文件全部在 `app/`，安装到机器上仍平铺在程序目录。
+
+2026-10-26 之前安装、且之后从未升级过的机器，内置升级器只认识根目录布局，菜单里的「更新机器人」会提示归档缺少代码；重新运行一次上面的一条命令安装即可（会继承已有配置）。
 
 文字命令和按钮在 `TaskController` 里用 `@on_text('按钮名')` 登记，按定义顺序匹配；新增按钮只要加一个处理方法。
 
 每次推送到 `main`，GitHub Actions 会逐个跑全部测试。发布新版本：在 Actions 页手动运行 **tests** 工作流并勾选 `release`，测试通过后它会自动把 `version.txt` 定型到当前提交，已安装的机器人在菜单里「检查版本」即可看到。
 
-新增代码文件要分两版发布：先在 `updater.py` 的 `OPTIONAL_FILES` 登记文件名并发布一版，再发布真正依赖它的代码。已安装机器上的升级器只认识自己白名单里的文件，跳过这一步会漏拷新模块、升级后启动失败并自动回滚。
+新增代码文件要分两版发布：先在 `app/updater.py` 的 `OPTIONAL_FILES` 登记文件名并发布一版，再发布真正依赖它的代码。已安装机器上的升级器只认识自己白名单里的文件，跳过这一步会漏拷新模块、升级后启动失败并自动回滚。
 
 ## 常见问题
 
