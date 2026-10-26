@@ -1589,8 +1589,10 @@ def provider_overview():
     lines = ['模型供应商（接口密钥渠道使用）', '']
     for item in provider_list():
         mark = '▶ ' if item['id'] == active else '　 '
+        # 正在用的那一家显示实时模型；其它家显示切走时记下的模型。
+        model = current_model() if item['id'] == active else item.get('model')
         lines.append(mark + item['name'] + '\n　 ' + (item.get('base_url') or '未设置地址')
-                     + ' · 密钥 ' + key_tail(item.get('api_key')) + ' · 模型 ' + (item.get('model') or '未选'))
+                     + ' · 密钥 ' + key_tail(item.get('api_key')) + ' · 模型 ' + (model or '未选'))
     lines.append('')
     lines.append('切换后新任务生效，运行中的任务保持原供应商；换供应商会自动开新会话。')
     return '\n'.join(lines)
