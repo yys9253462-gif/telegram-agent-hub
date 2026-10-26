@@ -2915,6 +2915,14 @@ def parse_claude_event(event, state):
         stream_type = stream.get('type')
         block = stream.get('content_block') or {}
         delta = stream.get('delta') or {}
+        if stream_type == 'message_delta' and not event.get('parent_tool_use_id'):
+            # OpenAI 转 Anthropic 的网关拿到上游用量时 message_start 早已发出，
+            # 只能把 input_tokens 补在收尾的 message_delta 里，这里也要认。
+            usage = stream.get('usage') or {}
+            used = sum(int(usage.get(key) or 0) for key in
+                       ('input_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens'))
+            if used:
+                state['context_used'] = used
         if stream_type == 'content_block_start':
             if block.get('type') == 'text':
                 # 只在真正开启正文块时补段落分隔；思考块与工具块都不触发。
@@ -2955,10 +2963,12 @@ def parse_claude_event(event, state):
         parent = event.get('parent_tool_use_id')
         agents = state.setdefault('agents', {})
         usage = (event.get('message') or {}).get('usage') or {}
-        if not parent and usage:
+        used = sum(int(usage.get(key) or 0) for key in
+                   ('input_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens'))
+        if not parent and used:
             # 主模型这一次请求的全部输入 = 当前会话上下文的实际占用。子代理的不算。
-            state['context_used'] = sum(int(usage.get(key) or 0) for key in
-                                        ('input_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens'))
+            # 为 0 时不覆盖：网关只在 message_delta 里给数时，assistant 事件里是 0。
+            state['context_used'] = used
         for block in event.get('message', {}).get('content', []):
             if isinstance(block, dict) and block.get('type') == 'tool_use':
                 record_tool(str(block.get('name', '工具')))
