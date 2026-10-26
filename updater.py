@@ -250,7 +250,10 @@ def _prepare(latest, folder):
         source = bootstrap.extract_archive(data, folder)
     except Exception:
         raise UpdateError('更新归档路径或内容不安全') from None
-    files = {name: (source / name).read_bytes() for name in CODE_FILES if (source / name).is_file()}
+    # 程序文件在仓库的 app/ 目录；更早的版本放在归档根目录。两种都认，
+    # 这样旧版本发布的归档与新布局的归档都能安装和升级。
+    base = source / 'app' if (source / 'app').is_dir() else source
+    files = {name: (base / name).read_bytes() for name in CODE_FILES if (base / name).is_file()}
     if not REQUIRED_FILES.issubset(files):
         raise UpdateError('更新归档缺少运行必需代码')
     try:

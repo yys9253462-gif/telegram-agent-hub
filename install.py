@@ -466,7 +466,10 @@ def shared_memory(source, home, uid, gid):
     memory = home / 'memory'
     memory.mkdir(mode=0o700, exist_ok=True)
     os.chown(memory, uid, gid)
+    # memory/ 在仓库根目录；安装器自身可能在 app/ 下，所以也看上一级。
     supplied = source / 'memory'
+    if not supplied.is_dir():
+        supplied = source.parent / 'memory'
     if supplied.is_dir():
         for item in supplied.rglob('*'):
             if item.is_symlink():

@@ -94,6 +94,17 @@ class UpdaterTests(unittest.TestCase):
         self.assertEqual(set(p.name for p in backups[0].iterdir()), updater.REQUIRED_FILES | {'installed-version.json'})
         self.assertIn('is-active', self.calls)
 
+    def test_app_directory_layout_installs_flat(self):
+        """程序文件挪到仓库 app/ 后，归档里是 repo/app/bot.py；装到机器上仍是平铺的。"""
+        self.new_files['usage.py'] = "VERSION = 'new'\n"
+        self.data = archive({'repo/app/' + name: body for name, body in self.new_files.items()})
+        self.latest = {'commit': NEW, 'sha256': updater.digest(self.data)}
+        result = updater.apply(self.app)
+        self.assertTrue(result['success'], result)
+        self.assertEqual((self.app / 'bot.py').read_text(), "VERSION = 'new'\n")
+        self.assertEqual((self.app / 'usage.py').read_text(), "VERSION = 'new'\n")
+        self.assertFalse((self.app / 'app').exists())
+
     def test_failed_health_restores_all_code(self):
         original = (self.app / 'bot.py').read_bytes()
         metadata = (self.app / 'installed-version.json').read_bytes()
