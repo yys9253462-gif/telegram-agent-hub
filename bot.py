@@ -3172,6 +3172,20 @@ def generate_image(task):
     task['result'] = '图片已生成并回传。\n模型：' + options['model'] + '\n画幅：' + options['size'] + '\n原图：' + str(path)
     send(task['chat'], task['result'])
 
+# 文字命令表：TaskController 里用 @on_text 登记的处理方法，按定义顺序依次匹配，
+# 第一个命中的处理。names 是精确匹配的按钮/命令名，match 是需要看前缀或
+# 动态集合的判断。原来这些是 handle_text 里一条 58 个分支的 elif 链，
+# 加一个按钮要在几百行里找位置，改文案也容易漏改另一处。
+TEXT_COMMANDS = []
+
+
+def on_text(*names, match=None):
+    def register(handler):
+        TEXT_COMMANDS.append((frozenset(names), match, handler))
+        return handler
+    return register
+
+
 class TaskController:
     TERMINAL = ('completed', 'failed', 'cancelled', 'interrupted')
     # 已结束任务只保留最近这么多条。每条 result 最多 24000 字符，
@@ -3691,441 +3705,13 @@ class TaskController:
                 raise MediaError(result.get('message') or '当前没有进行中的 CodeBuddy 登录，请先点击“登录CodeBuddy账号”。')
             send(chat, 'CodeBuddy 授权码已提交，正在等待官方登录结果。')
             return
-        if text in ('检查版本', '更新机器人', '确认更新机器人'):
-            quick_action(chat, text)
-        elif text == '图片创作':
-            send(chat, '发送“生图 描述”生成一张图片，例如：生图 一只趴在窗边的橘猫，水彩插画。图片任务使用独立生图通道，与聊天执行器无关。当前：' + json.dumps(image_options(), ensure_ascii=False))
-        elif text == '生图设置':
-            send_options(chat, '选择生图模型或画幅。目录可见不代表全部模型已验证。', ['生图模型 ' + value for value in IMAGE_MODELS] + ['画幅 方形', '画幅 横图', '画幅 竖图'])
-        elif text.startswith('生图模型 '):
-            model = text.partition(' ')[2]
-            if model not in IMAGE_MODELS:
-                raise MediaError('生图模型不在已验证通道目录中。')
-            options = image_options()
-            options['model'] = model
-            atomic_json(IMAGE_OPTIONS, options)
-            send(chat, '生图模型已设为：' + model)
-        elif text.startswith('画幅 '):
-            sizes = {'方形': '1024x1024', '横图': '1536x1024', '竖图': '1024x1536'}
-            choice = text.partition(' ')[2]
-            if choice not in sizes:
-                raise MediaError('请选择方形、横图或竖图。')
-            options = image_options()
-            options['size'] = sizes[choice]
-            atomic_json(IMAGE_OPTIONS, options)
-            send(chat, '生图画幅已设为：' + choice)
-        elif text.startswith(('生图 ', '/draw ')):
-            prompt = text.partition(' ')[2].strip()
-            if not prompt:
-                raise MediaError('请提供图片描述。')
-            task = self.enqueue(chat, prompt, 'image', payload=image_options(), update_id=update_id)
-            if task:
-                send(chat, '生图任务已排队：' + task['id'])
-        elif text in ('选择智能体', '/agent'):
-            # 当前执行器直接写在标题里，不再单独占一个「当前智能体」按钮。
-            names = enabled_engines()
-            send_options(chat, '选择执行器\n当前：' + current_engine()
-                         + '\n已启用：' + '、'.join(ENGINES[name]['label'] for name in names)
-                         + '\n共享技能、长期记忆、文件和机器人会话；原生会话编号分别保存，通过最近六项任务记录衔接上下文。',
-                         [ENGINES[name]['button'] for name in names])
-        elif text in [spec['button'] for spec in ENGINES.values()]:
-            desired = next(name for name, spec in ENGINES.items() if spec['button'] == text)
-            if desired not in enabled_engines():
-                raise MediaError('这个执行器未安装，请重新运行安装器启用。')
-            with self.lock:
-                self.data['engine'] = desired
-                self.persist()
-            send(chat, '新任务执行器已切换为：' + model_label(desired) + '。已有排队或运行任务保持原执行器。')
-        elif text == '当前智能体':
-            # 旧版留给老键盘和习惯输入，功能并入「选择智能体」。
-            send(chat, '当前执行器：' + current_engine() + '\n共享记忆和技能；原生会话独立，最近六项任务摘要交接。CodeBuddy保留自身高风险确认规则，不伪装成隔离沙箱绕过。\n注意 Codex 走 codex exec，无系统提示词参数，指令与任务会拼在同一条 prompt 里。')
-        elif text in ('新任务',):
-            send(chat, '直接发送任务目标即可排队，最多同时执行' + str(self.max_concurrent) + '项。当前会话已有排队或运行中的智能体任务时，会自动新建并切换独立会话；空闲会话继续原有上下文。')
-        elif text in ('当前任务', '状态'):
-            with self.lock:
-                current = '\n\n'.join(self.task_summary(state['task']) for state in self.running.values()) or '当前没有运行中的任务。'
-                count = sum(item['status'] == 'queued' for item in self.data['tasks'])
-                stops = [('停止 ' + task_id[:8], '停止任务 ' + task_id) for task_id, state in self.running.items()
-                         if state['task']['chat'] == chat]
-            title = current + '\n\n排队：' + str(count) + ' 项\n新任务：' + model_label() + ' · ' + self.target + ' · ' + strategy_name()
-            title += '\n\n' + usage_overview_text()
-            if stops:
-                send_options(chat, title, stops + ['刷新用量'])
-            else:
-                send_options(chat, title, ['刷新用量'])
-        elif text == '刷新用量':
-            # 强制绕过缓存重取一次，机主点了刷新就是想看当下真实数字。
-            for name in enabled_engines():
-                if auth_channel(name) == 'account':
-                    try:
-                        USAGE.snapshot(name, force=True)
-                    except Exception:
-                        pass
-            send(chat, usage_overview_text())
-        elif text == '停止':
-            with self.lock:
-                stops = [('停止 ' + task_id[:8], '停止任务 ' + task_id) for task_id, state in self.running.items()
-                         if state['task']['chat'] == chat]
-            if len(stops) > 1:
-                send_options(chat, '选择要停止的任务：', stops)
-            else:
-                send(chat, self.stop())
-        elif text.startswith('停止任务 '):
-            send(chat, self.stop(text.split(maxsplit=1)[1].strip()))
-        elif text == '队列':
-            with self.lock:
-                entries = [self.task_summary(item) for item in self.data['tasks'] if item['status'] in ('queued', 'awaiting_confirmation')]
-            send(chat, '\n\n'.join(entries) or '队列为空。')
-            send(chat, '发送“撤销任务 任务ID”撤销指定排队项；“历史结果”查看最近结果。')
-        elif text.startswith(('撤销任务 ', '取消语音 ')):
-            send(chat, self.cancel(text.split(maxsplit=1)[1].strip()))
-        elif text.startswith(('执行语音 ', '修改语音 ')):
-            parts = text.split(maxsplit=2)
-            with self.condition:
-                task = next((item for item in self.data['tasks'] if item['id'] == parts[1] and item['chat'] == chat and item['status'] == 'awaiting_confirmation'), None)
-                if task is None:
-                    send(chat, '找不到待确认的语音草稿。')
-                elif parts[0] == '修改语音':
-                    if len(parts) < 3 or not parts[2].strip():
-                        send(chat, '格式：修改语音 任务ID 新内容')
-                    else:
-                        task['text'] = redact(parts[2].strip())
-                        self.persist()
-                        send(chat, '草稿已修改，仍未执行。发送“执行语音 ' + task['id'] + '”确认。')
-                else:
-                    self.isolate_session(task['snapshot'], exclude=task)
-                    task.update(kind='agent', status='queued', result='')
-                    self.persist()
-                    self.condition.notify()
-                    send(chat, '已确认执行并加入队列：' + task['id'])
-        elif text == '目标':
-            targets = ssh_targets()
-            hint = ('\n可用远程主机：' + '、'.join(item[0] for item in targets) if targets
-                    else '\n本机没有可用的 SSH 主机配置。')
-            send_options(chat, '当前新任务目标：' + self.target + '\n目标通过系统指令注入；CLI仍运行在本机。'
-                               + hint, ['目标本机', '目标远程服务器'])
-        elif text in ('目标本机', '目标远程服务器'):
-            if text == '目标远程服务器':
-                # 判据用 ssh_targets()：密钥与 config 都在的情况下不能因为
-                # 环境变量没设就拦住机主。
-                targets = ssh_targets()
-                if not targets:
-                    raise MediaError('本机没有可用的 SSH 主机配置（~/.ssh/config 里没有 Host）。'
-                                     '请先补好免密 SSH，再用「目标远程服务器」。')
-                send(chat, '远程目标可用：' + '、'.join(item[0] for item in targets) + '。'
-                           '新任务会按这个目标注入指令，可以直接让我连上去操作。')
-            with self.lock:
-                self.target = text[2:]
-                self.persist()
-            send(chat, '新任务目标已切换为：' + self.target + '。已有任务目标保持原值。')
-        elif text in ('模型', '切换模型', '/models'):
-            send_options(chat, '模型操作。搜索格式：搜索模型 关键词；收藏格式：收藏模型 模型ID；移除格式：取消收藏 模型ID。', ['模型列表', '收藏列表', '当前模型', '刷新模型'])
-        elif text in ('模型列表', '刷新模型', '收藏列表') or text.startswith('搜索模型 '):
-            kind = {'模型列表': 'models', '刷新模型': 'refresh_models', '收藏列表': 'favorites'}.get(text, 'model_search')
-            task = self.enqueue(chat, text.partition(' ')[2], kind, update_id=update_id)
-            if task:
-                send(chat, '模型查询已排队：' + task['id'])
-        elif text.startswith(('收藏模型 ', '取消收藏 ')):
-            model = text.split(maxsplit=1)[1].strip()
-            with self.lock:
-                favorites = self.data['favorites']
-                if text.startswith('收藏模型 ') and model not in favorites:
-                    if len(favorites) >= 100:
-                        raise MediaError('收藏上限一百项。')
-                    favorites.append(model)
-                elif text.startswith('取消收藏 ') and model in favorites:
-                    favorites.remove(model)
-                self.persist()
-            send(chat, '已更新收藏。模型是否可用仍需实际调用验证。')
-        elif text == '会话':
-            send_options(chat, '会话管理：发送“命名会话 名称”重命名当前会话；发送“切换会话 ID”切换。', ['会话列表', '新建会话', '继续会话', '会话信息'])
-        elif text in ('新建会话', '/new'):
-            with self.lock:
-                key = uuid.uuid4().hex[:12]
-                self.data['sessions'][key] = {'name': '会话 ' + key, 'session_id': None}
-                self.data['active_session'] = key
-                self.persist()
-            send(chat, '已新建并切换会话：' + key + '。已有任务继续使用原会话。')
-        elif text == '会话列表':
-            with self.lock:
-                sessions = list(self.data['sessions'].items())[-10:][::-1]
-                buttons = [(('当前 · ' if key == self.data['active_session'] else '')
-                            + value['name'][:32] + ' · ' + key[:8], '切换会话 ' + key)
-                           for key, value in sessions]
-            send_options(chat, '最近创建的10个会话，点击直接切换。', buttons)
-        elif text.startswith('命名会话 '):
-            name = text.split(maxsplit=1)[1].strip()[:80]
-            with self.lock:
-                self.data['sessions'][self.data['active_session']]['name'] = name
-                self.persist()
-            send(chat, '当前会话已命名为：' + name)
-        elif text.startswith('切换会话 '):
-            key = text.split(maxsplit=1)[1].strip()
-            with self.lock:
-                if key not in self.data['sessions']:
-                    send(chat, '会话ID不存在，请查看“会话列表”。')
-                else:
-                    self.data['active_session'] = key
-                    self.persist()
-                    send(chat, '已切换会话：' + self.data['sessions'][key]['name'])
-        elif text == '文件':
-            send_options(chat, '普通文件上传后只保存，不执行。发送“发送文件 /绝对路径”取回文件；敏感配置、私钥和凭证会被阻止。路径位于本机本机，远程服务器文件需另发任务取回。', ['文件列表', '工作目录'])
-        elif text == '文件列表':
-            folder = WORK / 'uploads'
-            internal = {self.path, STATE, SESSION_STATE, MODEL_STATE, MODEL_CACHE, STRATEGY_STATE, MENU_STATE}
-            candidates = list(WORK.iterdir()) + (list(folder.iterdir()) if folder.exists() else [])
-            items = sorted((item for item in candidates if item.is_file() and item not in internal and not sensitive_path(item)),
-                           key=lambda item: item.stat().st_mtime, reverse=True)[:30]
-            send(chat, '\n'.join(str(item) for item in items) or '暂无可列出的任务产物或上传文件。')
-        elif text.startswith('发送文件 '):
-            task = self.enqueue(chat, text.split(maxsplit=1)[1].strip(), 'file_send', update_id=update_id)
-            if task:
-                send(chat, '文件发送已排队：' + task['id'])
-        elif text in ('历史结果', '工具审计'):
-            with self.lock:
-                entries = [item for item in self.data['tasks'] if item['status'] in self.TERMINAL][-10:]
-                lines = [self.task_summary(item) + '\n工具：' + ('、'.join(item['tools']) or '无记录')
-                         + ('\n结果：' + item.get('result', '')[:800] if text == '历史结果' else '') for item in entries]
-            send(chat, '\n\n'.join(lines) or '暂无历史。发送“查看结果 任务ID”查看完整保留结果。')
-        elif text.startswith('查看结果 '):
-            with self.lock:
-                task = next((item for item in self.data['tasks'] if item['id'] == text.split(maxsplit=1)[1].strip()), None)
-                result = task.get('result', '') if task else '任务ID不存在。'
-            send_formatted(chat, redact(result or '尚无结果。'))
-        elif text in ('设置', '更多设置', '/settings'):
-            send_group_menu(chat, group_title('设置', '设置'), MENU_GROUPS['设置'])
-        elif text == '更多':
-            send_group_menu(chat, group_title('更多', '更多'), MENU_GROUPS['更多'])
-        elif expand_group(chat, text):
+        for names, match, handler in TEXT_COMMANDS:
+            if text in names or (match is not None and match(text)):
+                handler(self, chat, text, update_id)
+                return
+        if expand_group(chat, text):
             # 分组展开：只在确实是分组名时才响应，避免和功能名冲突。
             pass
-        elif text in ('登录Claude', '登录 Claude', '/login'):
-            url = start_account_login()
-            send(chat, '请用手机浏览器打开下面的链接完成授权（可能需要先登录 claude.ai）。\n\n'
-                       + url + '\n\n授权后网页会给出一段授权码，把它直接发给我即可。\n'
-                       '链接十分钟内有效；期间不要重复发起登录。')
-        elif text in ('登录CodeBuddy', '登录Codex'):
-            engine = 'codebuddy' if text == '登录CodeBuddy' else 'codex'
-            result = CLI_LOGINS.start(engine, chat, engine_binary(engine),
-                                      account_environment(os.environ, engine), cli_login_notification)
-            if not result.get('ok'):
-                if result.get('state') == 'already_running':
-                    raise MediaError('已有进行中的' + engine_spec(engine)['label'] + '登录，请完成或取消后重试。')
-                raise MediaError(result.get('message') or '无法启动官方登录流程，请检查执行器是否已安装。')
-            send_options(chat, '正在启动' + engine_spec(engine)['label'] + '官方登录，授权信息稍后发送。',
-                         [('取消登录', '取消登录 ' + engine)])
-        elif text.startswith('取消登录 '):
-            engine = text.partition(' ')[2]
-            if engine not in ('codebuddy', 'codex'):
-                raise MediaError('未知登录执行器。')
-            result = CLI_LOGINS.cancel(engine, chat)
-            send(chat, '已请求取消' + engine_spec(engine)['label'] + '登录。' if result.get('ok') else '当前没有进行中的该执行器登录。')
-        elif text == '退出账号':
-            # 先列一份「谁现在是登录着的」，让机主看着身份去选退哪个，
-            # 而不是先选执行器再猜它有没有登录。
-            options = []
-            lines = ['退出账号登录\n只清除账号登录态，接口密钥与任务数据都不受影响。']
-            for name in enabled_engines():
-                label = engine_spec(name)['label']
-                identity = subscription_identity(name)
-                if identity:
-                    who = github_auth.account_identity_label(identity)
-                    lines.append(label + '：已登录 · ' + who)
-                    # 按钮上也带上身份。按钮与文字分开显示，只写「退出X账号」
-                    # 的话，机主点的那一刻还得往上翻才想得起退的是谁。
-                    button = '退出' + label + '账号' + ('（' + who.split(' · ')[0] + '）' if who != '已登录' else '')
-                    options.append((button, '退出账号 ' + name))
-                else:
-                    lines.append(label + '：未登录或无法确认')
-            if not options:
-                raise MediaError('当前没有已登录的账号可以退出。' + '\n'.join(lines[1:]))
-            lines.append('')
-            lines.append('退出后该执行器的账号渠道会切回接口密钥，新任务立即生效；'
-                         '正在运行的任务不受影响。')
-            send_options(chat, '\n'.join(lines), options)
-        elif text.startswith('退出账号 '):
-            engine = text.partition(' ')[2].strip()
-            if engine not in ENGINES:
-                raise MediaError('未知执行器。')
-            label = engine_spec(engine)['label']
-            # 退出前先确认它确实登录着，否则「退出成功」只会让机主误以为
-            # 自己刚删掉了一份并不存在的凭据。
-            #
-            # 但判据不能只看官方状态：CodeBuddy 的状态靠跑一段临时对话来探，
-            # 那一段会因为超时或网络抖动失败，把「探测没成功」误判成「没登录」，
-            # 于是凭据明明还在，退出却被拦下来。所以官方说没登录时，
-            # 再看一眼退出要动的凭据文件在不在 —— 在，就允许退出。
-            ok, detail = account_authorized(engine)
-            if not ok and not CLI_LOGINS.logout_target_present(engine):
-                raise MediaError(label + ' 当前没有确认的账号登录（' + detail.strip()
-                                 + '），不需要退出。')
-            result = CLI_LOGINS.logout(engine, engine_binary(engine),
-                                       account_environment(os.environ, engine))
-            if not result.get('ok'):
-                raise MediaError(label + ' 退出失败：' + (result.get('message') or '原因未知'))
-            # 账号渠道下退了账号，任务会拿不到任何凭据直接失败。
-            # 这里顺手切回接口密钥，省得机主退完还得自己回来改渠道。
-            note = ''
-            if auth_channel(engine) == 'account':
-                set_auth_channel('gateway', engine)
-                note = '\n该执行器的渠道已切回接口密钥（账号已退出，留在账号渠道会没有可用凭据）。'
-            if result.get('state') == 'not_logged_in':
-                send(chat, label + ' 本来就没有保存的账号登录，无需退出。' + note)
-            else:
-                send(chat, label + ' 账号已退出。' + note
-                     + ('\n' + result['removed'] if result.get('removed') else ''))
-        elif text == '账号状态':
-            engine = current_engine()
-            ok, detail = account_authorized(engine)
-            title = (engine_spec(engine)['label'] + ' 账号：' + ('已登录\n' + detail if ok else detail)
-                     + '\n当前使用渠道：' + channel_label(engine))
-            options = [('退出账号', '退出账号')]
-            send_options(chat, title, options)
-        elif text == '渠道切换':
-            engine = current_engine()
-            label = engine_spec(engine)['label']
-            identity = subscription_identity(engine)
-            lines = [label + ' 当前渠道：' + channel_label(engine)]
-            if auth_channel(engine) == 'account':
-                lines.append('账号模式模型：' + (account_model(engine) or '官方默认'))
-            lines.append('')
-            lines.append('接口密钥：使用已配置的网关与密钥。')
-            options = [('使用接口密钥', '使用接口密钥 ' + engine)]
-            if identity:
-                # 已登录就把真实身份摆出来，避免「账号」两字之下不知道用的是谁。
-                lines.append(label + ' 账号：' + github_auth.account_identity_label(identity)
-                             + '（官方登录态）')
-                options.append(('使用' + label + '账号', '使用账号 ' + engine))
-            else:
-                lines.append(label + ' 账号：未登录，先「登录' + label + '账号」。')
-            others = [name for name in enabled_engines() if name != engine]
-            if others:
-                # 这里只列，不切换执行器：切执行器有专门入口，
-                # 在本页混进切执行器的按钮，会把「换渠道」和「换执行器」两件事搅在一起。
-                lines.append('')
-                lines.append('其他执行器（到「切换执行器」里切）：'
-                             + '、'.join(ENGINES[name]['label'] for name in others))
-            send_options(chat, '\n'.join(lines), options)
-        elif (text in ('使用接口密钥', '使用Claude账号', '使用CodeBuddy账号', '使用Codex账号')
-              or text.startswith(('使用接口密钥 ', '使用账号 '))):
-            # 跨执行器切换时，文本里带引擎名；直接点「使用Claude账号」这类旧按钮时按标签反查。
-            # 两者都认不出来就明确报错，不要在这里抛 StopIteration 糊掉。
-            engine = ''
-            if text.startswith(('使用接口密钥 ', '使用账号 ')):
-                engine = text.partition(' ')[2]
-            elif text == '使用接口密钥':
-                engine = current_engine()
-            else:
-                engine = next((name for name, spec in ENGINES.items()
-                               if text == '使用' + spec['label'] + '账号'), '')
-            if engine not in ENGINES:
-                raise MediaError('未知执行器。')
-            account = text.startswith('使用账号 ') or text.endswith('账号')
-            if account:
-                ok, _ = account_authorized(engine)
-                if not ok:
-                    raise MediaError('还没有确认' + engine_spec(engine)['label'] + '账号登录，请先发送“登录' + engine_spec(engine)['label'] + '”。')
-            set_auth_channel('account' if account else 'gateway', engine)
-            label = engine_spec(engine)['label']
-            if account:
-                extra = ('\n账号模式模型：' + (account_model(engine) or '官方默认')
-                         + '\n可发送“账号模型”选择具体模型。')
-            else:
-                extra = '\n已回到接口密钥渠道，模型沿用“模型设置”里的网关模型。'
-            # 不自动改当前执行器：切渠道只改「用哪个身份」，
-            # 顺手把执行器也换掉，等于替用户做了另一件事。
-            switching = engine != current_engine()
-            if switching:
-                extra += ('\n当前执行器仍是 ' + engine_spec(current_engine())['label']
-                          + '，要先换到 ' + label + ' 才用得上这个渠道。')
-            send(chat, label + ' 已切换到：' + channel_label(engine) + extra + '\n仅影响该执行器的新任务。')
-            if switching:
-                send_options(chat, '要把执行器换成 ' + label + ' 吗？',
-                             [(engine_spec(engine)['button'], engine_spec(engine)['button'])])
-        elif text == '账号模型':
-            engine = current_engine()
-            label = engine_spec(engine)['label']
-            if auth_channel(engine) != 'account':
-                # 换渠道的操作就在这里，不必让机主先退出去找「渠道切换」再回来。
-                raise MediaError('当前走接口密钥渠道，没有账号模型可选。'
-                                 '到「模型与会话 → 渠道切换」切到账号后，这里才会列出账号可用的模型。')
-            models = account_model_options(engine)
-            if not models:
-                raise MediaError(label + ' 账号模式暂无可选模型清单。')
-            current = account_model(engine)
-            lines = [label + ' 账号模式模型\n当前：' + (current or '官方默认'),
-                     '账号模式与接口密钥模式各用各的模型，互不影响。',
-                     '官方对账号模式有可用范围限制，清单之外的模型会被直接拒绝。']
-            options = [('账号模型 默认', '账号模型 默认')]
-            options.extend((name + (' ·当前' if mid == current else ''), '账号模型 ' + mid)
-                           for mid, name in models)
-            send_options(chat, '\n'.join(lines), options)
-        elif text.startswith('账号模型 '):
-            engine = current_engine()
-            choice = text.partition(' ')[2].strip()
-            model = '' if choice in ('默认', 'default') else choice
-            set_account_model(engine, model)
-            if auth_channel(engine) != 'account':
-                # 记下来但不生效最容易让人以为设错了，这里说清什么时候才用得上。
-                send(chat, engine_spec(engine)['label'] + ' 账号模式模型已记为：' + (model or '官方默认')
-                     + '\n但当前走接口密钥渠道，这次选择要等切到账号模式才生效。')
-                return
-            label = engine_spec(engine)['label']
-            send(chat, label + ' 账号模式模型已设为：' + (model or '官方默认')
-                 + '\n仅影响该执行器的新任务。')
-        elif text == '授权GitHub':
-            send_rich(chat, start_github_device_flow(chat))
-        elif text == '授权Cloudflare':
-            # 默认走设备码：一次点击 + 一次输码，比让机主去后台勾二十几个权限项省事得多。
-            send_rich(chat, start_cloudflare_device_flow(chat))
-        elif text == '云flare粘贴令牌':
-            # 备选入口。它不是「默认路径」的下半段，而是一条独立的窄路：
-            # 只要某个站点、不要整账号、或者不想要会过期的 OAuth 令牌时走这里。
-            # 用两步确认而不是直接进「等待令牌」态：否则机主点错按钮之后，
-            # 下一条正常任务描述就会被当成令牌去校验，白跑一次还报错。
-            PENDING_TOKEN.update({'provider': 'cloudflare', 'chat': chat,
-                                  'expires_at': time.time() + 300})
-            send(chat, '改用粘贴 API 令牌。请到 Cloudflare 控制台「我的个人资料 → API 令牌」'
-                       '创建一个令牌，权限按需勾选（建议只给要用的站点与 Zone 读/编辑），'
-                       '然后把它整段发给我。\n'
-                       '五分钟后自动失效；现在也可以发「取消授权」放弃。\n'
-                       '不接受账号密码、Global API Key。')
-        elif text in ('取消授权', '取消'):
-            PENDING_TOKEN.update({'provider': '', 'chat': None, 'expires_at': 0})
-            send(chat, '已取消本次授权输入。')
-        elif text == '授权状态':
-            send(chat, auth_status_text())
-        elif text == '撤销授权':
-            send_options(chat, '要撤销哪一个平台的授权？撤销后新任务不再拿到对应凭据。',
-                         ['撤销GitHub', '撤销Cloudflare'])
-        elif text in ('撤销GitHub', '撤销Cloudflare'):
-            provider = 'github' if text == '撤销GitHub' else 'cloudflare'
-            removed = credentials().drop(provider)
-            if provider == 'github':
-                # 内存里可能还有一轮等待中的设备码，撤销后必须一起清掉，
-                # 否则轮询线程还会把新拿到的令牌写回去。
-                DEVICE_FLOW.update({'provider': '', 'device_code': '', 'user_code': ''})
-            else:
-                # Cloudflare 同理。别漏这一步：撤销之后三十秒轮询才成功，
-                # 凭据就又回来了，机主会以为撤销没生效。
-                CLOUDFLARE_FLOW.update({'thread': None, 'device_code': '', 'user_code': ''})
-            send(chat, (PROVIDERS[provider]['label'] + ' 授权已撤销，凭据已从本机删除。'
-                        '注意：这只是删掉本地那份，平台侧的授权仍然存在，需要在平台页面另行撤销。'
-                        if removed else PROVIDERS[provider]['label'] + ' 本来就没有保存的凭据。'))
-        elif text in ('长期记忆', '技能查询'):
-            prompt = ('只读查询当前CLI可用的长期记忆来源和已保存条目摘要。不要读取认证文件，不修改或创建记忆；不存在时明确说明。'
-                      if text == '长期记忆' else '只读列出当前CLI实际可用技能的名称、用途和调用方式；以实际配置为准，不安装、不执行技能、不读取密钥。')
-            snap = self.snapshot()
-            snap['strategy'] = '先出方案'
-            task = self.enqueue(chat, prompt, snapshot=snap, update_id=update_id)
-            if task:
-                send(chat, text + '查询已排队：' + task['id'])
-        elif text in ('巡检配置', '巡检'):
-            send(chat, '定时巡检尚未启用，未创建任何定时任务。可先说明目标机器、检查项目、频率和告警方式，再另行配置。手动查询请点“主机状态”。')
-        elif text in CHECKS or text in ('服务器状态', '/resources'):
-            task = self.enqueue(chat, text, 'quick', update_id=update_id)
-            if task:
-                send(chat, '只读状态查询已排队：' + task['id'])
         elif quick_action(chat, text):
             pass
         elif await_token_input(chat, text, update_id=update_id):
@@ -4142,6 +3728,546 @@ class TaskController:
             # 「已接收，正在生成…」重复，且一整块信息对用户没什么用。
             # 执行器、模型、耗时改为压到最终回复底部，与用量同行。
             self.enqueue(chat, text, update_id=update_id)
+
+    @on_text('检查版本', '更新机器人', '确认更新机器人')
+    def _cmd_检查版本(self, chat, text, update_id):
+        quick_action(chat, text)
+
+    @on_text('图片创作')
+    def _cmd_图片创作(self, chat, text, update_id):
+        send(chat, '发送“生图 描述”生成一张图片，例如：生图 一只趴在窗边的橘猫，水彩插画。图片任务使用独立生图通道，与聊天执行器无关。当前：' + json.dumps(image_options(), ensure_ascii=False))
+
+    @on_text('生图设置')
+    def _cmd_生图设置(self, chat, text, update_id):
+        send_options(chat, '选择生图模型或画幅。目录可见不代表全部模型已验证。', ['生图模型 ' + value for value in IMAGE_MODELS] + ['画幅 方形', '画幅 横图', '画幅 竖图'])
+
+    @on_text(match=lambda text: text.startswith('生图模型 '))
+    def _cmd_生图模型(self, chat, text, update_id):
+        model = text.partition(' ')[2]
+        if model not in IMAGE_MODELS:
+            raise MediaError('生图模型不在已验证通道目录中。')
+        options = image_options()
+        options['model'] = model
+        atomic_json(IMAGE_OPTIONS, options)
+        send(chat, '生图模型已设为：' + model)
+
+    @on_text(match=lambda text: text.startswith('画幅 '))
+    def _cmd_画幅(self, chat, text, update_id):
+        sizes = {'方形': '1024x1024', '横图': '1536x1024', '竖图': '1024x1536'}
+        choice = text.partition(' ')[2]
+        if choice not in sizes:
+            raise MediaError('请选择方形、横图或竖图。')
+        options = image_options()
+        options['size'] = sizes[choice]
+        atomic_json(IMAGE_OPTIONS, options)
+        send(chat, '生图画幅已设为：' + choice)
+
+    @on_text(match=lambda text: text.startswith(('生图 ', '/draw ')))
+    def _cmd_生图(self, chat, text, update_id):
+        prompt = text.partition(' ')[2].strip()
+        if not prompt:
+            raise MediaError('请提供图片描述。')
+        task = self.enqueue(chat, prompt, 'image', payload=image_options(), update_id=update_id)
+        if task:
+            send(chat, '生图任务已排队：' + task['id'])
+
+    @on_text('选择智能体', '/agent')
+    def _cmd_选择智能体(self, chat, text, update_id):
+        # 当前执行器直接写在标题里，不再单独占一个「当前智能体」按钮。
+        names = enabled_engines()
+        send_options(chat, '选择执行器\n当前：' + current_engine()
+                     + '\n已启用：' + '、'.join(ENGINES[name]['label'] for name in names)
+                     + '\n共享技能、长期记忆、文件和机器人会话；原生会话编号分别保存，通过最近六项任务记录衔接上下文。',
+                     [ENGINES[name]['button'] for name in names])
+
+    @on_text(match=lambda text: text in [spec['button'] for spec in ENGINES.values()])
+    def _cmd_button(self, chat, text, update_id):
+        desired = next(name for name, spec in ENGINES.items() if spec['button'] == text)
+        if desired not in enabled_engines():
+            raise MediaError('这个执行器未安装，请重新运行安装器启用。')
+        with self.lock:
+            self.data['engine'] = desired
+            self.persist()
+        send(chat, '新任务执行器已切换为：' + model_label(desired) + '。已有排队或运行任务保持原执行器。')
+
+    @on_text('当前智能体')
+    def _cmd_当前智能体(self, chat, text, update_id):
+        # 旧版留给老键盘和习惯输入，功能并入「选择智能体」。
+        send(chat, '当前执行器：' + current_engine() + '\n共享记忆和技能；原生会话独立，最近六项任务摘要交接。CodeBuddy保留自身高风险确认规则，不伪装成隔离沙箱绕过。\n注意 Codex 走 codex exec，无系统提示词参数，指令与任务会拼在同一条 prompt 里。')
+
+    @on_text('新任务')
+    def _cmd_新任务(self, chat, text, update_id):
+        send(chat, '直接发送任务目标即可排队，最多同时执行' + str(self.max_concurrent) + '项。当前会话已有排队或运行中的智能体任务时，会自动新建并切换独立会话；空闲会话继续原有上下文。')
+
+    @on_text('当前任务', '状态')
+    def _cmd_当前任务(self, chat, text, update_id):
+        with self.lock:
+            current = '\n\n'.join(self.task_summary(state['task']) for state in self.running.values()) or '当前没有运行中的任务。'
+            count = sum(item['status'] == 'queued' for item in self.data['tasks'])
+            stops = [('停止 ' + task_id[:8], '停止任务 ' + task_id) for task_id, state in self.running.items()
+                     if state['task']['chat'] == chat]
+        title = current + '\n\n排队：' + str(count) + ' 项\n新任务：' + model_label() + ' · ' + self.target + ' · ' + strategy_name()
+        title += '\n\n' + usage_overview_text()
+        if stops:
+            send_options(chat, title, stops + ['刷新用量'])
+        else:
+            send_options(chat, title, ['刷新用量'])
+
+    @on_text('刷新用量')
+    def _cmd_刷新用量(self, chat, text, update_id):
+        # 强制绕过缓存重取一次，机主点了刷新就是想看当下真实数字。
+        for name in enabled_engines():
+            if auth_channel(name) == 'account':
+                try:
+                    USAGE.snapshot(name, force=True)
+                except Exception:
+                    pass
+        send(chat, usage_overview_text())
+
+    @on_text('停止')
+    def _cmd_停止(self, chat, text, update_id):
+        with self.lock:
+            stops = [('停止 ' + task_id[:8], '停止任务 ' + task_id) for task_id, state in self.running.items()
+                     if state['task']['chat'] == chat]
+        if len(stops) > 1:
+            send_options(chat, '选择要停止的任务：', stops)
+        else:
+            send(chat, self.stop())
+
+    @on_text(match=lambda text: text.startswith('停止任务 '))
+    def _cmd_停止任务(self, chat, text, update_id):
+        send(chat, self.stop(text.split(maxsplit=1)[1].strip()))
+
+    @on_text('队列')
+    def _cmd_队列(self, chat, text, update_id):
+        with self.lock:
+            entries = [self.task_summary(item) for item in self.data['tasks'] if item['status'] in ('queued', 'awaiting_confirmation')]
+        send(chat, '\n\n'.join(entries) or '队列为空。')
+        send(chat, '发送“撤销任务 任务ID”撤销指定排队项；“历史结果”查看最近结果。')
+
+    @on_text(match=lambda text: text.startswith(('撤销任务 ', '取消语音 ')))
+    def _cmd_撤销任务(self, chat, text, update_id):
+        send(chat, self.cancel(text.split(maxsplit=1)[1].strip()))
+
+    @on_text(match=lambda text: text.startswith(('执行语音 ', '修改语音 ')))
+    def _cmd_执行语音(self, chat, text, update_id):
+        parts = text.split(maxsplit=2)
+        with self.condition:
+            task = next((item for item in self.data['tasks'] if item['id'] == parts[1] and item['chat'] == chat and item['status'] == 'awaiting_confirmation'), None)
+            if task is None:
+                send(chat, '找不到待确认的语音草稿。')
+            elif parts[0] == '修改语音':
+                if len(parts) < 3 or not parts[2].strip():
+                    send(chat, '格式：修改语音 任务ID 新内容')
+                else:
+                    task['text'] = redact(parts[2].strip())
+                    self.persist()
+                    send(chat, '草稿已修改，仍未执行。发送“执行语音 ' + task['id'] + '”确认。')
+            else:
+                self.isolate_session(task['snapshot'], exclude=task)
+                task.update(kind='agent', status='queued', result='')
+                self.persist()
+                self.condition.notify()
+                send(chat, '已确认执行并加入队列：' + task['id'])
+
+    @on_text('目标')
+    def _cmd_目标(self, chat, text, update_id):
+        targets = ssh_targets()
+        hint = ('\n可用远程主机：' + '、'.join(item[0] for item in targets) if targets
+                else '\n本机没有可用的 SSH 主机配置。')
+        send_options(chat, '当前新任务目标：' + self.target + '\n目标通过系统指令注入；CLI仍运行在本机。'
+                           + hint, ['目标本机', '目标远程服务器'])
+
+    @on_text('目标本机', '目标远程服务器')
+    def _cmd_目标本机(self, chat, text, update_id):
+        if text == '目标远程服务器':
+            # 判据用 ssh_targets()：密钥与 config 都在的情况下不能因为
+            # 环境变量没设就拦住机主。
+            targets = ssh_targets()
+            if not targets:
+                raise MediaError('本机没有可用的 SSH 主机配置（~/.ssh/config 里没有 Host）。'
+                                 '请先补好免密 SSH，再用「目标远程服务器」。')
+            send(chat, '远程目标可用：' + '、'.join(item[0] for item in targets) + '。'
+                       '新任务会按这个目标注入指令，可以直接让我连上去操作。')
+        with self.lock:
+            self.target = text[2:]
+            self.persist()
+        send(chat, '新任务目标已切换为：' + self.target + '。已有任务目标保持原值。')
+
+    @on_text('模型', '切换模型', '/models')
+    def _cmd_模型(self, chat, text, update_id):
+        send_options(chat, '模型操作。搜索格式：搜索模型 关键词；收藏格式：收藏模型 模型ID；移除格式：取消收藏 模型ID。', ['模型列表', '收藏列表', '当前模型', '刷新模型'])
+
+    @on_text(match=lambda text: text in ('模型列表', '刷新模型', '收藏列表') or text.startswith('搜索模型 '))
+    def _cmd_模型列表(self, chat, text, update_id):
+        kind = {'模型列表': 'models', '刷新模型': 'refresh_models', '收藏列表': 'favorites'}.get(text, 'model_search')
+        task = self.enqueue(chat, text.partition(' ')[2], kind, update_id=update_id)
+        if task:
+            send(chat, '模型查询已排队：' + task['id'])
+
+    @on_text(match=lambda text: text.startswith(('收藏模型 ', '取消收藏 ')))
+    def _cmd_收藏模型(self, chat, text, update_id):
+        model = text.split(maxsplit=1)[1].strip()
+        with self.lock:
+            favorites = self.data['favorites']
+            if text.startswith('收藏模型 ') and model not in favorites:
+                if len(favorites) >= 100:
+                    raise MediaError('收藏上限一百项。')
+                favorites.append(model)
+            elif text.startswith('取消收藏 ') and model in favorites:
+                favorites.remove(model)
+            self.persist()
+        send(chat, '已更新收藏。模型是否可用仍需实际调用验证。')
+
+    @on_text('会话')
+    def _cmd_会话(self, chat, text, update_id):
+        send_options(chat, '会话管理：发送“命名会话 名称”重命名当前会话；发送“切换会话 ID”切换。', ['会话列表', '新建会话', '继续会话', '会话信息'])
+
+    @on_text('新建会话', '/new')
+    def _cmd_新建会话(self, chat, text, update_id):
+        with self.lock:
+            key = uuid.uuid4().hex[:12]
+            self.data['sessions'][key] = {'name': '会话 ' + key, 'session_id': None}
+            self.data['active_session'] = key
+            self.persist()
+        send(chat, '已新建并切换会话：' + key + '。已有任务继续使用原会话。')
+
+    @on_text('会话列表')
+    def _cmd_会话列表(self, chat, text, update_id):
+        with self.lock:
+            sessions = list(self.data['sessions'].items())[-10:][::-1]
+            buttons = [(('当前 · ' if key == self.data['active_session'] else '')
+                        + value['name'][:32] + ' · ' + key[:8], '切换会话 ' + key)
+                       for key, value in sessions]
+        send_options(chat, '最近创建的10个会话，点击直接切换。', buttons)
+
+    @on_text(match=lambda text: text.startswith('命名会话 '))
+    def _cmd_命名会话(self, chat, text, update_id):
+        name = text.split(maxsplit=1)[1].strip()[:80]
+        with self.lock:
+            self.data['sessions'][self.data['active_session']]['name'] = name
+            self.persist()
+        send(chat, '当前会话已命名为：' + name)
+
+    @on_text(match=lambda text: text.startswith('切换会话 '))
+    def _cmd_切换会话(self, chat, text, update_id):
+        key = text.split(maxsplit=1)[1].strip()
+        with self.lock:
+            if key not in self.data['sessions']:
+                send(chat, '会话ID不存在，请查看“会话列表”。')
+            else:
+                self.data['active_session'] = key
+                self.persist()
+                send(chat, '已切换会话：' + self.data['sessions'][key]['name'])
+
+    @on_text('文件')
+    def _cmd_文件(self, chat, text, update_id):
+        send_options(chat, '普通文件上传后只保存，不执行。发送“发送文件 /绝对路径”取回文件；敏感配置、私钥和凭证会被阻止。路径位于本机本机，远程服务器文件需另发任务取回。', ['文件列表', '工作目录'])
+
+    @on_text('文件列表')
+    def _cmd_文件列表(self, chat, text, update_id):
+        folder = WORK / 'uploads'
+        internal = {self.path, STATE, SESSION_STATE, MODEL_STATE, MODEL_CACHE, STRATEGY_STATE, MENU_STATE}
+        candidates = list(WORK.iterdir()) + (list(folder.iterdir()) if folder.exists() else [])
+        items = sorted((item for item in candidates if item.is_file() and item not in internal and not sensitive_path(item)),
+                       key=lambda item: item.stat().st_mtime, reverse=True)[:30]
+        send(chat, '\n'.join(str(item) for item in items) or '暂无可列出的任务产物或上传文件。')
+
+    @on_text(match=lambda text: text.startswith('发送文件 '))
+    def _cmd_发送文件(self, chat, text, update_id):
+        task = self.enqueue(chat, text.split(maxsplit=1)[1].strip(), 'file_send', update_id=update_id)
+        if task:
+            send(chat, '文件发送已排队：' + task['id'])
+
+    @on_text('历史结果', '工具审计')
+    def _cmd_历史结果(self, chat, text, update_id):
+        with self.lock:
+            entries = [item for item in self.data['tasks'] if item['status'] in self.TERMINAL][-10:]
+            lines = [self.task_summary(item) + '\n工具：' + ('、'.join(item['tools']) or '无记录')
+                     + ('\n结果：' + item.get('result', '')[:800] if text == '历史结果' else '') for item in entries]
+        send(chat, '\n\n'.join(lines) or '暂无历史。发送“查看结果 任务ID”查看完整保留结果。')
+
+    @on_text(match=lambda text: text.startswith('查看结果 '))
+    def _cmd_查看结果(self, chat, text, update_id):
+        with self.lock:
+            task = next((item for item in self.data['tasks'] if item['id'] == text.split(maxsplit=1)[1].strip()), None)
+            result = task.get('result', '') if task else '任务ID不存在。'
+        send_formatted(chat, redact(result or '尚无结果。'))
+
+    @on_text('设置', '更多设置', '/settings')
+    def _cmd_设置(self, chat, text, update_id):
+        send_group_menu(chat, group_title('设置', '设置'), MENU_GROUPS['设置'])
+
+    @on_text('更多')
+    def _cmd_更多(self, chat, text, update_id):
+        send_group_menu(chat, group_title('更多', '更多'), MENU_GROUPS['更多'])
+
+    @on_text('登录Claude', '登录 Claude', '/login')
+    def _cmd_登录Claude(self, chat, text, update_id):
+        url = start_account_login()
+        send(chat, '请用手机浏览器打开下面的链接完成授权（可能需要先登录 claude.ai）。\n\n'
+                   + url + '\n\n授权后网页会给出一段授权码，把它直接发给我即可。\n'
+                   '链接十分钟内有效；期间不要重复发起登录。')
+
+    @on_text('登录CodeBuddy', '登录Codex')
+    def _cmd_登录CodeBuddy(self, chat, text, update_id):
+        engine = 'codebuddy' if text == '登录CodeBuddy' else 'codex'
+        result = CLI_LOGINS.start(engine, chat, engine_binary(engine),
+                                  account_environment(os.environ, engine), cli_login_notification)
+        if not result.get('ok'):
+            if result.get('state') == 'already_running':
+                raise MediaError('已有进行中的' + engine_spec(engine)['label'] + '登录，请完成或取消后重试。')
+            raise MediaError(result.get('message') or '无法启动官方登录流程，请检查执行器是否已安装。')
+        send_options(chat, '正在启动' + engine_spec(engine)['label'] + '官方登录，授权信息稍后发送。',
+                     [('取消登录', '取消登录 ' + engine)])
+
+    @on_text(match=lambda text: text.startswith('取消登录 '))
+    def _cmd_取消登录(self, chat, text, update_id):
+        engine = text.partition(' ')[2]
+        if engine not in ('codebuddy', 'codex'):
+            raise MediaError('未知登录执行器。')
+        result = CLI_LOGINS.cancel(engine, chat)
+        send(chat, '已请求取消' + engine_spec(engine)['label'] + '登录。' if result.get('ok') else '当前没有进行中的该执行器登录。')
+
+    @on_text('退出账号')
+    def _cmd_退出账号(self, chat, text, update_id):
+        # 先列一份「谁现在是登录着的」，让机主看着身份去选退哪个，
+        # 而不是先选执行器再猜它有没有登录。
+        options = []
+        lines = ['退出账号登录\n只清除账号登录态，接口密钥与任务数据都不受影响。']
+        for name in enabled_engines():
+            label = engine_spec(name)['label']
+            identity = subscription_identity(name)
+            if identity:
+                who = github_auth.account_identity_label(identity)
+                lines.append(label + '：已登录 · ' + who)
+                # 按钮上也带上身份。按钮与文字分开显示，只写「退出X账号」
+                # 的话，机主点的那一刻还得往上翻才想得起退的是谁。
+                button = '退出' + label + '账号' + ('（' + who.split(' · ')[0] + '）' if who != '已登录' else '')
+                options.append((button, '退出账号 ' + name))
+            else:
+                lines.append(label + '：未登录或无法确认')
+        if not options:
+            raise MediaError('当前没有已登录的账号可以退出。' + '\n'.join(lines[1:]))
+        lines.append('')
+        lines.append('退出后该执行器的账号渠道会切回接口密钥，新任务立即生效；'
+                     '正在运行的任务不受影响。')
+        send_options(chat, '\n'.join(lines), options)
+
+    @on_text(match=lambda text: text.startswith('退出账号 '))
+    def _cmd_退出账号_2(self, chat, text, update_id):
+        engine = text.partition(' ')[2].strip()
+        if engine not in ENGINES:
+            raise MediaError('未知执行器。')
+        label = engine_spec(engine)['label']
+        # 退出前先确认它确实登录着，否则「退出成功」只会让机主误以为
+        # 自己刚删掉了一份并不存在的凭据。
+        #
+        # 但判据不能只看官方状态：CodeBuddy 的状态靠跑一段临时对话来探，
+        # 那一段会因为超时或网络抖动失败，把「探测没成功」误判成「没登录」，
+        # 于是凭据明明还在，退出却被拦下来。所以官方说没登录时，
+        # 再看一眼退出要动的凭据文件在不在 —— 在，就允许退出。
+        ok, detail = account_authorized(engine)
+        if not ok and not CLI_LOGINS.logout_target_present(engine):
+            raise MediaError(label + ' 当前没有确认的账号登录（' + detail.strip()
+                             + '），不需要退出。')
+        result = CLI_LOGINS.logout(engine, engine_binary(engine),
+                                   account_environment(os.environ, engine))
+        if not result.get('ok'):
+            raise MediaError(label + ' 退出失败：' + (result.get('message') or '原因未知'))
+        # 账号渠道下退了账号，任务会拿不到任何凭据直接失败。
+        # 这里顺手切回接口密钥，省得机主退完还得自己回来改渠道。
+        note = ''
+        if auth_channel(engine) == 'account':
+            set_auth_channel('gateway', engine)
+            note = '\n该执行器的渠道已切回接口密钥（账号已退出，留在账号渠道会没有可用凭据）。'
+        if result.get('state') == 'not_logged_in':
+            send(chat, label + ' 本来就没有保存的账号登录，无需退出。' + note)
+        else:
+            send(chat, label + ' 账号已退出。' + note
+                 + ('\n' + result['removed'] if result.get('removed') else ''))
+
+    @on_text('账号状态')
+    def _cmd_账号状态(self, chat, text, update_id):
+        engine = current_engine()
+        ok, detail = account_authorized(engine)
+        title = (engine_spec(engine)['label'] + ' 账号：' + ('已登录\n' + detail if ok else detail)
+                 + '\n当前使用渠道：' + channel_label(engine))
+        options = [('退出账号', '退出账号')]
+        send_options(chat, title, options)
+
+    @on_text('渠道切换')
+    def _cmd_渠道切换(self, chat, text, update_id):
+        engine = current_engine()
+        label = engine_spec(engine)['label']
+        identity = subscription_identity(engine)
+        lines = [label + ' 当前渠道：' + channel_label(engine)]
+        if auth_channel(engine) == 'account':
+            lines.append('账号模式模型：' + (account_model(engine) or '官方默认'))
+        lines.append('')
+        lines.append('接口密钥：使用已配置的网关与密钥。')
+        options = [('使用接口密钥', '使用接口密钥 ' + engine)]
+        if identity:
+            # 已登录就把真实身份摆出来，避免「账号」两字之下不知道用的是谁。
+            lines.append(label + ' 账号：' + github_auth.account_identity_label(identity)
+                         + '（官方登录态）')
+            options.append(('使用' + label + '账号', '使用账号 ' + engine))
+        else:
+            lines.append(label + ' 账号：未登录，先「登录' + label + '账号」。')
+        others = [name for name in enabled_engines() if name != engine]
+        if others:
+            # 这里只列，不切换执行器：切执行器有专门入口，
+            # 在本页混进切执行器的按钮，会把「换渠道」和「换执行器」两件事搅在一起。
+            lines.append('')
+            lines.append('其他执行器（到「切换执行器」里切）：'
+                         + '、'.join(ENGINES[name]['label'] for name in others))
+        send_options(chat, '\n'.join(lines), options)
+
+    @on_text(match=lambda text: text in ('使用接口密钥', '使用Claude账号', '使用CodeBuddy账号', '使用Codex账号') or text.startswith(('使用接口密钥 ', '使用账号 ')))
+    def _cmd_使用接口密钥(self, chat, text, update_id):
+        # 跨执行器切换时，文本里带引擎名；直接点「使用Claude账号」这类旧按钮时按标签反查。
+        # 两者都认不出来就明确报错，不要在这里抛 StopIteration 糊掉。
+        engine = ''
+        if text.startswith(('使用接口密钥 ', '使用账号 ')):
+            engine = text.partition(' ')[2]
+        elif text == '使用接口密钥':
+            engine = current_engine()
+        else:
+            engine = next((name for name, spec in ENGINES.items()
+                           if text == '使用' + spec['label'] + '账号'), '')
+        if engine not in ENGINES:
+            raise MediaError('未知执行器。')
+        account = text.startswith('使用账号 ') or text.endswith('账号')
+        if account:
+            ok, _ = account_authorized(engine)
+            if not ok:
+                raise MediaError('还没有确认' + engine_spec(engine)['label'] + '账号登录，请先发送“登录' + engine_spec(engine)['label'] + '”。')
+        set_auth_channel('account' if account else 'gateway', engine)
+        label = engine_spec(engine)['label']
+        if account:
+            extra = ('\n账号模式模型：' + (account_model(engine) or '官方默认')
+                     + '\n可发送“账号模型”选择具体模型。')
+        else:
+            extra = '\n已回到接口密钥渠道，模型沿用“模型设置”里的网关模型。'
+        # 不自动改当前执行器：切渠道只改「用哪个身份」，
+        # 顺手把执行器也换掉，等于替用户做了另一件事。
+        switching = engine != current_engine()
+        if switching:
+            extra += ('\n当前执行器仍是 ' + engine_spec(current_engine())['label']
+                      + '，要先换到 ' + label + ' 才用得上这个渠道。')
+        send(chat, label + ' 已切换到：' + channel_label(engine) + extra + '\n仅影响该执行器的新任务。')
+        if switching:
+            send_options(chat, '要把执行器换成 ' + label + ' 吗？',
+                         [(engine_spec(engine)['button'], engine_spec(engine)['button'])])
+
+    @on_text('账号模型')
+    def _cmd_账号模型(self, chat, text, update_id):
+        engine = current_engine()
+        label = engine_spec(engine)['label']
+        if auth_channel(engine) != 'account':
+            # 换渠道的操作就在这里，不必让机主先退出去找「渠道切换」再回来。
+            raise MediaError('当前走接口密钥渠道，没有账号模型可选。'
+                             '到「模型与会话 → 渠道切换」切到账号后，这里才会列出账号可用的模型。')
+        models = account_model_options(engine)
+        if not models:
+            raise MediaError(label + ' 账号模式暂无可选模型清单。')
+        current = account_model(engine)
+        lines = [label + ' 账号模式模型\n当前：' + (current or '官方默认'),
+                 '账号模式与接口密钥模式各用各的模型，互不影响。',
+                 '官方对账号模式有可用范围限制，清单之外的模型会被直接拒绝。']
+        options = [('账号模型 默认', '账号模型 默认')]
+        options.extend((name + (' ·当前' if mid == current else ''), '账号模型 ' + mid)
+                       for mid, name in models)
+        send_options(chat, '\n'.join(lines), options)
+
+    @on_text(match=lambda text: text.startswith('账号模型 '))
+    def _cmd_账号模型_2(self, chat, text, update_id):
+        engine = current_engine()
+        choice = text.partition(' ')[2].strip()
+        model = '' if choice in ('默认', 'default') else choice
+        set_account_model(engine, model)
+        if auth_channel(engine) != 'account':
+            # 记下来但不生效最容易让人以为设错了，这里说清什么时候才用得上。
+            send(chat, engine_spec(engine)['label'] + ' 账号模式模型已记为：' + (model or '官方默认')
+                 + '\n但当前走接口密钥渠道，这次选择要等切到账号模式才生效。')
+            return
+        label = engine_spec(engine)['label']
+        send(chat, label + ' 账号模式模型已设为：' + (model or '官方默认')
+             + '\n仅影响该执行器的新任务。')
+
+    @on_text('授权GitHub')
+    def _cmd_授权GitHub(self, chat, text, update_id):
+        send_rich(chat, start_github_device_flow(chat))
+
+    @on_text('授权Cloudflare')
+    def _cmd_授权Cloudflare(self, chat, text, update_id):
+        # 默认走设备码：一次点击 + 一次输码，比让机主去后台勾二十几个权限项省事得多。
+        send_rich(chat, start_cloudflare_device_flow(chat))
+
+    @on_text('云flare粘贴令牌')
+    def _cmd_云flare粘贴令牌(self, chat, text, update_id):
+        # 备选入口。它不是「默认路径」的下半段，而是一条独立的窄路：
+        # 只要某个站点、不要整账号、或者不想要会过期的 OAuth 令牌时走这里。
+        # 用两步确认而不是直接进「等待令牌」态：否则机主点错按钮之后，
+        # 下一条正常任务描述就会被当成令牌去校验，白跑一次还报错。
+        PENDING_TOKEN.update({'provider': 'cloudflare', 'chat': chat,
+                              'expires_at': time.time() + 300})
+        send(chat, '改用粘贴 API 令牌。请到 Cloudflare 控制台「我的个人资料 → API 令牌」'
+                   '创建一个令牌，权限按需勾选（建议只给要用的站点与 Zone 读/编辑），'
+                   '然后把它整段发给我。\n'
+                   '五分钟后自动失效；现在也可以发「取消授权」放弃。\n'
+                   '不接受账号密码、Global API Key。')
+
+    @on_text('取消授权', '取消')
+    def _cmd_取消授权(self, chat, text, update_id):
+        PENDING_TOKEN.update({'provider': '', 'chat': None, 'expires_at': 0})
+        send(chat, '已取消本次授权输入。')
+
+    @on_text('授权状态')
+    def _cmd_授权状态(self, chat, text, update_id):
+        send(chat, auth_status_text())
+
+    @on_text('撤销授权')
+    def _cmd_撤销授权(self, chat, text, update_id):
+        send_options(chat, '要撤销哪一个平台的授权？撤销后新任务不再拿到对应凭据。',
+                     ['撤销GitHub', '撤销Cloudflare'])
+
+    @on_text('撤销GitHub', '撤销Cloudflare')
+    def _cmd_撤销GitHub(self, chat, text, update_id):
+        provider = 'github' if text == '撤销GitHub' else 'cloudflare'
+        removed = credentials().drop(provider)
+        if provider == 'github':
+            # 内存里可能还有一轮等待中的设备码，撤销后必须一起清掉，
+            # 否则轮询线程还会把新拿到的令牌写回去。
+            DEVICE_FLOW.update({'provider': '', 'device_code': '', 'user_code': ''})
+        else:
+            # Cloudflare 同理。别漏这一步：撤销之后三十秒轮询才成功，
+            # 凭据就又回来了，机主会以为撤销没生效。
+            CLOUDFLARE_FLOW.update({'thread': None, 'device_code': '', 'user_code': ''})
+        send(chat, (PROVIDERS[provider]['label'] + ' 授权已撤销，凭据已从本机删除。'
+                    '注意：这只是删掉本地那份，平台侧的授权仍然存在，需要在平台页面另行撤销。'
+                    if removed else PROVIDERS[provider]['label'] + ' 本来就没有保存的凭据。'))
+
+    @on_text('长期记忆', '技能查询')
+    def _cmd_长期记忆(self, chat, text, update_id):
+        prompt = ('只读查询当前CLI可用的长期记忆来源和已保存条目摘要。不要读取认证文件，不修改或创建记忆；不存在时明确说明。'
+                  if text == '长期记忆' else '只读列出当前CLI实际可用技能的名称、用途和调用方式；以实际配置为准，不安装、不执行技能、不读取密钥。')
+        snap = self.snapshot()
+        snap['strategy'] = '先出方案'
+        task = self.enqueue(chat, prompt, snapshot=snap, update_id=update_id)
+        if task:
+            send(chat, text + '查询已排队：' + task['id'])
+
+    @on_text('巡检配置', '巡检')
+    def _cmd_巡检配置(self, chat, text, update_id):
+        send(chat, '定时巡检尚未启用，未创建任何定时任务。可先说明目标机器、检查项目、频率和告警方式，再另行配置。手动查询请点“主机状态”。')
+
+    @on_text(match=lambda text: text in CHECKS or text in ('服务器状态', '/resources'))
+    def _cmd_服务器状态(self, chat, text, update_id):
+        task = self.enqueue(chat, text, 'quick', update_id=update_id)
+        if task:
+            send(chat, '只读状态查询已排队：' + task['id'])
+
 
 
 def show_model_items(chat, models, page=0, key=None):

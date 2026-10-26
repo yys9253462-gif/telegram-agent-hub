@@ -47,6 +47,10 @@ def handled_labels():
     """扫描源码里被比较过的字符串字面量，当作「有分支接住」的证据。"""
     labels = set()
     for node in ast.walk(TREE):
+        # 命令表登记：@on_text('按钮名', ...)
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == 'on_text'):
+            labels.update(arg.value for arg in node.args
+                          if isinstance(arg, ast.Constant) and isinstance(arg.value, str))
         if not isinstance(node, ast.Compare):
             continue
         for operand in [node.left, *node.comparators]:
@@ -145,9 +149,9 @@ class HandlerCoverageTest(unittest.TestCase):
     def test_group_owner_message_mentions_current_engine(self):
         """执行器现状直接写在入口标题里，所以不再需要单独的「当前智能体」按钮。"""
         self.assertIn('current_engine()', SOURCE)
-        block = SOURCE.split("elif text in ('选择智能体', '/agent'):", 1)
+        block = SOURCE.split("@on_text('选择智能体', '/agent')", 1)
         self.assertEqual(len(block), 2, '未找到选择智能体分支')
-        self.assertIn('current_engine()', block[1].split('elif', 1)[0],
+        self.assertIn('current_engine()', block[1].split('@on_text', 1)[0],
                       '选择智能体标题里应当显示当前执行器')
 
 
