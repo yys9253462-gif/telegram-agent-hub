@@ -279,7 +279,7 @@ class ConcurrencyTests(unittest.TestCase):
                         raise RuntimeError('写入前未登记进程')
                 process.stdin.write.side_effect = write_prompt
                 process.stdout = io.StringIO('{"type":"result","result":"测试结果"}\n')
-                def api(method, payload):
+                def api(method, payload, retries=None):
                     calls.append((method, payload))
                     if method == 'editMessageText' and limiter['remaining'] > 0:
                         limiter['remaining'] -= 1

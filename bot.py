@@ -88,7 +88,7 @@ ACTION_UI_TTL = 300
 API_RETRIES = 3
 
 
-def api(method, payload):
+def api(method, payload, retries=None):
     """调用电报接口。限流（429）、服务端 5xx 与网络抖动自动重试几次。
 
     线上见过：连发几条长消息被 429，异常直接冒到消息循环，用户那条消息
@@ -96,7 +96,7 @@ def api(method, payload):
     问题，重试没用，直接抛出。getUpdates 自己有外层重试，不在这里叠加。
     """
     data = json.dumps(payload).encode()
-    attempts = 1 if method == 'getUpdates' else API_RETRIES
+    attempts = retries or (1 if method == 'getUpdates' else API_RETRIES)
     for attempt in range(attempts):
         request = urllib.request.Request(BASE + method, data=data, headers={'Content-Type': 'application/json'})
         try:
@@ -2326,6 +2326,14 @@ STREAM_CONTENT_CAP = 72000
 # 正文没变化时没必要这么勤，放宽到 600 毫秒，只在状态文字上打转。
 STREAM_EDIT_MIN = 0.25      # 正文有新增时的最短刷新间隔（秒）
 STREAM_EDIT_IDLE = 0.6      # 仅有状态变化时的最短刷新间隔（秒）
+# 长任务的持续节奏。线上事故（2026-10-26）：一个任务跑工具时正文不动，
+# 但「已运行N秒」每秒都变，于是每 0.6 秒编辑一次同一条消息，连续几分钟。
+# Telegram 对单个聊天的持续编辑频率约一秒一次，超了会被 flood control
+# 封几分钟（retry_after 动辄上百秒），用户看到的就是「跑到 170 秒不动了」。
+# 所以开头一分钟保持流畅，之后降到持续安全的频率。
+STREAM_WARMUP = 60          # 前这么多秒用上面的快节奏
+STREAM_EDIT_MIN_LONG = 1.2  # 之后正文有新增时的最短间隔
+STREAM_EDIT_IDLE_LONG = 4.0 # 之后仅状态变化（计时、换工具）时的最短间隔
 
 
 def append_content(state, chunk):
@@ -2590,8 +2598,10 @@ def run_stream(chat, text):
         if len(value) > 4000:
             value = value[:4000]
         try:
+            # 不走 api() 内部的限流重试：那会在封禁期内提前重试、让窗口越拉越长。
+            # 流式帧丢一帧无所谓，交给下面的退避逻辑统一处理。
             api('editMessageText', {'chat_id': chat, 'message_id': message_id,
-                                    'text': render_reply(value), 'parse_mode': 'HTML'})
+                                    'text': render_reply(value), 'parse_mode': 'HTML'}, retries=1)
             send_state['shown'] = value
         except urllib.error.HTTPError as exc:
             raw = {}
@@ -2604,6 +2614,7 @@ def run_stream(chat, text):
             if exc.code == 429 or 'retry_after' in (raw.get('parameters') or {}):
                 delay = (raw.get('parameters') or {}).get('retry_after', 3)
                 send_state['hold_until'] = time.monotonic() + delay
+                print('流式刷新被限流，暂停 ' + str(delay) + ' 秒', flush=True)
         except Exception:
             send_state['hold_until'] = time.monotonic() + 3
 
@@ -2627,6 +2638,45 @@ def run_stream(chat, text):
                 frames.notify()
         if sender_thread.is_alive():
             sender_thread.join(timeout=6)
+
+    def deliver_final(value):
+        """最终答案必须送达，不能像流式帧那样「丢一帧无所谓」。
+
+        原来最终答案也走 push_edit：正赶上限流退避期就被直接跳过，
+        任务明明跑完了，气泡却永远停在某个进度上。这里等退避结束再编辑，
+        仍不成功就改发一条新消息。
+        """
+        full = label + redact(value)
+        if full == send_state['shown']:
+            return
+        text = full[:4000]
+        deadline = time.monotonic() + 600
+        while True:
+            hold = send_state.get('hold_until', 0) - time.monotonic()
+            if hold > 0:
+                if time.monotonic() + hold > deadline:
+                    break
+                time.sleep(hold)
+            try:
+                api('editMessageText', {'chat_id': chat, 'message_id': message_id,
+                                        'text': render_reply(text), 'parse_mode': 'HTML'}, retries=1)
+                send_state['shown'] = full
+                return
+            except urllib.error.HTTPError as exc:
+                try:
+                    raw = json.loads(exc.read() or b'{}')
+                except Exception:
+                    raw = {}
+                description = str(raw.get('description') or '')
+                if 'not modified' in description:
+                    return
+                if exc.code == 429:
+                    send_state['hold_until'] = time.monotonic() + float((raw.get('parameters') or {}).get('retry_after', 3))
+                    continue
+                break
+            except Exception:
+                break
+        send_formatted(chat, full)
     try:
         if stdin_text:
             # 先登记进程，再写入；停止或关闭可终止因管道写满而阻塞的任务。
@@ -2681,7 +2731,10 @@ def run_stream(chat, text):
             #     保证每段都以完整形态定格，不会停在半句话上。
             now = time.monotonic()
             grew = len(content) > last_content_len
-            interval = STREAM_EDIT_MIN if grew else STREAM_EDIT_IDLE
+            if now - started < STREAM_WARMUP:
+                interval = STREAM_EDIT_MIN if grew else STREAM_EDIT_IDLE
+            else:
+                interval = STREAM_EDIT_MIN_LONG if grew else STREAM_EDIT_IDLE_LONG
             settled = block_finished and len(content) > last_content_len
             if settled or now - last_edit >= interval:
                 last_edit = now
@@ -2738,8 +2791,8 @@ def run_stream(chat, text):
         # 先把最终答案交给后台发送器，等它把这一帧发完再决定要不要补发分片。
         # 这里必须等一次：不等的话，尾部的执行摘要可能在分片消息之后才到达，
         # 顺序就乱了（用户看到「结果 → 摘要 → 结果的后半段」）。
-        edit(head)
         close_sender()
+        deliver_final(head)
         # 首片已通过编辑消息呈现，其余分片补发。
         for piece in pieces[1:]:
             send_formatted(chat, label + piece)
