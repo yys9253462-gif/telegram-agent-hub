@@ -85,13 +85,42 @@ ACTION_UI_LOCK = threading.Lock()
 ACTION_UI_LIMIT = 512
 ACTION_UI_TTL = 300
 
+API_RETRIES = 3
+
+
 def api(method, payload):
-    request = urllib.request.Request(BASE + method, data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json'})
-    with urllib.request.urlopen(request, timeout=45) as response:
-        body = json.load(response)
-    if not body.get('ok'):
-        raise RuntimeError('机器人接口返回失败')
-    return body['result']
+    """调用电报接口。限流（429）、服务端 5xx 与网络抖动自动重试几次。
+
+    线上见过：连发几条长消息被 429，异常直接冒到消息循环，用户那条消息
+    就这么没了回应。429 会带 retry_after，照着等即可；其它 4xx 是请求本身的
+    问题，重试没用，直接抛出。getUpdates 自己有外层重试，不在这里叠加。
+    """
+    data = json.dumps(payload).encode()
+    attempts = 1 if method == 'getUpdates' else API_RETRIES
+    for attempt in range(attempts):
+        request = urllib.request.Request(BASE + method, data=data, headers={'Content-Type': 'application/json'})
+        try:
+            with urllib.request.urlopen(request, timeout=45) as response:
+                body = json.load(response)
+        except urllib.error.HTTPError as exc:
+            retry_after = None
+            if exc.code == 429:
+                try:
+                    retry_after = json.loads(exc.read() or b'{}').get('parameters', {}).get('retry_after')
+                except (ValueError, OSError, AttributeError):
+                    retry_after = None
+            if attempt + 1 < attempts and (exc.code == 429 or exc.code >= 500):
+                time.sleep(min(30, float(retry_after or 2 ** attempt)))
+                continue
+            raise
+        except (urllib.error.URLError, TimeoutError, ConnectionError):
+            if attempt + 1 < attempts:
+                time.sleep(2 ** attempt)
+                continue
+            raise
+        if not body.get('ok'):
+            raise RuntimeError('机器人接口返回失败')
+        return body['result']
 
 # 顶层只留高频操作：派任务、看进度、急停、看机器、两个二级入口。
 # 配置和授权入口使用消息内联按钮，首页底部键盘保持六项常用操作。
@@ -171,7 +200,7 @@ def home_menu_text():
     """首页信息集中展示，避免返回首页与显示菜单的文案漂移。"""
     return ('智能体工作台\n'
             '────────────────\n'
-            '当前模型  ·  ' + current_model() + '\n'
+            '执行器    ·  ' + model_label() + '\n'
             '执行方式  ·  ' + strategy_name() + '\n'
             '会话状态  ·  ' + ('继续当前会话' if session_id() else '准备开始') + '\n'
             '────────────────\n'
@@ -721,6 +750,19 @@ def set_account_model(engine, model):
 
 
 USAGE = UsageReporter(credential=usage_credential)
+
+
+def model_label(engine=None, channel=None, gateway_model=None):
+    """人读的「执行器 · 渠道 · 模型」。
+
+    账号渠道实际用的是账号模型，不是网关模型；原来首页与进度只显示网关
+    模型，切到账号模式后看到的模型名和实际在跑的不一致。
+    """
+    engine = engine or current_engine()
+    channel = channel or auth_channel(engine)
+    if channel == 'account':
+        return engine_spec(engine)['label'] + ' · 账号 · ' + (account_model(engine) or '官方默认')
+    return engine_spec(engine)['label'] + ' · 接口密钥 · ' + str(gateway_model or current_model())
 
 
 def execution_footer(engine=None, started=None, started_wall=None):
@@ -1894,7 +1936,7 @@ def quick_action(chat, text):
     elif text in ('继续会话', '/resume'):
         send(chat, '发送下一条任务即可继续当前会话。' if session_id() else '目前没有会话，发送任务即可开始。')
     elif text == '会话信息':
-        send(chat, '当前会话：' + (session_id() or '尚未开始') + '\n当前模型：' + current_model() + '\n任务并发执行，每项上限三十分钟、最多八十轮；繁忙会话自动隔离。')
+        send(chat, '当前会话：' + (session_id() or '尚未开始') + '\n当前执行器：' + model_label() + '\n任务并发执行，每项上限三十分钟、最多八十轮；繁忙会话自动隔离。')
     elif text == '工作目录':
         send(chat, '默认工作目录：' + str(WORK) + '\n可以在任务中指定其他服务器路径。')
     elif text == '权限状态':
@@ -2155,6 +2197,22 @@ def agent_message_separator(buffer):
     if not buffer or buffer.endswith('\n\n') or buffer[-1].isspace():
         return ''
     return '\n\n'
+
+
+def failure_hint(message):
+    """按报错给一句具体的下一步，而不是每次都同一句泛泛的建议。"""
+    text = str(message or '').lower()
+    if session_history_incompatible(text) or session_error_is_recoverable(text):
+        return '会话记录与当前渠道不兼容，已自动换新会话，直接重发即可。'
+    if any(word in text for word in ('429', 'rate limit', 'rate_limit', 'usage limit', 'quota', '额度', 'limit reached')):
+        return '额度或频率到上限了：可在「查看进度」看用量刷新时间，或切换渠道/模型后重试。'
+    if any(word in text for word in ('401', '403', 'unauthorized', 'authentication', 'invalid api key', 'oauth token', '未登录')):
+        return '登录或密钥失效：到「模型与会话」重新登录账号，或检查接口密钥。'
+    if any(word in text for word in ('timeout', 'timed out', 'overloaded', '529', '502', '503')):
+        return '模型服务暂时不稳定，稍等片刻重发即可。'
+    if any(word in text for word in ('model', 'unavailable', '不支持')):
+        return '当前模型可能不可用：到「模型与会话」换一个模型后重试。'
+    return '可检查当前模型的套餐权限、额度和工具兼容性；也可以切换模型后重试。'
 
 
 def pick_final_answer(final_result, content):
@@ -2651,7 +2709,7 @@ def run_stream(chat, text):
             if state['failed'] and answer in ('', '任务未返回内容，请检查模型接口。'):
                 # 整轮失败且没有正文时，把失败原因直接给出来，比一句「未返回内容」有用得多。
                 answer = state['failed']
-            answer = '本轮执行未成功。\n' + answer + '\n可检查当前模型的套餐权限、额度和工具兼容性；也可以切换模型后重试。已执行的操作不会自动回滚，请先核对结果。'
+            answer = '本轮执行未成功。\n' + answer + '\n' + failure_hint(state['failed'] or answer) + '已执行的操作不会自动回滚，请先核对结果。'
         if crashed and session_history_incompatible(state['failed'] or answer):
             state['session_invalid'] = True
         if state.get('session_invalid'):
@@ -3418,11 +3476,20 @@ class TaskController:
 
     def task_summary(self, task):
         snap = task['snapshot']
-        return (task['id'] + ' | ' + task['status'] + ' | ' + task['kind']
-                + '\n执行器：' + snap.get('engine', 'claude') + '\n模型：' + snap['model'] + '；目标：' + snap['target'] + '；策略：' + snap['strategy']
-                + '\n会话：' + self.data['sessions'][snap['session_key']]['name']
-                + '\n耗时：' + str(int(max(0, task.get('finished', time.time()) - task.get('started', task['created'])))) + '秒'
-                + '\n最近工具：' + ('、'.join(task.get('tools', [])[-3:]) or '暂无'))
+        status = {'running': '运行中', 'queued': '排队中', 'completed': '已完成', 'failed': '失败',
+                  'cancelled': '已停止', 'awaiting_confirmation': '待确认'}.get(task['status'], task['status'])
+        engine = snap.get('engine', 'claude')
+        session = self.data['sessions'].get(snap['session_key'], {}).get('name', '?')
+        summary = (status + ' · 任务 ' + task['id'] + '\n'
+                   + model_label(engine, snap.get('auth_channel', 'gateway'), snap['model'])
+                   + ' · ' + snap['target'] + ' · ' + snap['strategy']
+                   + '\n会话：' + session
+                   + '\n耗时：' + format_elapsed(task.get('finished', time.time()) - task.get('started', task['created']))
+                   + '\n最近工具：' + ('、'.join(task.get('tools', [])[-3:]) or '暂无'))
+        brief = ' '.join(str(task.get('text') or '').split())
+        if brief and task.get('kind') in ('agent', 'media'):
+            summary += '\n内容：' + (brief[:40] + '…' if len(brief) > 40 else brief)
+        return summary
 
     def next_task(self):
         occupied = {state['task']['snapshot']['session_key'] for state in self.running.values()
@@ -3589,7 +3656,7 @@ class TaskController:
             with self.lock:
                 self.data['engine'] = desired
                 self.persist()
-            send(chat, '新任务执行器已切换为：' + desired + '。已有排队或运行任务保持原执行器。')
+            send(chat, '新任务执行器已切换为：' + model_label(desired) + '。已有排队或运行任务保持原执行器。')
         elif text == '当前智能体':
             # 旧版留给老键盘和习惯输入，功能并入「选择智能体」。
             send(chat, '当前执行器：' + current_engine() + '\n共享记忆和技能；原生会话独立，最近六项任务摘要交接。CodeBuddy保留自身高风险确认规则，不伪装成隔离沙箱绕过。\n注意 Codex 走 codex exec，无系统提示词参数，指令与任务会拼在同一条 prompt 里。')
@@ -3601,7 +3668,7 @@ class TaskController:
                 count = sum(item['status'] == 'queued' for item in self.data['tasks'])
                 stops = [('停止 ' + task_id[:8], '停止任务 ' + task_id) for task_id, state in self.running.items()
                          if state['task']['chat'] == chat]
-            title = current + '\n排队：' + str(count) + '\n新任务设置：' + current_model() + ' / ' + self.target + ' / ' + strategy_name() + '\n运行和排队任务保留各自设置。实时系统资源请选择“服务器状态”。'
+            title = current + '\n\n排队：' + str(count) + ' 项\n新任务：' + model_label() + ' · ' + self.target + ' · ' + strategy_name()
             title += '\n\n' + usage_overview_text()
             if stops:
                 send_options(chat, title, stops + ['刷新用量'])
@@ -3902,7 +3969,7 @@ class TaskController:
             if auth_channel(engine) != 'account':
                 # 换渠道的操作就在这里，不必让机主先退出去找「渠道切换」再回来。
                 raise MediaError('当前走接口密钥渠道，没有账号模型可选。'
-                                 '到「设置 → 渠道切换」切到账号后，这里才会列出账号可用的模型。')
+                                 '到「模型与会话 → 渠道切换」切到账号后，这里才会列出账号可用的模型。')
             models = account_model_options(engine)
             if not models:
                 raise MediaError(label + ' 账号模式暂无可选模型清单。')
@@ -3975,7 +4042,7 @@ class TaskController:
             if task:
                 send(chat, text + '查询已排队：' + task['id'])
         elif text in ('巡检配置', '巡检'):
-            send(chat, '定时巡检尚未启用，未创建任何定时任务。可先说明目标机器、检查项目、频率和告警方式，再另行配置。手动查询请选择“服务器状态”。')
+            send(chat, '定时巡检尚未启用，未创建任何定时任务。可先说明目标机器、检查项目、频率和告警方式，再另行配置。手动查询请点“主机状态”。')
         elif text in CHECKS or text in ('服务器状态', '/resources'):
             task = self.enqueue(chat, text, 'quick', update_id=update_id)
             if task:
@@ -3989,7 +4056,7 @@ class TaskController:
         elif LOGIN_PENDING.exists() and looks_like_login_code(text):
             # 只在确有登录进程在等时才会走到这里，避免把普通文本误当授权码吞掉。
             ok, detail = submit_login_code(text)
-            send(chat, 'Claude 账号登录成功。\n' + detail + '\n\n要改用它，请到“设置 → 渠道切换 → 使用Claude账号”。'
+            send(chat, 'Claude 账号登录成功。\n' + detail + '\n\n要改用它，请到“模型与会话 → 渠道切换 → 使用Claude账号”。'
                       if ok else '授权码未通过校验：' + detail + '\n可以重新发送“登录Claude”获取新链接。')
         else:
             # 入队不再单独发一条「已加入队列 + 摘要」：那条消息与随后
@@ -4031,16 +4098,32 @@ def show_model_items(chat, models, page=0, key=None):
          + '，共' + str(len(models)) + '项。新任务生效，目录不保证套餐或工具兼容性。', 'reply_markup': {'inline_keyboard': rows}})
 
 
+def answer_callback(callback, text=None):
+    """回执按钮点击，只为让客户端停止转圈。
+
+    机器人重启或处理慢了，query 超过时限后回执会 400（query is too old）。
+    原来这个异常直接让整次点击失败，用户只看到「本次操作失败」。
+    回执失败不影响按钮功能本身，所以吞掉。
+    """
+    payload = {'callback_query_id': callback.get('id')}
+    if text:
+        payload['text'] = text
+    try:
+        api('answerCallbackQuery', payload)
+    except Exception:
+        pass
+
+
 def handle_update(update):
     callback = update.get('callback_query')
     message = callback.get('message', {}) if callback else update.get('message', {})
     sender = callback.get('from', {}) if callback else message.get('from', {})
     if sender.get('id') != OWNER or message.get('chat', {}).get('type') != 'private':
         if callback:
-            api('answerCallbackQuery', {'callback_query_id': callback['id'], 'text': '仅机主可操作'})
+            answer_callback(callback, '仅机主可操作')
         return
     if callback:
-        api('answerCallbackQuery', {'callback_query_id': callback['id']})
+        answer_callback(callback)
     # chat id 与 update_id 理论上必然存在，但缺了会直接 KeyError。
     # 缺 update_id 尤其致命：异常会穿过 main 的轮询循环，让整个机器人退出，
     # 而 next_offset 已经推进 —— 这条更新连同其后的消息全部丢失。
@@ -4167,10 +4250,14 @@ def main():
                 try:
                     handle_update(update)
                 except Exception as exc:
-                    print('消息处理失败：' + type(exc).__name__, flush=True)
+                    reason = type(exc).__name__
+                    if isinstance(exc, urllib.error.HTTPError):
+                        reason += ' ' + str(exc.code)
+                    print('消息处理失败：' + reason, flush=True)
                     message = update.get('message') or update.get('callback_query', {}).get('message', {})
                     if message.get('chat', {}).get('id') == OWNER:
-                        CONTROL.notify(OWNER, str(exc) if isinstance(exc, MediaError) else '本次操作失败，请重试。任务结果可在历史中核对。')
+                        CONTROL.notify(OWNER, str(exc) if isinstance(exc, MediaError)
+                                       else '这条消息没处理成功（' + reason + '），请再发一次。任务结果可在「查看进度」里核对。')
                     if not isinstance(exc, MediaError):
                         # 非预期异常：先推进 offset 再退出本轮。
                         # 原来的 break 发生在 offset 赋值之前，这条更新会被重新投递，
