@@ -71,6 +71,16 @@ class ReplyButtonsTest(unittest.TestCase):
             'type': 'message_delta', 'usage': {'input_tokens': 5}}}, s)
         self.assertEqual(s['context_used'], 30700)
 
+    def test_context_window_from_catalog(self):
+        original = bot.read_model_cache
+        bot.read_model_cache = lambda: [{'id': 'codex-gpt-6.1-sol', 'context': 856000}, {'id': 'x', 'context': None}]
+        try:
+            self.assertEqual(bot.model_context_window('codex-gpt-6.1-sol'), 856000)
+            self.assertEqual(bot.model_context_window('x'), 0)
+            self.assertEqual(bot.model_context_window('nope'), 0)
+        finally:
+            bot.read_model_cache = original
+
     def test_prompt_mentions_format(self):
         self.assertIn('【建议】', bot.SUGGEST_PROMPT)
 
