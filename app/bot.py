@@ -979,6 +979,7 @@ COLLAB_PROMPT = (
     '本轮启用「规划执行」模式：你是主代理，负责理解需求、制定计划、审核结果并给出最终结论。'
     '具体执行（运行命令、读写与修改文件、批量查询、跑测试）一律交给 executor 子代理：'
     '用 Agent 工具、subagent_type 选 executor，把要做的步骤、涉及的路径和验收标准写清楚。'
+    '调用 Agent 时必须设 run_in_background: false，等它返回再继续。这是一次性运行，你结束回复后进程立即退出，后台任务会被直接杀掉，也不会有完成通知；不要说「结果回来再汇报」然后结束。'
     '先把计划拆成若干块并判断依赖：互不依赖的块（例如检查不同的服务、改不同的文件、查不同的主机）'
     '要在同一条回复里同时发出多个 Agent 调用，让多个 executor 并行执行；'
     '后一步要用到前一步结果的，才按顺序一个个派。不要让两个 executor 同时改同一个文件或同一个服务。'
@@ -1847,7 +1848,8 @@ def await_token_input(chat, text, update_id=None):
 
 def model_environment():
     model = current_model()
-    environment = {**os.environ, 'DISABLE_AUTOUPDATER': '1'}
+    # 后台子代理/后台命令在 -p 一次性运行里会随进程退出被杀，任务就「中断」了，统一关掉。
+    environment = {**os.environ, 'DISABLE_AUTOUPDATER': '1', 'CLAUDE_CODE_DISABLE_BACKGROUND_TASKS': '1'}
     environment.update({name: model for name in MODEL_PIN_VARS})
     if auth_channel() == 'account':
         return account_environment(environment, current_engine())
