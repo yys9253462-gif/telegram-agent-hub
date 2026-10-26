@@ -93,7 +93,7 @@ class ProjectTests(unittest.TestCase):
             self.b.send_file(1, str(path))
 
     def test_render_and_scan_negative_control(self):
-        self.assertEqual(self.b.render_reply('## 标题'), '<b>标题</b>')
+        self.assertEqual(self.b.render_reply('## 标题'), '🟦 <b>标题</b>')
         self.assertEqual(self.b.render_reply('<script>'), '&lt;script&gt;')
         scanner = load('security_check')
         fake = self.root / 'negative.txt'
