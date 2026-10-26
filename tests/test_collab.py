@@ -87,6 +87,70 @@ class CollabTest(unittest.TestCase):
         finally:
             bot.TASK_LOCAL.task = None
 
+    def press(self, text):
+        """模拟机主点按钮，返回 (send 的文字列表, send_options 的 (标题, 按钮命令列表))。"""
+        with patch.object(bot, 'current_engine', return_value='claude'), \
+             patch.object(bot, 'send') as send, patch.object(bot, 'send_options') as options:
+            bot.TaskController(self.folder).handle_text(1, text)
+        texts = [call.args[1] for call in send.call_args_list]
+        page = None
+        if options.call_args:
+            title, labels = options.call_args.args[1], options.call_args.args[2]
+            page = (title, [item[1] if isinstance(item, tuple) else item for item in labels])
+        return texts, page
+
+    def test_guided_flow_main_then_worker_then_enable(self):
+        """规划执行要按顺序引导：先选主模型 → 再选执行模型 → 最后确认开启。"""
+        _, (title, commands) = self.press('规划执行')
+        self.assertIn('第 1 步', title)
+        self.assertIn('规划主模型 big-model', commands)
+        _, (title, commands) = self.press('规划主模型 big-model')
+        self.assertIn('主模型已设为：big-model', title)
+        self.assertIn('第 2 步', title)
+        self.assertIn('执行模型 fast-model', commands)
+        self.assertFalse(bot.collab_worker('claude'), '还没确认开启，不能先生效')
+        _, (title, commands) = self.press('执行模型 fast-model')
+        self.assertIn('第 3 步', title)
+        self.assertIn('主模型（规划 + 审核）：big-model', title)
+        self.assertIn('执行模型（执行具体操作）：fast-model', title)
+        self.assertEqual(commands[0], '开启规划执行')
+        texts, _ = self.press('开启规划执行')
+        self.assertIn('规划执行已开启', texts[-1])
+        self.assertEqual(bot.collab_worker('claude'), 'fast-model')
+        self.assertEqual(bot.current_model(), 'big-model')
+
+    def test_entry_shows_status_when_enabled(self):
+        bot.set_collab('claude', worker='fast-model')
+        bot.set_collab('claude', enabled=True)
+        _, (title, commands) = self.press('规划执行')
+        self.assertIn('规划执行已开启', title)
+        self.assertEqual(commands, ['关闭规划执行', '重新设置规划执行'])
+        _, (title, _) = self.press('重新设置规划执行')
+        self.assertIn('第 1 步', title)
+
+    def test_account_main_model_goes_to_account_setting(self):
+        bot.set_auth_channel('account', 'claude')
+        _, (_, commands) = self.press('规划执行')
+        self.assertIn('规划主模型 opus', commands)
+        self.press('规划主模型 opus')
+        self.assertEqual(bot.account_model('claude'), 'opus')
+
+    def test_paging_and_search(self):
+        bot.MODEL_CACHE.write_text(json.dumps([{'id': 'model-' + str(i)} for i in range(30)]), encoding='utf-8')
+        _, (title, commands) = self.press('规划执行')
+        self.assertIn('第 1/3 页', title)
+        self.assertIn('规划模型页 main  1', commands)
+        _, (title, commands) = self.press('规划模型页 main  1')
+        self.assertIn('第 2/3 页', title)
+        self.assertIn('规划主模型 model-12', commands)
+        _, (title, commands) = self.press('搜索执行模型 model-2')
+        self.assertIn('第 2 步', title)
+        self.assertIn('执行模型 model-25', commands)
+
+    def test_unknown_model_is_rejected(self):
+        with self.assertRaises(bot.MediaError):
+            self.press('规划主模型 not-exist')
+
     def test_footer_shows_worker(self):
         bot.set_collab('claude', worker='fast-model')
         bot.set_collab('claude', enabled=True)
