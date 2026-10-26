@@ -23,18 +23,42 @@ def assistant(blocks, parent=None):
 class ProgressStepsTest(unittest.TestCase):
     def test_main_and_subagent_steps(self):
         s = state()
-        bot.parse_claude_event(assistant([{'type': 'tool_use', 'name': 'Agent',
+        bot.parse_claude_event(assistant([{'type': 'tool_use', 'name': 'Agent', 'id': 'call_1',
                                            'input': {'description': '盘点东京源码项目', 'prompt': '...'}}]), s)
-        bot.parse_claude_event(assistant([{'type': 'tool_use', 'name': 'Bash',
+        bot.parse_claude_event(assistant([{'type': 'tool_use', 'name': 'Bash', 'id': 't1',
                                            'input': {'command': "ssh tokyo 'ls /opt'"}}], parent='call_1'), s)
         bot.parse_claude_event({'type': 'user', 'parent_tool_use_id': 'call_1', 'message': {'content': [
-            {'type': 'tool_result', 'is_error': True, 'content': 'Permission denied'}]}}, s)
+            {'type': 'tool_result', 'tool_use_id': 't1', 'is_error': True, 'content': 'Permission denied'}]}}, s)
         bot.parse_claude_event(assistant([{'type': 'tool_use', 'name': 'Read',
                                            'input': {'file_path': '/opt/app/main.go'}}], parent='call_1'), s)
-        self.assertEqual(s['steps'], ['🤝 交给执行模型：盘点东京源码项目',
-                                      '↳ 💻 `tokyo: ls /opt` ✗',
-                                      '↳ 📖 `/opt/app/main.go`'])
+        self.assertEqual(s['steps'], ['🤝 #1 交给执行模型：盘点东京源码项目',
+                                      '↳1 💻 `tokyo: ls /opt` ✗',
+                                      '↳1 📖 `/opt/app/main.go`'])
         self.assertEqual(s['activity'], '执行模型工作中', '进度行不再重复命令')
+
+    def test_parallel_executors_are_numbered(self):
+        """三个执行模型并行：步骤交错到来，编号要对得上，失败标在正确的那一行。"""
+        s = state()
+        bot.parse_claude_event(assistant([{'type': 'tool_use', 'name': 'Agent', 'id': 'a1', 'input': {'description': '查日期'}}]), s)
+        bot.parse_claude_event(assistant([{'type': 'tool_use', 'name': 'Agent', 'id': 'a2', 'input': {'description': '查负载'}}]), s)
+        bot.parse_claude_event(assistant([{'type': 'tool_use', 'name': 'Agent', 'id': 'a3', 'input': {'description': '查磁盘'}}]), s)
+        bot.parse_claude_event(assistant([{'type': 'tool_use', 'name': 'Bash', 'id': 'b3', 'input': {'command': 'df -h /'}}], parent='a3'), s)
+        bot.parse_claude_event(assistant([{'type': 'tool_use', 'name': 'Bash', 'id': 'b1', 'input': {'command': 'date'}}], parent='a1'), s)
+        self.assertEqual(s['activity'], '3 个执行模型并行中')
+        # 先跑的 b3 失败，但它不是最后一行，✗ 必须标在它自己那一行
+        bot.parse_claude_event({'type': 'user', 'parent_tool_use_id': 'a3', 'message': {'content': [
+            {'type': 'tool_result', 'tool_use_id': 'b3', 'is_error': True}]}}, s)
+        self.assertEqual(s['steps'][3:], ['↳3 💻 `df -h /` ✗', '↳1 💻 `date`'])
+        self.assertEqual(s['steps'][:3], ['🤝 #1 交给执行模型：查日期', '🤝 #2 交给执行模型：查负载', '🤝 #3 交给执行模型：查磁盘'])
+        for agent in ('a1', 'a2'):
+            bot.parse_claude_event({'type': 'user', 'message': {'content': [{'type': 'tool_result', 'tool_use_id': agent}]}}, s)
+        self.assertEqual(s['activity'], '执行模型工作中')
+        bot.parse_claude_event({'type': 'user', 'message': {'content': [{'type': 'tool_result', 'tool_use_id': 'a3'}]}}, s)
+        self.assertEqual(s['activity'], '主模型复核中')
+
+    def test_collab_prompt_asks_for_parallel(self):
+        self.assertIn('同时发出多个 Agent 调用', bot.COLLAB_PROMPT)
+        self.assertIn('按顺序', bot.COLLAB_PROMPT)
 
     def test_preview_shows_recent_steps_in_quote(self):
         steps = ['💻 cmd ' + str(i) for i in range(9)]

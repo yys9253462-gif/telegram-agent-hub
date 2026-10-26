@@ -979,6 +979,9 @@ COLLAB_PROMPT = (
     '本轮启用「规划执行」模式：你是主代理，负责理解需求、制定计划、审核结果并给出最终结论。'
     '具体执行（运行命令、读写与修改文件、批量查询、跑测试）一律交给 executor 子代理：'
     '用 Agent 工具、subagent_type 选 executor，把要做的步骤、涉及的路径和验收标准写清楚。'
+    '先把计划拆成若干块并判断依赖：互不依赖的块（例如检查不同的服务、改不同的文件、查不同的主机）'
+    '要在同一条回复里同时发出多个 Agent 调用，让多个 executor 并行执行；'
+    '后一步要用到前一步结果的，才按顺序一个个派。不要让两个 executor 同时改同一个文件或同一个服务。'
     '每次 executor 返回后你要复核：核对输出与改动是否达到验收标准，必要时自己做只读抽查；'
     '有问题就把具体问题交回 executor 修正，直到确认无误。'
     '最后由你汇总结论回复机主，说明做了什么、验证了什么。'
@@ -2750,6 +2753,11 @@ def describe_tool(name, payload):
     return icon + ' `' + _clip(detail) + '`'
 
 
+def agents_activity(state):
+    running = len(state.get('running_agents') or ())
+    return str(running) + ' 个执行模型并行中' if running > 1 else '执行模型工作中'
+
+
 def add_step(state, text):
     steps = state.setdefault('steps', [])
     # 不裁剪：单任务最多 80 轮，全部留着才能如实显示「前面还有 N 步」。
@@ -2819,22 +2827,39 @@ def parse_claude_event(event, state):
                 tool = str(state.get('tool_name') or '')
                 state['activity'] = ('正在准备工具参数：' + tool) if tool else '正在准备工具参数'
     elif event.get('type') == 'assistant':
-        # parent_tool_use_id 非空：这是子代理（规划执行里的执行模型）内部的一步。
-        nested = bool(event.get('parent_tool_use_id'))
+        # parent_tool_use_id 非空：这是子代理（规划执行里的执行模型）内部的一步，
+        # 值就是主模型派它出去的那次 Agent 调用的 id。并行时靠它分清是哪个执行模型。
+        parent = event.get('parent_tool_use_id')
+        agents = state.setdefault('agents', {})
         for block in event.get('message', {}).get('content', []):
             if isinstance(block, dict) and block.get('type') == 'tool_use':
                 record_tool(str(block.get('name', '工具')))
                 step = describe_tool(block.get('name'), block.get('input'))
-                add_step(state, ('↳ ' if nested else '') + step)
-                if nested:
-                    # 进度行不再重复命令（上面的过程里已经有了），只说是谁在干活。
-                    state['activity'] = '执行模型工作中'
+                if not parent and block.get('name') in ('Agent', 'Task'):
+                    number = len(agents) + 1
+                    agents[block.get('id')] = number
+                    state.setdefault('running_agents', set()).add(block.get('id'))
+                    step = step.replace('🤝 ', '🤝 #' + str(number) + ' ', 1)
+                add_step(state, ('↳' + str(agents.get(parent, '')) + ' ' if parent else '') + step)
+                state.setdefault('step_of', {})[block.get('id')] = len(state['steps']) - 1
+                if parent:
+                    state['activity'] = agents_activity(state)
     elif event.get('type') == 'user':
-        # 工具返回失败时在那一步后面标 ✗，过程里能看出哪步没成。
         for block in (event.get('message') or {}).get('content') or []:
-            if isinstance(block, dict) and block.get('type') == 'tool_result' and block.get('is_error'):
-                if state.get('steps'):
-                    state['steps'][-1] += ' ✗'
+            if not isinstance(block, dict) or block.get('type') != 'tool_result':
+                continue
+            tool_id = block.get('tool_use_id')
+            # 工具返回失败时在那一步后面标 ✗。并行时最后一行未必是它，所以按 id 找回原来那一行。
+            index = state.get('step_of', {}).get(tool_id)
+            if block.get('is_error') and state.get('steps'):
+                index = index if index is not None else len(state['steps']) - 1
+                if not state['steps'][index].endswith(' ✗'):
+                    state['steps'][index] += ' ✗'
+            # 执行模型交回结果：从「进行中」里去掉。
+            running = state.get('running_agents')
+            if running and tool_id in running:
+                running.discard(tool_id)
+                state['activity'] = agents_activity(state) if running else '主模型复核中'
     elif event.get('type') == 'result':
         state['final'] = event
         if event.get('session_id'):
