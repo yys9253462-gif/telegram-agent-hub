@@ -155,7 +155,7 @@ KEYBOARD = {
 MENU_GROUPS = {
     '设置': {
         '任务与模型': ['模型', '账号模型', '思考强度', '规划执行', '模型供应商', '选择智能体'],
-        '会话与文件': ['新建会话', '会话列表'],
+        '会话与文件': ['新建会话', '会话列表', '压缩上下文'],
         '账号登录': ['登录Claude', '登录CodeBuddy', '登录Codex', '退出账号', '账号状态', '渠道切换'],
         '版本更新': ['检查版本', '更新机器人'],
     },
@@ -212,7 +212,9 @@ ALIASES.update({label: command for command, label in MENU_LABELS.items()})
 
 GROUP_DESCRIPTIONS = {
     '任务与模型': '选择执行目标、模型和智能体，管理待办任务。',
-    '会话与文件': '继续之前的对话，查找和发送任务文件。',
+    '会话与文件': '开新会话、切换旧会话，或把当前会话压缩成摘要腾出上下文。',
+    '账号登录': '登录或退出各执行器的官方账号，选择走账号还是接口密钥。',
+    '版本更新': '检查机器人是否有新版本并一键更新。',
     '生图与文档': '描述你的创意，选择生图模型和画幅。',
     '账号与渠道': '管理账号登录，切换模型调用渠道。',
     '平台授权': '连接代码仓库与云平台，让智能体调用你的授权。',
@@ -2193,15 +2195,38 @@ def send_options(chat, title, labels):
     api('sendMessage', {'chat_id': chat, 'text': redact(title), 'reply_markup': {
         'inline_keyboard': [buttons[index:index + 2] for index in range(0, len(buttons), 2)]}})
 
+GROUP_ICONS = {'任务与模型': '🧠 模型与执行', '会话与文件': '💬 会话', '账号登录': '🔑 账号与渠道',
+               '版本更新': '🔄 版本更新', '平台授权': '🔗 平台授权'}
+
+
+def settings_summary():
+    """「模型与会话」顶部的当前状态，一眼看清现在在用什么，不用逐个点进去查。"""
+    try:
+        engine = current_engine()
+        worker = collab_worker(engine)
+        lines = ['当前：' + model_label(engine),
+                 '思考强度：' + (current_effort(engine) or '默认')
+                 + ' · 规划执行：' + ('开（执行模型 ' + worker + '）' if worker else '关')]
+        return '\n'.join(lines)
+    except Exception as exc:
+        log_swallowed('设置摘要', exc)
+        return ''
+
+
 def send_group_menu(chat, title, groups):
-    """直接列出入口下的功能，按钮保留在这条消息下方。"""
-    send_options(chat, title, [label for items in groups.values() for label in items])
+    """入口下只有一组时直接列功能；多组时先列分组，点进去再看具体功能，避免一屏十几个按钮。"""
+    if len(groups) == 1:
+        send_options(chat, title, [label for items in groups.values() for label in items])
+        return
+    send_options(chat, title, [(GROUP_ICONS.get(name, name), name) for name in groups])
 
 
 def group_title(owner, group):
     """分组展开时的标题文案。集中在这里，避免两处实现各写一句、逐渐漂移。"""
-    intro = {'设置': '直接选择模型、智能体、会话或版本更新。',
-             '更多': '直接连接平台，查看或撤销授权。'}
+    if owner == '设置':
+        summary = settings_summary()
+        return MENU_LABELS.get(group, group) + ('\n' + summary if summary else '') + '\n\n选择要调整的类别：'
+    intro = {'更多': '直接连接平台，查看或撤销授权。'}
     return MENU_LABELS.get(group, group) + '\n' + intro.get(owner, '选择下面的功能。')
 
 
@@ -2216,8 +2241,9 @@ def expand_group(chat, text):
         items = groups.get(text)
         if items:
             # 标题带上级名字，避免两个菜单重名时看不出自己在哪一层。
-            send_options(chat, MENU_LABELS.get(owner, owner) + ' / ' + text
-                         + '\n\n' + GROUP_DESCRIPTIONS.get(text, '选择下面的功能。'), list(items))
+            back = [('‹ 返回', owner)] if len(groups) > 1 else []
+            send_options(chat, MENU_LABELS.get(owner, owner) + ' / ' + GROUP_ICONS.get(text, text)
+                         + '\n' + GROUP_DESCRIPTIONS.get(text, '选择下面的功能。'), list(items) + back)
             return True
     return False
 

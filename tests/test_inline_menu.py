@@ -54,8 +54,8 @@ class InlineMenuTests(unittest.TestCase):
             self.assertLessEqual(len(button['callback_data'].encode()), 64)
             self.assertEqual(bot.ACTION_UI[button['callback_data'][3:]]['command'], command)
 
-    def test_settings_and_auth_are_flat(self):
-        for owner, expected in [('设置', ['模型', '账号模型', '思考强度', '规划执行', '模型供应商', '选择智能体', '新建会话', '会话列表', '登录Claude', '登录CodeBuddy', '登录Codex', '退出账号', '账号状态', '渠道切换', '检查版本', '更新机器人']),
+    def test_settings_lists_groups_auth_is_flat(self):
+        for owner, expected in [('设置', ['任务与模型', '会话与文件', '账号登录', '版本更新']),
                                 ('更多', ['授权GitHub', '授权Cloudflare', '授权状态', '撤销授权'])]:
             bot.send_group_menu(123, '入口', bot.MENU_GROUPS[owner])
             self.assertEqual([bot.ACTION_UI[button['callback_data'][3:]]['command']
