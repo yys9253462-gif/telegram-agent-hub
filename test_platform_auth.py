@@ -613,7 +613,7 @@ class MenuEntryTest(unittest.TestCase):
     def test_cloudflare_paste_entry_present(self):
         """粘贴令牌这条路必须仍然可达，否则只想要单站点最小权限的机主无路可走。"""
         self.assertEqual(bot.ALIASES['手动填令牌'], '云flare粘贴令牌')
-        self.assertIn("elif text == '云flare粘贴令牌':", Path(bot.__file__).read_text(encoding='utf-8'))
+        self.assertIn("@on_text('云flare粘贴令牌')", Path(bot.__file__).read_text(encoding='utf-8'))
 
     def test_aliases_point_to_real_buttons(self):
         labels = set(bot.MENU_GROUPS['更多']['平台授权'])
