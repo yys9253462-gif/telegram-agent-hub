@@ -96,6 +96,8 @@ def load_install(app_dir):
         value = config.get(key)
         if not isinstance(value, str) or not Path(value).is_absolute():
             raise UpdateError('更新安装路径配置无效')
+    if GITHUB_TOKEN['value'] is None:
+        GITHUB_TOKEN['value'] = github_token(config['work_dir'])
     return config
 
 
@@ -145,11 +147,47 @@ def local_modified(app, manifest):
     return modified
 
 
+# 匿名访问 GitHub API 每小时只有 60 次，同一台机器上的任务（gh、脚本）也在消耗这份额度，
+# 用完后更新会一直失败。有令牌时带上（额度 5000 次/小时）。来源依次是环境变量、
+# 机器人里「授权GitHub」存下的令牌。只发给 api.github.com：跳转到 codeload 时
+# SafeRedirect 会新建一个不带身份信息的请求，令牌不会跟过去。
+GITHUB_TOKEN = {'value': None}
+
+
+def github_token(work_dir=None):
+    for name in ('GITHUB_TOKEN', 'GH_TOKEN'):
+        value = os.environ.get(name, '').strip()
+        if value:
+            return value
+    if not work_dir:
+        return ''
+    try:
+        record = json.loads((Path(work_dir) / 'credentials.json').read_text()).get('github') or {}
+    except (OSError, ValueError, AttributeError):
+        return ''
+    expires = record.get('expires_at')
+    if isinstance(expires, (int, float)) and expires and expires < time.time():
+        return ''
+    value = record.get('value')
+    return value.strip() if isinstance(value, str) else ''
+
+
 def _fetch(url, limit, accept):
-    request = urllib.request.Request(url, headers={
-        'Accept': accept, 'User-Agent': 'telegram-agent-hub-updater',
-        'X-GitHub-Api-Version': '2022-11-28',
-    })
+    headers = {'Accept': accept, 'User-Agent': 'telegram-agent-hub-updater',
+               'X-GitHub-Api-Version': '2022-11-28'}
+    if GITHUB_TOKEN['value'] and url.startswith('https://api.github.com/'):
+        headers['Authorization'] = 'Bearer ' + GITHUB_TOKEN['value']
+    try:
+        return _open(urllib.request.Request(url, headers=headers), limit)
+    except UpdateError:
+        if 'Authorization' not in headers:
+            raise
+    # 令牌失效或被撤销时不要让更新整个失败，退回匿名再试一次。
+    headers.pop('Authorization')
+    return _open(urllib.request.Request(url, headers=headers), limit)
+
+
+def _open(request, limit):
     try:
         with urllib.request.build_opener(bootstrap.SafeRedirect()).open(request, timeout=60) as response:
             body = response.read(limit + 1)
