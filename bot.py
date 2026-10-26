@@ -2505,6 +2505,159 @@ def parse_codex_event(event, state):
             state['activity'] = '正在推理'
 
 
+def stream_interval(elapsed, grew):
+    """距上次刷新至少要隔多久（秒）。
+
+    开头一分钟快节奏，让字真的往外冒；之后降到电报能长期接受的频率，
+    否则长任务会触发 flood control、界面停住（见 STREAM_WARMUP 处的说明）。
+    """
+    if elapsed < STREAM_WARMUP:
+        return STREAM_EDIT_MIN if grew else STREAM_EDIT_IDLE
+    return STREAM_EDIT_MIN_LONG if grew else STREAM_EDIT_IDLE_LONG
+
+
+def stream_preview(content, thinking, activity, elapsed):
+    """流式过程中气泡里显示的那一帧：最新正文（或思考片段）+ 进度行。"""
+    progress = activity + ' · 已运行' + str(int(elapsed)) + '秒'
+    # 预览同样压缩空行，避免流式过程中气泡被空行撑高。
+    clean_content = tidy_stream_text(content)
+    preview = clean_content if len(clean_content) <= 1800 else '（显示最新生成内容）\n' + clean_content[-1800:]
+    if not preview:
+        # 正文还没开始（思考阶段）。这时候别只留一行进度，
+        # 把最近一小段思考摆出来，让「正在思考」有实感。
+        thought = tidy_stream_text(str(thinking or ''))
+        if thought:
+            preview = '（思考中）' + thought[-300:].replace('\n', ' ')
+    return (preview + '\n\n' if preview else '') + progress
+
+
+class StreamMessage:
+    """一条随任务进展不断编辑的回复消息。
+
+    编辑走同步 api()，一次往返 100~600 毫秒。原来是在主循环里直接调用，
+    于是每次刷新都卡住主循环这么久；这期间读线程早把后面的事件全塞进
+    队列了，等 edit 返回、再取事件时已经是「一大段」——流式就此退化成
+    整块蹦出，而且模型吐字越快、积压越严重。
+
+    所以用一个「只留最新一帧」的后台发送器：主循环只把最新预览丢进去就继续
+    处理事件，中间被覆盖的旧帧直接丢弃（反正它们下一秒就过时了）。
+    这样网络快慢只影响画面刷新率，不再影响正文累积的及时性。
+    最终答案另走 deliver_final，保证送达。
+    """
+
+    def __init__(self, chat, message_id, label, initial):
+        self.chat = chat
+        self.message_id = message_id
+        self.label = label
+        self.frames = threading.Condition()
+        self.latest = None
+        self.closed = False
+        # shown 与 hold_until 由主循环与后台线程共用。
+        self.shown = initial
+        self.hold_until = 0.0
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def edit(self, value):
+        """只负责「登记最新一帧」，不在这里等网络。"""
+        with self.frames:
+            self.latest = value
+            self.frames.notify()
+
+    def close(self):
+        """收尾：把最后一帧发完再退出，避免最后几个字丢掉。
+
+        幂等：正常路径调一次，finally 里再调一次兜底，第二次直接返回。
+        """
+        with self.frames:
+            if not self.closed:
+                self.closed = True
+                self.frames.notify()
+        if self.thread.is_alive():
+            self.thread.join(timeout=6)
+
+    def _run(self):
+        while True:
+            with self.frames:
+                while self.latest is None and not self.closed:
+                    self.frames.wait(0.5)
+                if self.closed and self.latest is None:
+                    return
+                value = self.latest
+                self.latest = None
+            self._push(value)
+
+    def _edit_request(self, text):
+        # 不走 api() 内部的限流重试：那会在封禁期内提前重试、让窗口越拉越长。
+        api('editMessageText', {'chat_id': self.chat, 'message_id': self.message_id,
+                                'text': render_reply(text), 'parse_mode': 'HTML'}, retries=1)
+
+    @staticmethod
+    def _error_body(exc):
+        try:
+            raw = json.loads(exc.read() or b'{}')
+        except Exception:
+            return {}
+        return raw if isinstance(raw, dict) else {}
+
+    def _back_off(self, raw):
+        delay = (raw.get('parameters') or {}).get('retry_after', 3)
+        self.hold_until = time.monotonic() + float(delay)
+        print('流式刷新被限流，暂停 ' + str(delay) + ' 秒', flush=True)
+
+    def _push(self, value):
+        value = self.label + redact(value)
+        if value == self.shown or not value.strip():
+            return
+        # 退避期内不发：反复撞限流只会让 Telegram 把窗口拉得更长。
+        if time.monotonic() < self.hold_until:
+            return
+        try:
+            # 单条文本上限 4000 字符（留出余量），超出必然 400，截断后再发。
+            self._edit_request(value[:4000])
+            self.shown = value
+        except urllib.error.HTTPError as exc:
+            raw = self._error_body(exc)
+            # 只有真正的限流才退避等待；其他 400 不占用退避窗口。
+            if exc.code == 429 or 'retry_after' in (raw.get('parameters') or {}):
+                self._back_off(raw)
+        except Exception:
+            self.hold_until = time.monotonic() + 3
+
+    def deliver_final(self, value):
+        """最终答案必须送达，不能像流式帧那样「丢一帧无所谓」。
+
+        原来最终答案也走普通帧：正赶上限流退避期就被直接跳过，
+        任务明明跑完了，气泡却永远停在某个进度上。这里等退避结束再编辑，
+        仍不成功就改发一条新消息。
+        """
+        full = self.label + redact(value)
+        if full == self.shown:
+            return
+        deadline = time.monotonic() + 600
+        while True:
+            hold = self.hold_until - time.monotonic()
+            if hold > 0:
+                if time.monotonic() + hold > deadline:
+                    break
+                time.sleep(hold)
+            try:
+                self._edit_request(full[:4000])
+                self.shown = full
+                return
+            except urllib.error.HTTPError as exc:
+                raw = self._error_body(exc)
+                if 'not modified' in str(raw.get('description') or ''):
+                    return
+                if exc.code == 429:
+                    self._back_off(raw)
+                    continue
+                break
+            except Exception:
+                break
+        send_formatted(self.chat, full)
+
+
 def run_stream(chat, text):
     task = getattr(TASK_LOCAL, 'task', None)
     label = ('任务 ' + task['id'] + ' · ' + redact(text).replace('\n', ' ')[:80] + '\n') if task else ''
@@ -2563,120 +2716,7 @@ def run_stream(chat, text):
     final = None
     activity = '等待模型响应'
 
-    # ---- 后台发送器 ----
-    # 编辑走同步 api()，一次往返 100~600 毫秒。原来是在主循环里直接调用，
-    # 于是每次刷新都卡住主循环这么久；这期间读线程早把后面的事件全塞进
-    # 队列了，等 edit 返回、再取事件时已经是「一大段」——流式就此退化成
-    # 整块蹦出，而且模型吐字越快、积压越严重。
-    #
-    # 改成一个「只留最新一帧」的后台发送器：主循环只把最新预览丢进去就继续
-    # 处理事件，中间被覆盖的旧帧直接丢弃（反正它们下一秒就过时了）。
-    # 这样网络快慢只影响画面刷新率，不再影响正文累积的及时性。
-    frames = threading.Condition()
-    latest = {'value': None, 'closed': False}
-    send_state = {'shown': initial, 'hold_until': 0.0}
-
-    def sender():
-        while True:
-            with frames:
-                while latest['value'] is None and not latest['closed']:
-                    frames.wait(0.5)
-                if latest['closed'] and latest['value'] is None:
-                    return
-                value = latest['value']
-                latest['value'] = None
-            push_edit(value)
-
-    def push_edit(value):
-        value = label + redact(value)
-        if value == send_state['shown'] or not value.strip():
-            return
-        # 退避期内不发：反复撞限流只会让 Telegram 把窗口拉得更长。
-        if time.monotonic() < send_state.get('hold_until', 0):
-            return
-        # 单条文本上限 4000 字符（留出余量），超出必然 400，截断后再发。
-        if len(value) > 4000:
-            value = value[:4000]
-        try:
-            # 不走 api() 内部的限流重试：那会在封禁期内提前重试、让窗口越拉越长。
-            # 流式帧丢一帧无所谓，交给下面的退避逻辑统一处理。
-            api('editMessageText', {'chat_id': chat, 'message_id': message_id,
-                                    'text': render_reply(value), 'parse_mode': 'HTML'}, retries=1)
-            send_state['shown'] = value
-        except urllib.error.HTTPError as exc:
-            raw = {}
-            try:
-                raw = json.loads(exc.read())
-            except Exception:
-                raw = {}
-            # 只有真正的限流才退避等待；其他 400 不占用退避窗口。
-            # 退避状态放在 send_state 里，主循环与后台线程共用同一份。
-            if exc.code == 429 or 'retry_after' in (raw.get('parameters') or {}):
-                delay = (raw.get('parameters') or {}).get('retry_after', 3)
-                send_state['hold_until'] = time.monotonic() + delay
-                print('流式刷新被限流，暂停 ' + str(delay) + ' 秒', flush=True)
-        except Exception:
-            send_state['hold_until'] = time.monotonic() + 3
-
-    sender_thread = threading.Thread(target=sender, daemon=True)
-    sender_thread.start()
-
-    def edit(value):
-        """只负责「登记最新一帧」，不在这里等网络。"""
-        with frames:
-            latest['value'] = value
-            frames.notify()
-
-    def close_sender():
-        """收尾：把最后一帧发完再退出，避免最后几个字丢掉。
-
-        幂等：正常路径调一次，finally 里再调一次兜底，第二次直接返回。
-        """
-        with frames:
-            if not latest['closed']:
-                latest['closed'] = True
-                frames.notify()
-        if sender_thread.is_alive():
-            sender_thread.join(timeout=6)
-
-    def deliver_final(value):
-        """最终答案必须送达，不能像流式帧那样「丢一帧无所谓」。
-
-        原来最终答案也走 push_edit：正赶上限流退避期就被直接跳过，
-        任务明明跑完了，气泡却永远停在某个进度上。这里等退避结束再编辑，
-        仍不成功就改发一条新消息。
-        """
-        full = label + redact(value)
-        if full == send_state['shown']:
-            return
-        text = full[:4000]
-        deadline = time.monotonic() + 600
-        while True:
-            hold = send_state.get('hold_until', 0) - time.monotonic()
-            if hold > 0:
-                if time.monotonic() + hold > deadline:
-                    break
-                time.sleep(hold)
-            try:
-                api('editMessageText', {'chat_id': chat, 'message_id': message_id,
-                                        'text': render_reply(text), 'parse_mode': 'HTML'}, retries=1)
-                send_state['shown'] = full
-                return
-            except urllib.error.HTTPError as exc:
-                try:
-                    raw = json.loads(exc.read() or b'{}')
-                except Exception:
-                    raw = {}
-                description = str(raw.get('description') or '')
-                if 'not modified' in description:
-                    return
-                if exc.code == 429:
-                    send_state['hold_until'] = time.monotonic() + float((raw.get('parameters') or {}).get('retry_after', 3))
-                    continue
-                break
-            except Exception:
-                break
-        send_formatted(chat, full)
+    stream = StreamMessage(chat, message_id, label, initial)
     try:
         if stdin_text:
             # 先登记进程，再写入；停止或关闭可终止因管道写满而阻塞的任务。
@@ -2731,27 +2771,13 @@ def run_stream(chat, text):
             #     保证每段都以完整形态定格，不会停在半句话上。
             now = time.monotonic()
             grew = len(content) > last_content_len
-            if now - started < STREAM_WARMUP:
-                interval = STREAM_EDIT_MIN if grew else STREAM_EDIT_IDLE
-            else:
-                interval = STREAM_EDIT_MIN_LONG if grew else STREAM_EDIT_IDLE_LONG
+            interval = stream_interval(now - started, grew)
             settled = block_finished and len(content) > last_content_len
             if settled or now - last_edit >= interval:
                 last_edit = now
                 last_content_len = len(content)
                 block_finished = False
-                seconds = int(now - started)
-                progress = activity + ' · 已运行' + str(seconds) + '秒'
-                # 预览同样压缩空行，避免流式过程中气泡被空行撑高。
-                clean_content = tidy_stream_text(content)
-                preview = clean_content if len(clean_content) <= 1800 else '（显示最新生成内容）\n' + clean_content[-1800:]
-                if not preview:
-                    # 正文还没开始（思考阶段）。这时候别只留一行进度，
-                    # 把最近一小段思考摆出来，让「正在思考」有实感。
-                    thought = tidy_stream_text(str(state.get('thinking') or ''))
-                    if thought:
-                        preview = '（思考中）' + thought[-300:].replace('\n', ' ')
-                edit((preview + '\n\n' if preview else '') + progress)
+                stream.edit(stream_preview(content, state.get('thinking'), activity, now - started))
         process.wait(timeout=10)
         answer = pick_final_answer((final or {}).get('result'), content)
         # 收尾统一压缩空行：模型输出与流式累积都可能带出多余空行。
@@ -2791,15 +2817,15 @@ def run_stream(chat, text):
         # 先把最终答案交给后台发送器，等它把这一帧发完再决定要不要补发分片。
         # 这里必须等一次：不等的话，尾部的执行摘要可能在分片消息之后才到达，
         # 顺序就乱了（用户看到「结果 → 摘要 → 结果的后半段」）。
-        close_sender()
-        deliver_final(head)
+        stream.close()
+        stream.deliver_final(head)
         # 首片已通过编辑消息呈现，其余分片补发。
         for piece in pieces[1:]:
             send_formatted(chat, label + piece)
     finally:
         # 异常路径也要把发送线程收干净，否则它会一直挂在条件变量上。
         try:
-            close_sender()
+            stream.close()
         except Exception:
             pass
         terminate_process(process)

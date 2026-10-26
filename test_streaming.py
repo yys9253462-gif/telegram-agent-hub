@@ -22,6 +22,8 @@ import json
 import os
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -254,11 +256,16 @@ class EditPacingTest(ParseTestBase):
     def test_main_loop_uses_the_adaptive_step(self):
         import inspect
         source = inspect.getsource(bot.run_stream)
-        self.assertIn('STREAM_EDIT_MIN if grew else STREAM_EDIT_IDLE', source,
+        self.assertIn('stream_interval(now - started, grew)', source,
                       '主循环没有按「有没有新正文」切换刷新间隔，'
                       '短段落会退回整块蹦出')
         self.assertNotIn("interval = 1.0 if activity", source,
                          '又写回了固定 1 秒的节流')
+        # 开头快节奏，之后降到电报能长期接受的频率（否则长任务会被限流卡住）。
+        self.assertEqual(bot.stream_interval(5, True), bot.STREAM_EDIT_MIN)
+        self.assertEqual(bot.stream_interval(5, False), bot.STREAM_EDIT_IDLE)
+        self.assertGreaterEqual(bot.stream_interval(300, True), 1.0)
+        self.assertGreaterEqual(bot.stream_interval(300, False), 3.0)
 
     def test_block_stop_triggers_immediate_settle(self):
         """段落收尾要立刻结算，否则最后几个字会拖到下一段才显示。"""
@@ -331,6 +338,31 @@ class EditPacingTest(ParseTestBase):
         self.assertLess(lengths[0], sum(len(c) for _, c in segments), str(lengths))
 
 
+class FinalDeliveryTest(unittest.TestCase):
+    """最终答案必达：限流退避期内也不能被跳过。"""
+
+    def test_final_answer_waits_out_backoff(self):
+        sent = []
+        with patch.object(bot, 'api', side_effect=lambda m, p, retries=None: sent.append(p['text'])):
+            stream = bot.StreamMessage(1, 2, '', '')
+            stream.hold_until = time.monotonic() + 0.3
+            stream.edit('中间帧')
+            stream.close()
+            stream.deliver_final('最终答案')
+        self.assertTrue(sent and '最终答案' in sent[-1], sent)
+
+    def test_final_answer_falls_back_to_new_message(self):
+        import io, urllib.error
+        def api(method, payload, retries=None):
+            raise urllib.error.HTTPError('u', 400, 'bad', {}, io.BytesIO(b'{"description": "message to edit not found"}'))
+        fallback = []
+        with patch.object(bot, 'api', side_effect=api),              patch.object(bot, 'send_formatted', side_effect=lambda chat, text: fallback.append(text)):
+            stream = bot.StreamMessage(1, 2, '', '')
+            stream.close()
+            stream.deliver_final('最终答案')
+        self.assertEqual(fallback, ['最终答案'])
+
+
 class BackgroundSenderTest(unittest.TestCase):
     """编辑不能再阻塞主循环：一次 edit 是一次 HTTP 往返。"""
 
@@ -338,10 +370,21 @@ class BackgroundSenderTest(unittest.TestCase):
         """edit 必须是「登记最新帧」，不能在里面同步等网络。"""
         import inspect
         source = inspect.getsource(bot.run_stream)
-        self.assertIn('threading.Thread(target=sender', source,
-                      '流式编辑没有走后台线程，网络往返会阻塞事件处理')
-        self.assertIn('latest[\'value\'] = value', source,
-                      '没有「只留最新一帧」的机制，积压会导致整块蹦出')
+        self.assertIn('StreamMessage(', source, '流式编辑没有走后台发送器，网络往返会阻塞事件处理')
+        # 「只留最新一帧」：连续登记多帧，网络卡住期间只有最后一帧会被发出。
+        sent, gate = [], threading.Event()
+        def api(method, payload, retries=None):
+            gate.wait(2)
+            sent.append(payload['text'])
+            return {}
+        with patch.object(bot, 'api', side_effect=api):
+            stream = bot.StreamMessage(1, 2, '', '')
+            for value in ('第一帧', '第二帧', '第三帧'):
+                stream.edit(value)
+            gate.set()
+            stream.close()
+        self.assertLessEqual(len(sent), 2, sent)
+        self.assertIn('第三帧', sent[-1])
 
 
 class RealFixtureReplayTest(ParseTestBase):
