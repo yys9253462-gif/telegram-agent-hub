@@ -32,31 +32,37 @@ class ProgressStepsTest(unittest.TestCase):
         bot.parse_claude_event(assistant([{'type': 'tool_use', 'name': 'Read',
                                            'input': {'file_path': '/opt/app/main.go'}}], parent='call_1'), s)
         self.assertEqual(s['steps'], ['🤝 交给执行模型：盘点东京源码项目',
-                                      "↳ 💻 ssh tokyo 'ls /opt' ✗",
-                                      '↳ 📖 /opt/app/main.go'])
-        self.assertTrue(s['activity'].startswith('执行模型正在：'))
+                                      '↳ 💻 `tokyo: ls /opt` ✗',
+                                      '↳ 📖 `/opt/app/main.go`'])
+        self.assertEqual(s['activity'], '执行模型工作中', '进度行不再重复命令')
 
     def test_preview_shows_recent_steps_in_quote(self):
         steps = ['💻 cmd ' + str(i) for i in range(9)]
-        frame = bot.stream_preview('先盘点源码。', '', '正在执行工具：Bash', 30, steps)
-        self.assertIn('…前面还有 3 步', frame)
+        frame = bot.stream_preview('先盘点源码。', '', '执行模型工作中', 30, steps)
         self.assertIn('💻 cmd 8', frame)
-        self.assertNotIn('💻 cmd 2', frame)
+        self.assertNotIn('💻 cmd 4', frame, '只显示最近 4 步')
         html = render_reply(frame)
         self.assertIn('<blockquote>', html)
         self.assertTrue(html.startswith('先盘点源码。'))
-        self.assertIn('<i>⏳ 正在执行工具：Bash · 已运行30秒</i>', html)
+        self.assertIn('<i>⏳ 执行模型工作中 · 第 9 步 · 已运行30秒</i>', html)
 
     def test_long_command_is_shortened(self):
         line = bot.describe_tool('Bash', {'command': 'x' * 200})
-        self.assertLess(len(line), 90)
+        self.assertLess(len(line), bot.STEP_WIDTH + 6)
+
+    def test_description_is_preferred_and_not_linkified(self):
+        line = bot.describe_tool('Bash', {'command': 'systemctl restart x', 'description': 'Restart portal.py service'})
+        self.assertTrue(line.startswith('💻 Restart portal.'))
+        self.assertNotIn('portal.py', line, '「名字.py」会被电报当成链接')
+        html = render_reply('> ' + bot.describe_tool('Read', {'file_path': '/etc/hysteria/portal.py'}))
+        self.assertIn('<code>/etc/hysteria/portal.py</code>', html, '路径放进代码样式，不会变链接')
 
     def test_codex_commands_become_steps(self):
         s = state()
         bot.parse_codex_event({'type': 'item.started', 'item': {'type': 'command_execution', 'command': 'df -h /'}}, s)
         bot.parse_codex_event({'type': 'item.completed', 'item': {'type': 'command_execution', 'command': 'df -h /',
                                                                    'exit_code': 1}}, s)
-        self.assertEqual(s['steps'], ['💻 df -h / ✗'])
+        self.assertEqual(s['steps'], ['💻 `df -h /` ✗'])
 
     def test_no_steps_keeps_old_frame(self):
         self.assertEqual(bot.stream_preview('正文', '', '正在生成回复', 5),

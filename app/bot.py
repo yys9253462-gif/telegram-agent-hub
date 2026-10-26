@@ -2704,25 +2704,50 @@ def session_history_incompatible(message):
         return False
     return any(word in text for word in ('non-whitespace thinking', 'invalid signature', 'signature', 'thinking block'))
 
-STEP_LIMIT = 6
+STEP_LIMIT = 4
+STEP_WIDTH = 36
 TOOL_ICONS = {'Bash': '💻', 'Read': '📖', 'Write': '📝', 'Edit': '✏️', 'MultiEdit': '✏️', 'Grep': '🔎',
               'Glob': '🔎', 'WebFetch': '🌐', 'WebSearch': '🌐', 'Agent': '🤝', 'Task': '🤝',
               'TodoWrite': '🗒', 'NotebookEdit': '✏️'}
 
 
+def _clip(text, width=STEP_WIDTH, keep_tail=False):
+    text = ' '.join(str(text or '').split())
+    if len(text) <= width:
+        return text
+    return ('…' + text[-(width - 1):]) if keep_tail else (text[:width - 1] + '…')
+
+
+def _unlink(text):
+    """电报会把 portal.py、patch.sh 这类「名字.后缀」识别成域名并变成链接。
+    在点后面插一个零宽空格，看起来不变，但不再被当成网址。"""
+    return text.replace('.', '.\u200b')
+
+
 def describe_tool(name, payload):
-    """把一次工具调用压成一行人话：💻 ssh tokyo 'docker ps'、📖 /etc/nginx/nginx.conf。"""
+    """把一次工具调用压成不折行的一行：
+
+    - 有人话描述（Bash 工具自带 description）就用描述：💻 重启 portal 服务；
+    - 否则用命令或路径，放进代码样式（等宽、不会变链接），长的截断；
+      ssh 主机 '命令' 写成「主机: 命令」，路径只留末尾。
+    """
     payload = payload if isinstance(payload, dict) else {}
     name = str(name or '工具')
+    icon = TOOL_ICONS.get(name, '🔧')
     if name in ('Agent', 'Task'):
         detail = payload.get('description') or payload.get('subagent_type') or ''
-        return '🤝 交给执行模型：' + str(detail)[:60]
-    detail = (payload.get('command') or payload.get('file_path') or payload.get('path')
-              or payload.get('pattern') or payload.get('url') or payload.get('query') or '')
-    detail = ' '.join(str(detail).split())
-    if len(detail) > 70:
-        detail = detail[:70] + '…'
-    return TOOL_ICONS.get(name, '🔧') + ' ' + (detail or name)
+        return '🤝 交给执行模型：' + _unlink(_clip(detail, 24))
+    if payload.get('description'):
+        return icon + ' ' + _unlink(_clip(payload['description']))
+    path = payload.get('file_path') or payload.get('path')
+    if path:
+        return icon + ' `' + _clip(str(path).replace('`', ''), keep_tail=True) + '`'
+    detail = payload.get('command') or payload.get('pattern') or payload.get('url') or payload.get('query') or name
+    detail = ' '.join(str(detail).replace('`', "'").split())
+    remote = re.match(r"^ssh\s+(?:-\S+\s+(?:\S+\s+)?)*([\w.@-]+)\s+['\"]?(.*?)['\"]?$", detail)
+    if remote:
+        detail = remote.group(1) + ': ' + remote.group(2)
+    return icon + ' `' + _clip(detail) + '`'
 
 
 def add_step(state, text):
@@ -2802,7 +2827,8 @@ def parse_claude_event(event, state):
                 step = describe_tool(block.get('name'), block.get('input'))
                 add_step(state, ('↳ ' if nested else '') + step)
                 if nested:
-                    state['activity'] = '执行模型正在：' + step
+                    # 进度行不再重复命令（上面的过程里已经有了），只说是谁在干活。
+                    state['activity'] = '执行模型工作中'
     elif event.get('type') == 'user':
         # 工具返回失败时在那一步后面标 ✗，过程里能看出哪步没成。
         for block in (event.get('message') or {}).get('content') or []:
@@ -2891,12 +2917,10 @@ def stream_preview(content, thinking, activity, elapsed, steps=None):
     过程只在运行中显示（引用块，一步一行，执行模型的步骤带 ↳），最终答案里不保留。
     原来长任务里只有一行「正在准备工具参数：Agent」，几分钟看不到任何进展。
     """
-    progress = PROGRESS_MARK + activity + ' · 已运行' + str(int(elapsed)) + '秒'
+    count = (' · 第 ' + str(len(steps)) + ' 步') if steps else ''
+    progress = PROGRESS_MARK + activity + count + ' · 已运行' + str(int(elapsed)) + '秒'
     if steps:
-        shown = steps[-STEP_LIMIT:]
-        hidden = len(steps) - len(shown)
-        lines = (['> …前面还有 ' + str(hidden) + ' 步'] if hidden else []) + ['> ' + step for step in shown]
-        progress = '\n'.join(lines) + '\n' + progress
+        progress = '\n'.join('> ' + step for step in steps[-STEP_LIMIT:]) + '\n' + progress
     # 预览同样压缩空行，避免流式过程中气泡被空行撑高。
     clean_content = tidy_stream_text(content)
     preview = clean_content if len(clean_content) <= 1800 else '（显示最新生成内容）\n' + clean_content[-1800:]
