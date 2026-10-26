@@ -19,12 +19,16 @@ import bootstrap
 
 REPO = 'yys9253462-gif/telegram-agent-hub'
 MAX_ARCHIVE = 20 * 1024 * 1024
-CODE_FILES = frozenset({
+REQUIRED_FILES = frozenset({
     'bot.py', 'credentials.py', 'cloudflare_auth.py', 'github_auth.py',
     'transcribe.py', 'image_tool.py',
     'bootstrap.py', 'install.py', 'updater.py',
 })
-REQUIRED_FILES = CODE_FILES
+# 拆分出来的模块。先作为可选文件登记：旧版本没有它们也能通过校验；
+# 新版本带上它们时升级器才会一起替换。必须先发布一版认得这些文件名的
+# 升级器，再发布真正依赖它们的代码，否则旧升级器会漏拷新模块。
+OPTIONAL_FILES = frozenset({'usage.py', 'textfmt.py'})
+CODE_FILES = REQUIRED_FILES | OPTIONAL_FILES
 COMMIT_RE = re.compile(r'[0-9a-f]{40}')
 HASH_RE = re.compile(r'[0-9a-f]{64}')
 SERVICE_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.@-]{0,127}\.service')
