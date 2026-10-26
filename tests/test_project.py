@@ -12,7 +12,7 @@ import unittest
 ROOT = _root.ROOT
 
 def load(name):
-    spec = importlib.util.spec_from_file_location(name, (ROOT / 'scripts' / (name + '.py') if name == 'security_check' else ROOT / (name + '.py')))
+    spec = importlib.util.spec_from_file_location(name, (_root.REPO / 'scripts' / (name + '.py') if name == 'security_check' else ROOT / (name + '.py')))
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

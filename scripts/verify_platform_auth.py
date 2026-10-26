@@ -9,7 +9,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+REPO = Path(__file__).resolve().parent.parent
+ROOT = REPO / 'app'
 TARGET = ROOT / 'credentials.py'
 BOT = ROOT / 'bot.py'
 TEXT = ROOT / 'textfmt.py'
@@ -86,7 +87,7 @@ def run_tests():
     同时清缓存，避免读到旧的 .pyc（这个坑已经踩过一次）。
     """
     shutil.rmtree(ROOT / '__pycache__', ignore_errors=True)
-    result = subprocess.run([sys.executable, str(ROOT / 'tests' / 'test_platform_auth.py')],
+    result = subprocess.run([sys.executable, str(REPO / 'tests' / 'test_platform_auth.py')],
                             capture_output=True, text=True,
                             env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'})
     combined = ((result.stdout or '') + (result.stderr or '')).strip().splitlines()
