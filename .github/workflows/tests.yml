@@ -22,9 +22,9 @@ jobs:
       - name: 逐个运行测试文件
         run: |
           failed=0
-          for t in test_*.py; do
+          for t in tests/test_*.py; do
             # test_integration.py 是安装验收用的假消息服务，不是单元测试。
-            [ "$t" = test_integration.py ] && continue
+            [ "$t" = tests/test_integration.py ] && continue
             echo "::group::$t"
             if ! timeout 600 python3 "$t"; then
               echo "::error::$t 失败"
@@ -33,6 +33,10 @@ jobs:
             echo "::endgroup::"
           done
           exit $failed
+      - name: 敏感信息扫描
+        run: python3 scripts/security_check.py
+      - name: 授权保护反向验证（逐个改坏，测试必须报红）
+        run: python3 scripts/verify_platform_auth.py
 
   release:
     # 只在手动触发且勾选 release 时运行，并且必须在测试通过之后。

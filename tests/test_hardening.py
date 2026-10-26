@@ -4,6 +4,7 @@
 每个用例都对应一处真实缺陷，注释写明缺陷现象，便于以后判断能否删除。
 运行：python test_hardening.py
 """
+import _root  # noqa: F401  仓库根目录进 sys.path
 import json
 import subprocess
 import tempfile

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import _root  # noqa: F401  仓库根目录进 sys.path
 import importlib.util
 import io
 import json
@@ -10,7 +11,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-ROOT = Path(__file__).resolve().parent
+ROOT = _root.ROOT
 
 def module(name):
     spec = importlib.util.spec_from_file_location(name, ROOT / (name + '.py'))

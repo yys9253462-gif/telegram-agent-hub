@@ -5,12 +5,13 @@
   2. 事件解析 —— codex 是 JSONL 且没有流式增量，正文分多次给出必须累加；
   3. 失败判定 —— codex 用 turn.failed 表达失败，退出码未必非零。
 """
+import _root  # noqa: F401  仓库根目录进 sys.path
 import ast
 import os
 import unittest
 from pathlib import Path
 
-SOURCE = Path(__file__).with_name('bot.py').read_text(encoding='utf-8')
+SOURCE = (_root.ROOT / 'bot.py').read_text(encoding='utf-8')
 TREE = ast.parse(SOURCE)
 
 
@@ -111,7 +112,7 @@ class CodexEventParseTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         import importlib.util
-        spec = importlib.util.spec_from_file_location('botmod_under_test', Path(__file__).with_name('bot.py'))
+        spec = importlib.util.spec_from_file_location('botmod_under_test', (_root.ROOT / 'bot.py'))
         module = importlib.util.module_from_spec(spec)
         # bot.py 在导入期会读环境并建目录，这里给最小可用的环境。
         os.environ.setdefault('TELEGRAM_BOT_TOKEN', 'TEST-ONLY-0000')
@@ -213,7 +214,7 @@ class CodexEnvironmentMappingTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         import importlib.util
-        spec = importlib.util.spec_from_file_location('botmod_env_test', Path(__file__).with_name('bot.py'))
+        spec = importlib.util.spec_from_file_location('botmod_env_test', (_root.ROOT / 'bot.py'))
         module = importlib.util.module_from_spec(spec)
         os.environ.setdefault('TELEGRAM_BOT_TOKEN', 'TEST-ONLY-0000')
         os.environ.setdefault('CLAUDE_BOT_WORKDIR', '.testwork')

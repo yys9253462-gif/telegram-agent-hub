@@ -160,21 +160,21 @@ Cloudflare 这条路径有一个环境前提：请求发往 `dash.cloudflare.com
 git clone https://github.com/yys9253462-gif/telegram-agent-hub.git
 cd telegram-agent-hub
 sudo bash install.sh            # 交互式安装
-python3 test_project.py         # 源码回归测试
-python3 test_hardening.py       # 五轮排查修复项的反向验证用例
-python3 test_codex_engine.py    # Codex 执行器参数与环境变量映射
-python3 test_installer.py       # 安装器配置校验与代码生成
-python3 test_menu_layout.py     # 键盘按钮与分组菜单一致性
-python3 test_auth_channel.py    # 网关/账号双渠道切换
-python3 test_platform_auth.py   # GitHub/Cloudflare 授权、凭据存取与注入
-python3 test_image_tool.py      # 生图 MCP 工具与协议测试
-python3 -m unittest test_interaction_r1 test_interaction_r2 test_interaction_r3 test_interaction_r4 test_interaction_r5
+python3 tests/test_project.py         # 源码回归测试
+python3 tests/test_hardening.py       # 五轮排查修复项的反向验证用例
+python3 tests/test_codex_engine.py    # Codex 执行器参数与环境变量映射
+python3 tests/test_installer.py       # 安装器配置校验与代码生成
+python3 tests/test_menu_layout.py     # 键盘按钮与分组菜单一致性
+python3 tests/test_auth_channel.py    # 网关/账号双渠道切换
+python3 tests/test_platform_auth.py   # GitHub/Cloudflare 授权、凭据存取与注入
+python3 tests/test_image_tool.py      # 生图 MCP 工具与协议测试
+for t in tests/test_interaction_r*.py; do python3 "$t"; done
                                 # 交互逻辑五轮测试：路由 / 队列 / 渠道 / 授权 / 边界
-python3 security_check.py       # 提交前的敏感信息扫描
+python3 scripts/security_check.py       # 提交前的敏感信息扫描
 bash -n get.sh && bash -n install.sh
 ```
 
-`test_interaction_r1.py` ~ `test_interaction_r5.py` 是按「机主真的按了一下」写的五轮交互测试，与前面那些按源码结构检查的用例互补：
+`tests/test_interaction_r1.py` ~ `tests/test_interaction_r5.py` 是按「机主真的按了一下」写的五轮交互测试，与前面那些按源码结构检查的用例互补：
 
 | 轮次 | 覆盖范围 | 主要判据 |
 |---|---|---|
@@ -185,11 +185,11 @@ bash -n get.sh && bash -n install.sh
 | 第五轮 | 超长消息、畸形更新、状态文件损坏、重入 | 任何异常都要落到一句人话，不能中断轮询 |
 
 
-`verify_platform_auth.py` 是授权功能的**反向验证脚本**：它把 8 处保护逐条故意改坏，确认 `test_platform_auth.py` 真的报红。永远绿的测试等于没有测试，改动授权相关代码后请跑一遍。
+`scripts/verify_platform_auth.py` 是授权功能的**反向验证脚本**：它把 8 处保护逐条故意改坏，确认 `tests/test_platform_auth.py` 真的报红。永远绿的测试等于没有测试，改动授权相关代码后请跑一遍。
 
-`test_hardening.py` 里每个用例都对应一处真实缺陷，注释写明缺陷现象，并可用「把修复改回原写法、测试必须报红」的方式自检。**改完代码请先删掉 `__pycache__` 再跑测试**——陈旧的 `bot.cpython-*.pyc` 会让测试读到旧字节码，从而给出全绿的假象（本项目踩过）。
+`tests/test_hardening.py` 里每个用例都对应一处真实缺陷，注释写明缺陷现象，并可用「把修复改回原写法、测试必须报红」的方式自检。**改完代码请先删掉 `__pycache__` 再跑测试**——陈旧的 `bot.cpython-*.pyc` 会让测试读到旧字节码，从而给出全绿的假象（本项目踩过）。
 
-`test_integration.py` 只提供绑定回环地址的假消息接口，必须配合独立运行用户与独立服务名使用，不能替代真实端到端验收，也禁止用于正式机器人。
+`tests/test_integration.py` 只提供绑定回环地址的假消息接口，必须配合独立运行用户与独立服务名使用，不能替代真实端到端验收，也禁止用于正式机器人。
 
 官方执行器安装脚本使用已审阅的固定校验值，上游脚本一变安装器就拒绝执行。这是刻意的设计：安全边界不提供关闭开关。
 
@@ -203,6 +203,11 @@ bash -n get.sh && bash -n install.sh
 | `github_auth.py` | GitHub 设备码授权、执行器账号登录与身份 |
 | `cloudflare_auth.py` / `credentials.py` | Cloudflare 授权、平台凭据存取与注入 |
 | `updater.py` / `bootstrap.py` / `install.py` | 菜单升级、归档校验、交互式安装 |
+| `tests/` | 全部测试（`python3 tests/test_xxx.py` 逐个运行）与测试数据 |
+| `scripts/` | 开发辅助：提交前敏感信息扫描、授权保护的反向验证 |
+| `memory/` | 安装时复制给执行器的共享说明 |
+
+程序文件必须留在仓库根目录：已安装机器的升级器按归档根目录取文件，挪进子目录会让旧版本升级失败。
 
 文字命令和按钮在 `TaskController` 里用 `@on_text('按钮名')` 登记，按定义顺序匹配；新增按钮只要加一个处理方法。
 

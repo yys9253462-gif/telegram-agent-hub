@@ -9,15 +9,16 @@ import subprocess
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent
 TARGET = ROOT / 'credentials.py'
 BOT = ROOT / 'bot.py'
+TEXT = ROOT / 'textfmt.py'
 CF = ROOT / 'cloudflare_auth.py'
 
 # (说明, 文件, 原文, 替换为)
 VARIANTS = [
-    ('凭据文件去掉 0600 建文件参数', TARGET,
-     'os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600', 'os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644'),
+    ('凭据文件最终权限不再收紧到 0600', TARGET,
+     'os.chmod(self.path, 0o600)', 'os.chmod(self.path, 0o644)'),
     ('摘要里改为回显令牌原文', TARGET,
      "'fingerprint': record.get('fingerprint') or fingerprint(record['value']),",
      "'fingerprint': record['value'],"),
@@ -28,12 +29,12 @@ VARIANTS = [
      "        if spec['env'] not in overrides:\n            environment.pop(spec['env'], None)",
      "        if False:\n            environment.pop(spec['env'], None)"),
     ('撤销时不清设备码等待态', BOT,
-     "                DEVICE_FLOW.update({'provider': '', 'device_code': '', 'user_code': ''})\n            else:",
-     "                pass\n            else:"),
+     "            DEVICE_FLOW.update({'provider': '', 'device_code': '', 'user_code': ''})\n        else:",
+     "            pass\n        else:"),
     ('等待令牌时不再校验形态', BOT,
      "    candidate = looks_like('cloudflare', text)\n    if not candidate:",
      "    candidate = True\n    if not candidate:"),
-    ('脱敏去掉 cfut_ 规则', BOT,
+    ('脱敏去掉 cfut_ 规则', TEXT,
      "    value = re.sub(r'\\bcfut_[A-Za-z0-9_-]{20,}', '[已隐藏令牌]', value)\n", ''),
     ('设备码重复发起不再复用', BOT,
      "    if running is not None and running.is_alive():", "    if False:"),
@@ -48,8 +49,8 @@ VARIANTS = [
      "        if isinstance(body, dict) and body.get('error'):\n            return body\n",
      ""),
     ('令牌自省略去 offline_access', CF,
-     "DEFAULT_SCOPE = 'offline_access account:read zone:read workers:read'",
-     "DEFAULT_SCOPE = 'account:read zone:read workers:read'"),
+     "DEFAULT_SCOPE = 'offline_access account:read user:read zone:read workers_tail:read'",
+     "DEFAULT_SCOPE = 'account:read user:read zone:read workers_tail:read'"),
     ('slow_down 仍按原间隔猛轮', CF,
      "        if error == 'slow_down':\n            # 规范要求：收到 slow_down 在原间隔上加 5 秒。\n            wait += 5\n            continue",
      "        if error == 'slow_down':\n            continue"),
@@ -66,8 +67,8 @@ VARIANTS = [
      "    complete = flow.get('verification_uri_complete') or flow.get('verification_uri') or ''",
      "    complete = flow.get('verification_uri') or ''"),
     ('撤销 Cloudflare 时不清设备码', BOT,
-     "                CLOUDFLARE_FLOW.update({'thread': None, 'device_code': '', 'user_code': ''})",
-     "                pass"),
+     "            CLOUDFLARE_FLOW.update({'thread': None, 'device_code': '', 'user_code': ''})\n        send(chat,",
+     "            pass\n        send(chat,"),
     ('Cloudflare 设备码复用两个平台共用状态', BOT,
      "    running = CLOUDFLARE_FLOW.get('thread')\n    if running is not None and running.is_alive():\n        remain",
      "    running = DEVICE_FLOW.get('thread')\n    if running is not None and running.is_alive():\n        remain"),
@@ -85,7 +86,7 @@ def run_tests():
     同时清缓存，避免读到旧的 .pyc（这个坑已经踩过一次）。
     """
     shutil.rmtree(ROOT / '__pycache__', ignore_errors=True)
-    result = subprocess.run([sys.executable, str(ROOT / 'test_platform_auth.py')],
+    result = subprocess.run([sys.executable, str(ROOT / 'tests' / 'test_platform_auth.py')],
                             capture_output=True, text=True,
                             env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'})
     combined = ((result.stdout or '') + (result.stderr or '')).strip().splitlines()

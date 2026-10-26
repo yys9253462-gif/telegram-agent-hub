@@ -8,6 +8,7 @@
 
 第二轮起依次覆盖队列与并发、渠道与执行器切换、授权与登录、边界与异常。
 """
+import _root  # noqa: F401  仓库根目录进 sys.path
 import tempfile
 import time
 import unittest

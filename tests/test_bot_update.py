@@ -1,4 +1,5 @@
 """机器人更新交互测试，不访问网络或启动真实服务。"""
+import _root  # noqa: F401  仓库根目录进 sys.path
 import json
 import tempfile
 import threading

@@ -1,4 +1,5 @@
 """执行器账号渠道、环境与排队快照回归，不访问网络。"""
+import _root  # noqa: F401  仓库根目录进 sys.path
 import json
 import os
 import tempfile

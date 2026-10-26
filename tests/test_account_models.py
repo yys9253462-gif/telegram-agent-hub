@@ -1,4 +1,5 @@
 """订阅账号身份与账号模式模型选择测试，不访问网络、不碰真实凭据。"""
+import _root  # noqa: F401  仓库根目录进 sys.path
 import base64
 import json
 import os

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """隔离消息服务：不使用真实机器人令牌，不记录请求头。"""
+import _root  # noqa: F401  仓库根目录进 sys.path
 import argparse
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer

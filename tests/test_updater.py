@@ -1,3 +1,4 @@
+import _root  # noqa: F401  仓库根目录进 sys.path
 import base64
 import io
 import json

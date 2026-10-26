@@ -7,6 +7,7 @@
 
 运行：python test_auth_channel.py
 """
+import _root  # noqa: F401  仓库根目录进 sys.path
 import json
 import os
 import tempfile

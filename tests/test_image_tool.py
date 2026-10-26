@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """图片工具与入队脱敏的隔离验证，不接触真实令牌和真实生图接口。"""
+import _root  # noqa: F401  仓库根目录进 sys.path
 import base64
 import json
 import os
@@ -14,7 +15,7 @@ import unittest
 import urllib.parse
 import zlib
 
-HERE = Path(__file__).resolve().parent
+HERE = _root.ROOT
 PYTHON = sys.executable
 
 # 用于验证脱敏的样例，拼接构造以免源码本身命中密钥扫描规则（并非真实凭据）。

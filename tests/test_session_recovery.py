@@ -13,6 +13,7 @@
   2. 只有「会话找不到」才允许清会话——凭据失效、额度耗尽不许动；
   3. 清会话必须真删键，而不是写个 None 占位。
 """
+import _root  # noqa: F401  仓库根目录进 sys.path
 import tempfile
 import unittest
 from pathlib import Path

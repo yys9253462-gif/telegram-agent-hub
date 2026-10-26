@@ -1,4 +1,5 @@
 """官方 CLI 登录流程测试：只用内存替身，不接触任何真实账号。"""
+import _root  # noqa: F401  仓库根目录进 sys.path
 import io
 import os
 import subprocess

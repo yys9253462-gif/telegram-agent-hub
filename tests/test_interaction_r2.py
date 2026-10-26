@@ -5,6 +5,7 @@
 重点看「队列语义」：谁能拿到任务、同一会话会不会并行、
 撤销之后还能不能被领走、停止请求落到哪个任务上。
 """
+import _root  # noqa: F401  仓库根目录进 sys.path
 import tempfile
 import threading
 import time

@@ -11,6 +11,7 @@
 这些差异一旦写错，症状很隐蔽：界面说「已退出」，实际还登录着。
 所以下面每个用例都盯「文件真的没了 / 真的清了」，而不只是看返回值。
 """
+import _root  # noqa: F401  仓库根目录进 sys.path
 import json
 import os
 import tempfile

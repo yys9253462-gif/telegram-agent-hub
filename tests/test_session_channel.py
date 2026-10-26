@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """会话绑定渠道、thinking 历史不兼容自愈、套餐到期推算。"""
+import _root  # noqa: F401  仓库根目录进 sys.path
 import datetime
 import os
 import sys
 import unittest
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.environ.setdefault('TELEGRAM_BOT_TOKEN', '1:test')
 os.environ.setdefault('TELEGRAM_OWNER_ID', '1')
 import github_auth as gh

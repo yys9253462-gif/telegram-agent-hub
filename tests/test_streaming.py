@@ -18,6 +18,7 @@
 下面的用例直接拿真实的 JSON 事件（不是自己编的简化版）喂给解析器，
 再验证刷新节奏确实会把「短短一段」也拆成多次。
 """
+import _root  # noqa: F401  仓库根目录进 sys.path
 import json
 import os
 import sys
