@@ -188,7 +188,8 @@ class UsageReporterTests(unittest.TestCase):
         self.assertTrue(reporter.claude()['ok'])
         reporter.claude()
         reporter.claude(force=True)
-        self.assertEqual(len(calls), 2)
+        # 套餐信息走 /api/oauth/profile 且单独缓存，这里只数用量接口。
+        self.assertEqual(calls.count(gh.USAGE_CLAUDE_URL), 2)
 
     def test_failed_read_cached_with_short_ttl(self):
         calls = []
