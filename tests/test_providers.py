@@ -10,6 +10,7 @@ import _root  # noqa: F401  仓库根目录进 sys.path
 import json
 import os
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -19,6 +20,13 @@ import bot
 KEY = 'testkey-0123456789abcdefWXYZ'
 NEW_KEY = 'testkey-9876543210fedcbaQRST'
 MODELS = [{'id': 'model-a', 'provider': 'x', 'tools': True}, {'id': 'model-b', 'provider': 'x', 'tools': True}]
+
+
+def wait_verify():
+    """密钥验证在后台线程里跑，等它结束再断言。"""
+    for thread in threading.enumerate():
+        if thread.name == 'provider-verify':
+            thread.join(5)
 
 
 class ProviderTest(unittest.TestCase):
@@ -71,6 +79,7 @@ class ProviderTest(unittest.TestCase):
         self.assertTrue(bot.provider_input(1, url))
         bot.INCOMING['message_id'] = 77
         self.assertTrue(bot.provider_input(1, key))
+        wait_verify()
         return next(item for item in bot.provider_list() if item['id'] != bot.BUILTIN_PROVIDER)
 
     def test_add_provider_deletes_key_message_and_never_echoes_key(self):
@@ -87,6 +96,7 @@ class ProviderTest(unittest.TestCase):
         bot.start_provider_input(1, 'url')
         bot.provider_input(1, 'https://api.other.com')
         self.assertTrue(bot.provider_input(1, 'testkey-wrong-00000000000000'))
+        wait_verify()
         self.assertEqual(len(bot.provider_list()), 1, '验证不过不能保存')
         self.assertTrue(any('验证没通过' in text for text in self.sent))
         self.assertIn(1, bot.PROVIDER_INPUT, '验证失败后仍可重发密钥')
@@ -129,6 +139,7 @@ class ProviderTest(unittest.TestCase):
         bot.start_provider_input(1, 'key', provider_id=bot.BUILTIN_PROVIDER)
         bot.INCOMING['message_id'] = 9
         self.assertTrue(bot.provider_input(1, NEW_KEY))
+        wait_verify()
         environment = bot.model_environment()
         self.assertEqual(environment['ANTHROPIC_API_KEY'], NEW_KEY)
         self.assertEqual(environment['ANTHROPIC_BASE_URL'], 'https://install.example.com')
@@ -141,6 +152,27 @@ class ProviderTest(unittest.TestCase):
         environment = bot.model_environment()
         self.assertNotIn('ANTHROPIC_API_KEY', environment)
         self.assertEqual(bot.session_channel('claude'), 'account')
+
+    def test_key_is_redacted_by_value_even_without_prefix(self):
+        bare = 'abcdef0123456789ZYXWVUTSRQ'
+        self.valid_keys.add(bare)
+        self.add(key=bare)
+        self.assertNotIn(bare, bot.redact('env: ANTHROPIC=' + bare + ' done'))
+
+    def test_cancel_during_verification_does_not_save(self):
+        bot.start_provider_input(1, 'url')
+        bot.provider_input(1, 'https://api.other.com')
+        gate = threading.Event()
+
+        def slow(base_url, api_key):
+            gate.wait(5)
+            return MODELS
+        with patch.object(bot, 'fetch_provider_models', side_effect=slow):
+            bot.provider_input(1, KEY)
+            bot.cancel_provider_input(1)
+            gate.set()
+            wait_verify()
+        self.assertEqual(len(bot.provider_list()), 1, '验证期间取消了就不能保存')
 
     def test_corrupted_state_falls_back_to_builtin(self):
         bot.PROVIDER_STATE.write_text('{坏的', encoding='utf-8')

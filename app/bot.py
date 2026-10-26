@@ -28,7 +28,7 @@ import github_auth
 from github_auth import LoginManager, UsageReporter, usage_footer, usage_line, usage_merge
 from credentials import PROVIDERS, CredentialStore, fingerprint, looks_like
 # 纯文本处理（排版、切片、脱敏、耗时格式）已拆到 textfmt.py。
-from textfmt import (RENDER_LIMIT, clamp_rendered, clean_reply, format_elapsed, redact, render_reply, split_message, tidy_stream_text)
+from textfmt import (RENDER_LIMIT, clamp_rendered, clean_reply, format_elapsed, redact, register_secret, render_reply, split_message, tidy_stream_text)
 
 # 导入模块不读取认证信息、不创建目录、不启动网络请求。
 TOKEN = ''
@@ -163,12 +163,29 @@ MENU_GROUPS = {
         '平台授权': ['授权GitHub', '授权Cloudflare', '授权状态', '撤销授权'],
     },
 }
+def monitored_services():
+    """「节点状态 / 服务检查」要看的服务。
+
+    原来默认写死 telegram-agent-hub，但自定义服务名的安装（例如 claude-telegram）
+    查的就是一个不存在的服务，永远报 inactive。没配 MONITORED_SERVICES 时，
+    改用安装器记在程序目录里的真实服务名。
+    """
+    configured = os.environ.get('MONITORED_SERVICES', '').strip()
+    if configured:
+        return [name.strip() for name in configured.split(',') if name.strip()]
+    try:
+        service = json.loads((APP_DIR / 'update-install.json').read_text()).get('service', '')
+    except (OSError, ValueError, AttributeError):
+        service = ''
+    return [str(service).removesuffix('.service') or 'telegram-agent-hub']
+
+
 CHECKS = {
     '服务器概况': [['uptime'], ['free', '-m'], ['df', '-h', '/']],
     '内存使用': [['free', '-m']],
     '磁盘空间': [['df', '-h'], ['df', '-i', '/']],
-    '节点状态': [['systemctl', 'status', '--no-pager', '--lines=3'] + os.environ.get('MONITORED_SERVICES', 'telegram-agent-hub').split(',')],
-    '服务检查': [['systemctl', '--failed', '--no-pager'], ['systemctl', 'is-active'] + os.environ.get('MONITORED_SERVICES', 'telegram-agent-hub').split(',')],
+    '节点状态': [['systemctl', 'status', '--no-pager', '--lines=3'] + monitored_services()],
+    '服务检查': [['systemctl', '--failed', '--no-pager'], ['systemctl', 'is-active'] + monitored_services()],
     '系统负载': [['uptime'], ['vmstat', '1', '2']],
 }
 ALIASES = {'/start': '显示菜单', '/menu': '显示菜单', '/help': '任务说明', '/status': '服务器概况', '/memory': '内存使用', '/disk': '磁盘空间', '/node': '节点状态', '/services': '服务检查', '/load': '系统负载', '/model': '当前模型',
@@ -1155,6 +1172,8 @@ def credential_environment(base=None):
     renew_credential('github')
     renew_credential('cloudflare')
     overrides = credentials().environment()
+    for value in overrides.values():
+        register_secret(value)
     for spec in PROVIDERS.values():
         if spec['env'] not in overrides:
             environment.pop(spec['env'], None)
@@ -1547,14 +1566,36 @@ def provider_input(chat, text):
         return True
     # 第二步：密钥。不管成败都先删消息，密钥不留在聊天记录里。
     deleted = delete_incoming(chat)
+    if pending.get('validating'):
+        send(chat, '上一枚密钥还在验证，请稍等。')
+        return True
     record = provider_record(pending['provider']) if pending['provider'] else None
     base_url = pending['base_url'] or (record or {}).get('base_url', '')
+    register_secret(value)
+    pending['validating'] = True
     send(chat, '正在用这枚密钥连接 ' + base_url + ' 验证…')
+    # 验证要发一次网络请求（最长 20 秒），放到后台，主循环照常响应其它按钮。
+    threading.Thread(target=finish_provider_key, args=(chat, pending, base_url, value, deleted),
+                     daemon=True, name='provider-verify').start()
+    return True
+
+
+def finish_provider_key(chat, pending, base_url, value, deleted):
     try:
         models = fetch_provider_models(base_url, value)
     except MediaError as exc:
+        pending['validating'] = False
+        pending['expires'] = time.monotonic() + PROVIDER_INPUT_TTL
         send(chat, '验证没通过：' + str(exc) + '\n可以重新发送密钥，或发「取消」放弃。')
-        return True
+        return
+    except Exception as exc:
+        pending['validating'] = False
+        log_swallowed('验证供应商密钥', exc)
+        send(chat, '验证时出错（' + type(exc).__name__ + '），请重新发送密钥。')
+        return
+    if PROVIDER_INPUT.get(chat) is not pending:
+        # 验证期间机主点了「取消」或重新开始了，不保存。
+        return
     PROVIDER_INPUT.pop(chat, None)
     with PROVIDER_LOCK:
         state = provider_state()
@@ -1581,7 +1622,6 @@ def provider_input(chat, text):
     else:
         send_options(chat, action + '，验证通过，共 ' + str(len(models)) + ' 个模型。' + note,
                      ['使用供应商 ' + name, '模型供应商'])
-    return True
 
 
 def provider_overview():
@@ -1631,6 +1671,10 @@ def model_environment():
     if auth_channel() == 'account':
         return account_environment(environment, current_engine())
     record = provider_record()
+    for name in GATEWAY_VARS + ('OPENAI_API_KEY', 'CODEX_API_KEY', 'CODEBUDDY_API_KEY'):
+        register_secret(environment.get(name))
+    if record:
+        register_secret(record.get('api_key'))
     if record and (record['id'] != BUILTIN_PROVIDER or record.get('overridden')):
         # 换了供应商或换了密钥：用它覆盖安装时的地址与密钥。AUTH_TOKEN 要一并去掉，
         # 否则 CLI 会优先用那枚旧令牌去请求新地址。
@@ -2202,7 +2246,10 @@ def quick_action(chat, text):
         show_models(chat)
     elif text == '当前模型':
         model = current_model()
-        send(chat, '模型入口：安装时配置的网关\n当前请求模型：' + model + '\n' + ('自动路由底层模型未确认。' if model == 'auto' else '固定请求此模型，不自动回退。') + '\n目录并非可用性保证。\n运行位置：' + LOCAL_LABEL)
+        record = provider_record() or {}
+        entry = ('账号渠道（' + engine_spec(current_engine())['label'] + ' 订阅账号）' if auth_channel() == 'account'
+                 else (record.get('name') or '安装时配置') + '（' + (record.get('base_url') or '未设置地址') + '）')
+        send(chat, '模型入口：' + entry + '\n当前请求模型：' + model + '\n' + ('自动路由底层模型未确认。' if model == 'auto' else '固定请求此模型，不自动回退。') + '\n目录并非可用性保证。\n运行位置：' + LOCAL_LABEL)
     elif text in CHECKS:
         parts = [text + '（服务器实时查询）']
         for command in CHECKS[text]:
@@ -3119,7 +3166,7 @@ def sensitive_path(path):
     # 所以除了通用关键词，还要显式列出各家 CLI 的真实凭据文件名。
     secret_names = ('.netrc', '_netrc', '.git-credentials', '.npmrc', '.pypirc',
                     'auth.json', 'sessions.json', 'cookies.json', 'keyring.json',
-                    'known_hosts', '.pgpass')
+                    'known_hosts', '.pgpass', 'providers.json')
     return (any(part in ('.ssh', '.aws', '.gnupg', '.kube', '.docker', '.config') for part in parts)
             or name in secret_names
             or name == '.env' or name.startswith('.env.') or name.endswith(('.pem', '.key', '.p12', '.pfx', '.jks', '.blocked'))
@@ -3319,6 +3366,25 @@ class TaskController:
                 task.update(status='interrupted', finished=time.time(), result='桥接进程重启，任务已中断；不会自动重放。已发生的操作请人工核对。')
         self.persist()
 
+    def announce_interrupted(self):
+        """启动后告诉机主哪些任务因重启中断了。
+
+        原来只在状态里记一笔 interrupted：那条回复气泡永远停在「已运行N秒」，
+        机主只能猜它是不是还在跑。每条只通知一次。
+        """
+        with self.lock:
+            pending = [task for task in self.data['tasks']
+                       if task['status'] == 'interrupted' and not task.get('interrupt_notified')
+                       and time.time() - task.get('finished', 0) < 6 * 3600]
+            for task in pending:
+                task['interrupt_notified'] = True
+            if pending:
+                self.persist()
+        for task in pending:
+            brief = ' '.join(str(task.get('user_context') or '').split())[:60]
+            self.notify(task['chat'] or OWNER, '任务 ' + task['id'] + ' 因机器人重启而中断'
+                        + ('：' + brief if brief else '') + '\n不会自动重跑；已执行的操作请先核对，需要的话把要求再发一次。')
+
     @property
     def current(self):
         with self.lock:
@@ -3416,9 +3482,12 @@ class TaskController:
             snapshot.setdefault('strategy', '均衡执行')
             snapshot.setdefault('engine', 'claude')
             snapshot.setdefault('auth_channel', 'gateway')
-            snapshot.setdefault('session_id', data['sessions'][snapshot['session_key']].get('session_id'))
             if snapshot['session_key'] not in data['sessions']:
                 snapshot['session_key'] = data['active_session']
+            snapshot.setdefault('session_id', data['sessions'][snapshot['session_key']].get('session_id'))
+            if task['status'] in TaskController.TERMINAL:
+                # 交接摘要只在运行时有用；旧版本把它留在每条历史任务里，状态文件因此虚胖。
+                snapshot.pop('handoff', None)
             task['snapshot'] = snapshot
             kept.append(task)
         data['tasks'] = kept
@@ -3586,12 +3655,45 @@ class TaskController:
                and item['status'] in ('queued', 'running') and item['snapshot']['session_key'] == key
                for item in self.data['tasks']):
             new_key = uuid.uuid4().hex[:12]
-            self.data['sessions'][new_key] = {'name': '并发会话 ' + new_key, 'session_id': None, 'engine_sessions': {}}
+            # 新会话没有原生上下文，但必须带上原会话的交接摘要和正在进行的任务。
+            # 原来这里什么都不带：机主在上一个任务还没跑完时追问一句，
+            # 新会话里的模型完全不知道前面在聊什么（线上真实回复过「上下文我这轮没有」）。
+            origin = self.data['sessions'].get(key, {})
+            handoff = list(origin.get('handoff', []))
+            for item in self.data['tasks']:
+                if (item is not exclude and item['status'] in ('queued', 'running')
+                        and item['snapshot']['session_key'] == key and item['kind'] in ('agent', 'media')):
+                    handoff.append({'engine': item['snapshot'].get('engine', 'claude'),
+                                    'request': redact(item.get('text', ''))[:1600],
+                                    'result': '（这项任务仍在进行中，结果未出）'})
+            handoff = handoff[-6:]
+            self.data['sessions'][new_key] = {'name': '并发会话 ' + new_key, 'session_id': None,
+                                              'engine_sessions': {}, 'handoff': handoff}
             snapshot['session_key'] = new_key
             snapshot['session_id'] = None
-            snapshot.pop('handoff', None)
+            snapshot['handoff'] = handoff
             if self.data['active_session'] == key:
                 self.data['active_session'] = new_key
+            self._prune_sessions()
+
+    MAX_SESSIONS = 30
+
+    def _prune_sessions(self):
+        """会话记录封顶。每次并发都会新开一个会话，原来只增不减。
+
+        只删最早的、既不是当前会话也没有排队/运行任务引用的那些；
+        历史任务引用的会话被删后，展示时退回「?」，不影响任何功能。调用方须持锁。
+        """
+        sessions = self.data['sessions']
+        if len(sessions) <= self.MAX_SESSIONS:
+            return
+        busy = {item['snapshot']['session_key'] for item in self.data['tasks']
+                if item['status'] in ('queued', 'running', 'awaiting_confirmation')}
+        for key in list(sessions):
+            if len(sessions) <= self.MAX_SESSIONS:
+                break
+            if key != self.data['active_session'] and key not in busy:
+                sessions.pop(key)
 
     def stop(self, task_id=None):
         with self.lock:
@@ -3633,7 +3735,7 @@ class TaskController:
                    + '\n会话：' + session
                    + '\n耗时：' + format_elapsed(task.get('finished', time.time()) - task.get('started', task['created']))
                    + '\n最近工具：' + ('、'.join(task.get('tools', [])[-3:]) or '暂无'))
-        brief = ' '.join(str(task.get('text') or '').split())
+        brief = ' '.join(str(task.get('text') or task.get('user_context') or '').split())
         if brief and task.get('kind') in ('agent', 'media'):
             summary += '\n内容：' + (brief[:40] + '…' if len(brief) > 40 else brief)
         return summary
@@ -3698,6 +3800,10 @@ class TaskController:
                     if task['status'] != 'awaiting_confirmation':
                         task['text'] = ''
                         task['payload'] = {}
+                    # 交接摘要（最近六项任务、每项最多 2400 字）只在执行时注入一次。
+                    # 原来每条历史任务都留着一份，200 条历史能让状态文件涨到 1MB 以上，
+                    # 而状态文件每次工具调用都要整份重写并 fsync。
+                    task['snapshot'].pop('handoff', None)
                     self.running.pop(task['id'], None)
                     self.persist()
                     self.condition.notify_all()
@@ -4313,7 +4419,8 @@ class TaskController:
             send(chat, '已切到「' + item['name'] + '」，模型：' + model + '。新任务生效，会自动开新会话。')
         else:
             send(chat, '已切到「' + item['name'] + '」。请选这一家的模型：')
-            show_models(chat)
+            # 拉目录要请求网关，交给队列执行，不卡住主循环。
+            self.enqueue(chat, '', 'models')
 
     @on_text('更换密钥')
     def _cmd_更换密钥(self, chat, text, update_id):
@@ -4562,6 +4669,11 @@ def main():
     TOKEN = os.environ['TELEGRAM_BOT_TOKEN']
     OWNER = int(os.environ['TELEGRAM_OWNER_ID'])
     BASE = os.environ.get('TELEGRAM_API_BASE', 'https://api.telegram.org').rstrip('/') + '/bot' + TOKEN + '/'
+    register_secret(TOKEN)
+    for name in GATEWAY_VARS + ('OPENAI_API_KEY', 'CODEX_API_KEY', 'CODEBUDDY_API_KEY'):
+        register_secret(os.environ.get(name))
+    for item in provider_list():
+        register_secret(item.get('api_key'))
     WORK.mkdir(mode=0o700, parents=True, exist_ok=True)
     offset = int(STATE.read_text()) if STATE.exists() else 0
     # offset 落盘节流：上次落盘的游标值与时刻。
@@ -4573,6 +4685,10 @@ def main():
     threading.Thread(target=credential_renew_worker, daemon=True,
                      name='credential-renew').start()
     CONTROL.start_workers()
+    try:
+        CONTROL.announce_interrupted()
+    except Exception as exc:
+        log_swallowed('通知重启中断的任务', exc)
     def shutdown(signum, frame):
         raise KeyboardInterrupt()
     signal.signal(signal.SIGTERM, shutdown)

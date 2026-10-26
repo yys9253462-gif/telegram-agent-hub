@@ -191,10 +191,27 @@ def tidy_stream_text(text):
     return re.sub(r'\n{3,}', '\n\n', text).strip('\n')
 
 
+# 机器人自己持有的密钥原文（电报令牌、各供应商 API 密钥、平台授权令牌）。
+# 正则只认得带固定前缀的形态；无前缀的网关密钥一旦被模型 echo 出来，
+# 只有按原值匹配才能挡住。由 bot.py 在读取/注入密钥时登记。
+SECRET_VALUES = set()
+
+
+def register_secret(value):
+    value = str(value or '').strip()
+    # 太短的值按原文替换会误伤正常文字，交给正则规则处理。
+    if len(value) >= 12:
+        SECRET_VALUES.add(value)
+
+
 def redact(value):
     """抹掉文本里的凭证。顺序有讲究：先处理更长、更具体的形态，
     否则宽泛规则会先吃掉前缀，让后面的规则再也匹配不到令牌本体。"""
     value = str(value)
+    # 长的先换：一枚密钥若是另一枚的前缀，先换短的会留下半截。
+    for secret in sorted(SECRET_VALUES, key=len, reverse=True):
+        if secret in value:
+            value = value.replace(secret, '[已隐藏密钥]')
     value = re.sub(r'-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?-----END [^-]*PRIVATE KEY-----', '[已隐藏私钥]', value)
     # URL 内嵌凭证 https://user:password@host 与数据库连接串，必须在通用规则之前处理。
     # 密码里可能含 @，因此匹配到「最后一个 @ 之前」的全部内容。
