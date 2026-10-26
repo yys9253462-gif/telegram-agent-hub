@@ -2704,6 +2704,33 @@ def session_history_incompatible(message):
         return False
     return any(word in text for word in ('non-whitespace thinking', 'invalid signature', 'signature', 'thinking block'))
 
+STEP_LIMIT = 6
+TOOL_ICONS = {'Bash': '💻', 'Read': '📖', 'Write': '📝', 'Edit': '✏️', 'MultiEdit': '✏️', 'Grep': '🔎',
+              'Glob': '🔎', 'WebFetch': '🌐', 'WebSearch': '🌐', 'Agent': '🤝', 'Task': '🤝',
+              'TodoWrite': '🗒', 'NotebookEdit': '✏️'}
+
+
+def describe_tool(name, payload):
+    """把一次工具调用压成一行人话：💻 ssh tokyo 'docker ps'、📖 /etc/nginx/nginx.conf。"""
+    payload = payload if isinstance(payload, dict) else {}
+    name = str(name or '工具')
+    if name in ('Agent', 'Task'):
+        detail = payload.get('description') or payload.get('subagent_type') or ''
+        return '🤝 交给执行模型：' + str(detail)[:60]
+    detail = (payload.get('command') or payload.get('file_path') or payload.get('path')
+              or payload.get('pattern') or payload.get('url') or payload.get('query') or '')
+    detail = ' '.join(str(detail).split())
+    if len(detail) > 70:
+        detail = detail[:70] + '…'
+    return TOOL_ICONS.get(name, '🔧') + ' ' + (detail or name)
+
+
+def add_step(state, text):
+    steps = state.setdefault('steps', [])
+    # 不裁剪：单任务最多 80 轮，全部留着才能如实显示「前面还有 N 步」。
+    steps.append(text)
+
+
 def parse_claude_event(event, state):
     """解析 Claude/CodeBuddy 的 stream-json 事件，就地更新累积状态。
 
@@ -2767,9 +2794,21 @@ def parse_claude_event(event, state):
                 tool = str(state.get('tool_name') or '')
                 state['activity'] = ('正在准备工具参数：' + tool) if tool else '正在准备工具参数'
     elif event.get('type') == 'assistant':
+        # parent_tool_use_id 非空：这是子代理（规划执行里的执行模型）内部的一步。
+        nested = bool(event.get('parent_tool_use_id'))
         for block in event.get('message', {}).get('content', []):
             if isinstance(block, dict) and block.get('type') == 'tool_use':
                 record_tool(str(block.get('name', '工具')))
+                step = describe_tool(block.get('name'), block.get('input'))
+                add_step(state, ('↳ ' if nested else '') + step)
+                if nested:
+                    state['activity'] = '执行模型正在：' + step
+    elif event.get('type') == 'user':
+        # 工具返回失败时在那一步后面标 ✗，过程里能看出哪步没成。
+        for block in (event.get('message') or {}).get('content') or []:
+            if isinstance(block, dict) and block.get('type') == 'tool_result' and block.get('is_error'):
+                if state.get('steps'):
+                    state['steps'][-1] += ' ✗'
     elif event.get('type') == 'result':
         state['final'] = event
         if event.get('session_id'):
@@ -2822,6 +2861,10 @@ def parse_codex_event(event, state):
     elif item_type == 'command_execution':
         command = str(item.get('command', '命令')).strip()
         exit_code = item.get('exit_code')
+        if kind == 'item.started' or (exit_code is not None and not state.get('steps')):
+            add_step(state, describe_tool('Bash', {'command': command}))
+        if exit_code not in (None, 0) and state.get('steps'):
+            state['steps'][-1] += ' ✗'
         if exit_code is None:
             state['activity'] = '正在执行：' + command[:60]
         else:
@@ -2842,9 +2885,18 @@ def stream_interval(elapsed, grew):
     return STREAM_EDIT_MIN_LONG if grew else STREAM_EDIT_IDLE_LONG
 
 
-def stream_preview(content, thinking, activity, elapsed):
-    """流式过程中气泡里显示的那一帧：最新正文（或思考片段）+ 进度行。"""
+def stream_preview(content, thinking, activity, elapsed, steps=None):
+    """流式过程中气泡里显示的那一帧：最新正文（或思考片段）+ 最近几步过程 + 进度行。
+
+    过程只在运行中显示（引用块，一步一行，执行模型的步骤带 ↳），最终答案里不保留。
+    原来长任务里只有一行「正在准备工具参数：Agent」，几分钟看不到任何进展。
+    """
     progress = PROGRESS_MARK + activity + ' · 已运行' + str(int(elapsed)) + '秒'
+    if steps:
+        shown = steps[-STEP_LIMIT:]
+        hidden = len(steps) - len(shown)
+        lines = (['> …前面还有 ' + str(hidden) + ' 步'] if hidden else []) + ['> ' + step for step in shown]
+        progress = '\n'.join(lines) + '\n' + progress
     # 预览同样压缩空行，避免流式过程中气泡被空行撑高。
     clean_content = tidy_stream_text(content)
     preview = clean_content if len(clean_content) <= 1800 else '（显示最新生成内容）\n' + clean_content[-1800:]
@@ -3108,7 +3160,7 @@ def run_stream(chat, text):
                 last_edit = now
                 last_content_len = len(content)
                 block_finished = False
-                stream.edit(stream_preview(content, state.get('thinking'), activity, now - started))
+                stream.edit(stream_preview(content, state.get('thinking'), activity, now - started, state.get('steps')))
         process.wait(timeout=10)
         answer = pick_final_answer((final or {}).get('result'), content)
         # 收尾统一压缩空行：模型输出与流式累积都可能带出多余空行。
