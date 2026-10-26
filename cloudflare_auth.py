@@ -81,7 +81,7 @@ def _dash(url, payload, timeout=20):
         # 先读响应体：OAuth 的错误是「状态码 + JSON 错误码」成对出现的，两者都要。
         try:
             body = json.loads(exc.read().decode('utf-8', 'replace'))
-        except (ValueError, OSError):
+        except (ValueError, OSError, AttributeError):
             body = None
         if isinstance(body, dict) and body.get('error'):
             return body

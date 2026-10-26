@@ -29,6 +29,43 @@ class SessionChannelTest(unittest.TestCase):
         self.assertFalse(bot.session_history_incompatible('API Error: 429 rate limit'))
 
 
+class InteractionTest(unittest.TestCase):
+    def test_failure_hints_are_specific(self):
+        self.assertIn('额度', bot.failure_hint('API Error: 429 rate limit exceeded'))
+        self.assertIn('重新登录', bot.failure_hint('API Error: 401 authentication_error'))
+        self.assertIn('换新会话', bot.failure_hint('each thinking block must contain non-whitespace thinking'))
+
+    def test_answer_callback_swallows_expired_query(self):
+        original = bot.api
+        def boom(method, payload):
+            raise RuntimeError('query is too old')
+        bot.api = boom
+        try:
+            bot.answer_callback({'id': 'x'})
+        finally:
+            bot.api = original
+
+    def test_api_retries_429(self):
+        import io, urllib.error
+        calls = []
+        class Ok:
+            def __enter__(self): return io.BytesIO(b'{"ok": true, "result": 1}')
+            def __exit__(self, *a): return False
+        def fake(request, timeout=None):
+            calls.append(1)
+            if len(calls) == 1:
+                raise urllib.error.HTTPError('u', 429, 'Too Many', {},
+                                             io.BytesIO(b'{"parameters": {"retry_after": 0}}'))
+            return Ok()
+        original, base = bot.urllib.request.urlopen, bot.BASE
+        bot.urllib.request.urlopen, bot.BASE = fake, 'http://127.0.0.1/bot/'
+        try:
+            self.assertEqual(bot.api('sendMessage', {}), 1)
+        finally:
+            bot.urllib.request.urlopen, bot.BASE = original, base
+        self.assertEqual(len(calls), 2)
+
+
 class PlanTest(unittest.TestCase):
     def test_pro_renewal(self):
         now = datetime.datetime(2026, 10, 26, tzinfo=datetime.timezone.utc).timestamp()
