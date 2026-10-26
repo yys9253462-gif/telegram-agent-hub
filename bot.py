@@ -291,6 +291,26 @@ def save_session(value):
         return
     atomic_json(SESSION_STATE, {'session_id': value})
 
+def clear_session():
+    """抹掉当前执行器存下的会话 ID，回到「全新会话」。
+
+    CLI 侧的会话文件会被回收（例如重装、清理 home 目录、会话过期），
+    但本地这份记录还留着，于是下一次调用带着一个不存在的 ID 过去：
+    codebuddy 只吐一行 {"type":"error","error":"No conversation found ..."}
+    就以退出码 0 结束。不主动清掉，用户会一直撞同一堵墙，而且每次
+    都要人工干预——这属于「能自愈的失败」，不该丢给用户处理。
+
+    只删会话 ID，不动工作目录里的任务数据；也不碰 auth.json 等凭据文件：
+    会话失效与「登录态失效」是两码事，清错对象会把人踢出登录。
+    """
+    if CONTROL is not None:
+        task = getattr(TASK_LOCAL, 'task', None)
+        CONTROL.clear_session(task['snapshot']['session_key'] if task else None)
+        return
+    # 没有任务控制器（单会话模式）：直接把会话 ID 置空，文件留着更安全，
+    # 删文件会让后续的读取走异常分支。
+    atomic_json(SESSION_STATE, {'session_id': None})
+
 MODEL_STATE = WORK / 'selected-model.json'
 MODEL_CACHE = WORK / 'model-catalog.json'
 
@@ -2063,13 +2083,91 @@ def start_text_block(buffer):
 
     这是修复空行膨胀的关键：原代码在每次 message_start 时无条件追加 '\\n\\n'，
     而 agent 每完成一次工具调用都会产生一个 message_start，导致空行不断堆积
-    （线上实测出现过 153 个连续换行）。这里改为：
-      - 只在缓冲区已有正文、且末尾还没有空行时，补一个段落分隔；
-      - 其余情况返回空串，绝不叠加。
+    （线上实测出现过 153 个连续换行）。
+
+    但「每个块都补空行」也有反作用：块边界不一定落在句子边界上。生产实测见过
+    上一块停在「剩 32」、下一块接着「G，占用 15%」——硬补两个换行就把一个
+    数量词劈成两段：
+
+        根分区 40G，已用 5.6G，剩 32
+
+        G，占用 15%
+
+    每次工具调用后换段是 agent 的常规排版习惯，可它断在句子中间时应该接续
+    而不是另起一段。所以改为按缓冲区末尾的字符判断：
+      - 空缓冲、或已经带着空行 → 不补；
+      - 停在句末标点（中英文）→ 补一个空行，这就是正常的段落分隔；
+      - 停在别的字符（数字、字母、逗号……）→ **什么都不补**。
+
+    最后一条曾经写成「补一个空格」，那是错的：块边界纯粹是流式切片的产物，
+    可能落在标识符中间。生产上因此见过「claude -telegram」「机器 很空闲」——
+    空格是凭空塞进去的，原文里没有。模型自己在需要的地方会带空格，不是
+    句子边界就当没断过，是最安全的做法。
+
+    判断依据只能是「上一块结尾是什么」，不能是「这是第几块」：模型完全可以
+    连着说完一段话再调工具，那就不该断开。
     """
     if not buffer or buffer.endswith('\n\n'):
         return ''
+    if buffer[-1].isspace():
+        return ''
+    if buffer[-1] in SENTENCE_END:
+        return '\n\n'
+    return ''
+
+
+# 句末标点：只有停在这些字符后面，才值得另起一段。
+SENTENCE_END = frozenset('。！？；.!?;:：…”」』）)】》')
+
+
+def agent_message_separator(buffer):
+    """codex 的 agent_message 之间用什么分隔。
+
+    与 start_text_block 分开，因为两者语义不同：
+      - codex 的 agent_message 是**一整条消息**，条与条之间天然是段落关系，
+        哪怕上一段停在半个句子上（模型完全可能写「第一段」这种不成句的
+        标题式文本），也不该拿空格把它们黏成「第一段 第二段」；
+      - claude 的 text 块是一句话被工具调用切出来的碎片，边界落在哪儿不可控，
+        所以那边才要按句末标点判断（见 start_text_block）。
+
+    把两者混用，要么 codex 两段黏成一行，要么 claude 的数量词被劈成两段。
+    """
+    if not buffer or buffer.endswith('\n\n') or buffer[-1].isspace():
+        return ''
     return '\n\n'
+
+
+def pick_final_answer(final_result, content):
+    """决定最终回复用哪一份：CLI 的收尾答复，还是流式累积的正文。
+
+    线上真实事故（2026-10-26 生产复现）：用户让 agent 依次执行三条命令、
+    每条说一句话。流式过程中三段正文都正确显示了，但等到收尾，气泡里
+    **只剩最后一句**——前面「/opt 下只有一个 claude-telegram」与
+    「根分区 40G，已用 5.6G…」全没了。
+
+    原因是 `result` 字段的语义：它只是 CLI 给出的**收尾答复**（往往是
+    「机器很空闲」这样的总结句），并不包含中间段落。原来写成
+        answer = result or content
+    于是只要 result 非空，累积正文就被整体丢弃。而 result 永远是有的，
+    所以这条分支几乎总会命中，等于把多段回答截成最后一句。
+
+    现在的判断：谁的正文更完整就用谁。
+      - 有累积正文、且不比 result 短 → 用累积正文（保住中间段落）；
+      - 没有累积正文（例如直接 failed、没有流式）→ 退回 result；
+      - 两者都没有 → 给出可供排查的提示。
+
+    「不短于」而不是「长于」：等长时两者内容基本一致，用累积正文可以顺便
+    保留流式阶段已经整理好的段落分隔。
+    """
+    final_result = tidy_stream_text(str(final_result or ''))
+    content = tidy_stream_text(str(content or ''))
+    if content and len(content) >= len(final_result):
+        return content
+    if final_result:
+        return final_result
+    if content:
+        return content
+    return '任务未返回内容，请检查模型接口。'
 
 
 def engine_binary(engine):
@@ -2163,6 +2261,26 @@ def append_content(state, chunk):
     state['content'] = content
 
 
+def session_error_is_recoverable(message):
+    """判断这条 error 是不是「清掉会话记录就能自愈」的那种。
+
+    只认「会话找不到」这一类（No conversation found / session not found /
+    invalid session id）。清会话是破坏性动作：用户这一轮的上下文会丢，
+    所以宁可漏判也不能误判——把凭据失效、额度耗尽也当成会话问题清一遍，
+    既解决不了问题，还会顺手抹掉本来好用的上下文。
+
+    「session」这个词本身太宽（`session limit reached` 是额度、
+    `session token expired` 是凭据），所以要求「找不到」与「会话」
+    同时出现，而不是命中任一个就动手。
+    """
+    text = str(message or '').lower()
+    if not text:
+        return False
+    missing = ('no conversation found', 'conversation not found', 'no conversation',
+               'not found', 'does not exist', 'unknown session', 'invalid session')
+    session = ('conversation', 'session')
+    return any(word in text for word in missing) and any(word in text for word in session)
+
 def parse_claude_event(event, state):
     """解析 Claude/CodeBuddy 的 stream-json 事件，就地更新累积状态。
 
@@ -2200,6 +2318,10 @@ def parse_claude_event(event, state):
                 state['activity'] = '正在思考'
             elif block.get('type') == 'tool_use':
                 tool = str(block.get('name', '工具'))
+                # 名字只在这里出现：后面到达的是 input_json_delta，
+                # 里面只有参数片段，没有工具名。不记下来的话，参数阶段
+                # 只能显示兜底词「工具」，用户看不出正在准备哪个工具。
+                state['tool_name'] = tool
                 state['activity'] = '正在执行工具：' + tool
                 record_tool(tool)
         elif stream_type == 'content_block_delta':
@@ -2217,8 +2339,10 @@ def parse_claude_event(event, state):
             elif kind == 'input_json_delta':
                 # 工具参数是流式拼出来的 JSON 片段，逐片显示没有意义，
                 # 只更新活动提示，让用户知道还在动。
-                tool = str((state.get('tool_name') or '工具'))
-                state['activity'] = '正在准备工具参数：' + tool
+                # 工具名来自前面的 content_block_start；万一没收到（上游省略、
+                # 或从事件流中间接上），说「正在准备工具」也比说「工具」具体。
+                tool = str(state.get('tool_name') or '')
+                state['activity'] = ('正在准备工具参数：' + tool) if tool else '正在准备工具参数'
     elif event.get('type') == 'assistant':
         for block in event.get('message', {}).get('content', []):
             if isinstance(block, dict) and block.get('type') == 'tool_use':
@@ -2227,6 +2351,17 @@ def parse_claude_event(event, state):
         state['final'] = event
         if event.get('session_id'):
             save_session(event['session_id'])
+    elif event.get('type') == 'error':
+        # 顶层的 error 事件。生产实测：会话 ID 在 CLI 侧已失效时，
+        # codebuddy 只吐这一行然后**以退出码 0 结束**：
+        #   {"type":"error","error":"No conversation found with session ID: ..."}
+        # 原来这里什么都不做，于是退出码 0 + 正文为空 → 用户只看到
+        # 「任务未返回内容，请检查模型接口」，真正的原因一个字都没有。
+        message = str(event.get('error') or event.get('message') or '').strip()
+        if message:
+            state['failed'] = message
+            if session_error_is_recoverable(message):
+                state['session_invalid'] = True
 
 
 def parse_codex_event(event, state):
@@ -2256,8 +2391,10 @@ def parse_codex_event(event, state):
     if item_type == 'agent_message':
         chunk = str(item.get('text', ''))
         if chunk:
-            # 多条 agent_message 之间用空行分隔，避免两句黏成一段。
-            append_content(state, start_text_block(state['content']) + chunk)
+            # 每条 agent_message 是一条独立消息，之间用空行分开。
+            # 这里不能用 start_text_block：那条路径会按句末标点判断，
+            # 而 agent_message 不成句（例如「第一段」）时会被空格黏起来。
+            append_content(state, agent_message_separator(state['content']) + chunk)
             state['activity'] = '正在生成回复'
     elif item_type == 'command_execution':
         command = str(item.get('command', '命令')).strip()
@@ -2321,8 +2458,10 @@ def run_stream(chat, text):
     block_finished = False
     state_kind = engine_spec(engine)['kind']
     # 把流式累积状态收进一个字典，两种协议的解析函数都只改这里，主循环读同一份。
+    # tool_name 单独记：工具名只在 content_block_start 里出现，后面的
+    # input_json_delta 只有参数片段，不记下来参数阶段就只剩兜底词「工具」。
     state = {'content': '', 'final': None, 'activity': '等待模型响应', 'failed': '',
-             'thinking': ''}
+             'thinking': '', 'tool_name': ''}
     content = ''
     final = None
     activity = '等待模型响应'
@@ -2472,7 +2611,7 @@ def run_stream(chat, text):
                         preview = '（思考中）' + thought[-300:].replace('\n', ' ')
                 edit((preview + '\n\n' if preview else '') + progress)
         process.wait(timeout=10)
-        answer = (final or {}).get('result') or content or '任务未返回内容，请检查模型接口。'
+        answer = pick_final_answer((final or {}).get('result'), content)
         # 收尾统一压缩空行：模型输出与流式累积都可能带出多余空行。
         answer = tidy_stream_text(answer)
         # codex 用 turn.failed 表达失败，退出码未必非零；两种都要算进来。
@@ -2482,6 +2621,15 @@ def run_stream(chat, text):
                 # 整轮失败且没有正文时，把失败原因直接给出来，比一句「未返回内容」有用得多。
                 answer = state['failed']
             answer = '本轮执行未成功。\n' + answer + '\n可检查当前模型的套餐权限、额度和工具兼容性；也可以切换模型后重试。已执行的操作不会自动回滚，请先核对结果。'
+        if state.get('session_invalid'):
+            # 会话记录失效：清掉本地存的会话 ID，让下一轮自动开新会话。
+            # 必须在回复之前清好，否则用户重试时仍带着旧 ID，撞同一堵墙。
+            # 清理失败不改变本轮结果，只是下次还得再撞一次，如实说明即可。
+            try:
+                clear_session()
+                answer += '\n\n会话记录已失效，本地的会话 ID 已清除。直接把刚才的要求再发一次即可，新一轮会自动开启。'
+            except Exception as exc:
+                answer += '\n\n会话记录已失效，但自动清除没成功（' + str(exc) + '）。可发送 /new 手动开启新会话。'
         task = getattr(TASK_LOCAL, 'task', None)
         if task:
             task['result'] = redact(answer[:24000])
@@ -3107,9 +3255,42 @@ class TaskController:
         with self.lock:
             key = key or self.data['active_session']
             session = self.data['sessions'][key]
-            session.setdefault('engine_sessions', {})[current_engine()] = value
-            if current_engine() == 'claude':
+            engine = current_engine()
+            session.setdefault('engine_sessions', {})[engine] = value
+            if engine == 'claude':
                 session['session_id'] = value
+            else:
+                # session_id 是老版本留下的「claude 专用」镜像字段（早于
+                # engine_sessions 就存在，界面和旧数据还在读它）。它只能由
+                # claude 自己写：原来这里是「非 claude 时什么都不做」，
+                # 于是给 codebuddy 存会话时旧值原封不动留着，看起来无害——
+                # 但只要 claude 那边先被清成空，这个字段就一直是空的，
+                # 切回 claude 时反而以为「没有会话」，白白丢掉上下文。
+                # 现在改成从 engine_sessions 同步，保证两处永远一致。
+                session['session_id'] = session['engine_sessions'].get('claude')
+            self.persist()
+
+    def clear_session(self, key=None):
+        """删掉当前执行器的会话 ID（不是置 None）。
+
+        刻意与 update_session 分开：把 None 写进 engine_sessions 只是
+        「记了一个空值」，session_id() 取出来仍是 None 看似一样，但只要
+        别处有 `if engine in engine_sessions` 之类的判断，空值就会被当成
+        「有会话」；而且日志里会留下一条「已保存会话：None」的噪音。
+        真删掉才等价于「从没跑过」，CLI 那边也才会开新会话。
+
+        注意只清当前执行器：codebuddy 的会话失效了，claude 的会话好好地在
+        那里，顺手一起清就是把别人的上下文也丢了。
+        """
+        with self.lock:
+            key = key or self.data['active_session']
+            session = self.data['sessions'].get(key)
+            if not isinstance(session, dict):
+                return
+            engine = current_engine()
+            session.get('engine_sessions', {}).pop(engine, None)
+            if engine == 'claude':
+                session.pop('session_id', None)
             self.persist()
 
     def snapshot(self):
