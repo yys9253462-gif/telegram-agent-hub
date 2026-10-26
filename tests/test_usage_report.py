@@ -434,7 +434,7 @@ class ReplyFooterTests(unittest.TestCase):
     def test_account_channel_shows_the_chosen_account_model(self):
         bot.set_auth_channel('account', 'claude')
         with patch.object(bot, 'account_model', return_value='opus'):
-            self.assertIn('模型：opus', bot.execution_footer('claude'))
+            self.assertIn('模型：Opus 5.5', bot.execution_footer('claude'))
 
     def test_gateway_reply_has_no_usage_line(self):
         bot.set_auth_channel('gateway', 'claude')

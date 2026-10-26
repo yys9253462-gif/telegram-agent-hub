@@ -823,11 +823,16 @@ CODEX_PLAN_LABELS = {
     'edu': 'Edu',
 }
 # Claude 的 --model 接受别名，比写死版本号稳：官方换版本时别名照样有效。
+# Claude 账号模式可选模型（2026-10-26 在真实 Pro 账号上逐个实测，别名会跟着官方最新版走）。
+# fable 在 Pro 上要额外用量额度，未开通时官方直接拒绝，所以标注出来而不是藏掉。
 CLAUDE_ACCOUNT_MODELS = (
-    ('default', '默认'),
-    ('opus', 'Opus'),
-    ('sonnet', 'Sonnet'),
-    ('haiku', 'Haiku'),
+    ('opus', 'Opus 5.5'),
+    ('opus[1m]', 'Opus 5.5 · 1M 上下文'),
+    ('sonnet', 'Sonnet 5.5'),
+    ('sonnet[1m]', 'Sonnet 5.5 · 1M 上下文'),
+    ('haiku', 'Haiku 5.5'),
+    ('opusplan', 'Opus 规划 + Sonnet 执行'),
+    ('fable', 'Fable 5.1（Pro 需额外额度）'),
 )
 # Codex 账号模式真实可用的模型（2026-10-26 在真实 Plus 账号上逐个实测）。
 # 判定依据：返回 "Stream must be set to true" 说明模型存在；

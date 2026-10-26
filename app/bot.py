@@ -154,9 +154,9 @@ KEYBOARD = {
 # 保留分组常量兼容旧入口，展示时直接平铺各组功能。
 MENU_GROUPS = {
     '设置': {
-        '任务与模型': ['模型', '模型供应商', '选择智能体'],
+        '任务与模型': ['模型', '账号模型', '思考强度', '模型供应商', '选择智能体'],
         '会话与文件': ['新建会话', '会话列表'],
-        '账号登录': ['登录Claude', '登录CodeBuddy', '登录Codex', '退出账号', '账号状态', '渠道切换', '账号模型'],
+        '账号登录': ['登录Claude', '登录CodeBuddy', '登录Codex', '退出账号', '账号状态', '渠道切换'],
         '版本更新': ['检查版本', '更新机器人'],
     },
     '更多': {
@@ -934,6 +934,53 @@ def set_account_model(engine, model):
     atomic_json(account_model_state_path(engine), {'model': model})
 
 
+# 思考强度：各执行器 CLI 自己的档位。空串表示不传参数、用 CLI 默认。
+EFFORT_LEVELS = {
+    'claude': ('low', 'medium', 'high', 'xhigh', 'max'),
+    'codebuddy': ('minimal', 'low', 'medium', 'high', 'xhigh', 'max'),
+    'codex': ('minimal', 'low', 'medium', 'high'),
+}
+EFFORT_LABELS = {'minimal': '最低', 'low': '低', 'medium': '中', 'high': '高', 'xhigh': '很高', 'max': '最高'}
+
+
+def effort_state_path(engine):
+    return WORK / ('effort-' + engine + '.json')
+
+
+def current_effort(engine=None):
+    """当前执行器的思考强度。任务里以入队时的设置为准，与模型、渠道一样不受中途修改影响。"""
+    engine = engine or current_engine()
+    task = getattr(TASK_LOCAL, 'task', None)
+    if task and task['snapshot'].get('engine', 'claude') == engine and 'effort' in task['snapshot']:
+        value = task['snapshot']['effort']
+    else:
+        try:
+            value = json.loads(effort_state_path(engine).read_text()).get('effort', '')
+        except (OSError, ValueError, AttributeError):
+            value = ''
+    return value if value in EFFORT_LEVELS.get(engine, ()) else ''
+
+
+def set_effort(engine, value):
+    if value and value not in EFFORT_LEVELS.get(engine, ()):
+        raise MediaError(engine_spec(engine)['label'] + ' 不支持这个思考强度。')
+    atomic_json(effort_state_path(engine), {'effort': value})
+
+
+def effort_label(engine=None):
+    value = current_effort(engine)
+    return EFFORT_LABELS.get(value, value) + '（' + value + '）' if value else '默认'
+
+
+def account_model_label(engine=None):
+    """账号模型的人读名字，例如「Opus 5.5 · 1M 上下文」；没选过是「官方默认」。"""
+    engine = engine or current_engine()
+    value = account_model(engine)
+    if not value:
+        return '官方默认'
+    return dict(account_model_options(engine)).get(value, value)
+
+
 USAGE = UsageReporter(credential=usage_credential)
 
 
@@ -946,7 +993,7 @@ def model_label(engine=None, channel=None, gateway_model=None):
     engine = engine or current_engine()
     channel = channel or auth_channel(engine)
     if channel == 'account':
-        return engine_spec(engine)['label'] + ' · 账号 · ' + (account_model(engine) or '官方默认')
+        return engine_spec(engine)['label'] + ' · 账号 · ' + account_model_label(engine)
     record = provider_record() or {}
     name = record.get('name') if record.get('id') != BUILTIN_PROVIDER else '接口密钥'
     return engine_spec(engine)['label'] + ' · ' + (name or '接口密钥') + ' · ' + str(gateway_model or current_model())
@@ -972,10 +1019,12 @@ def execution_footer(engine=None, started=None, started_wall=None):
     engine = engine or current_engine()
     label = engine_spec(engine)['label']
     if auth_channel(engine) == 'account':
-        model = account_model(engine) or '官方默认'
+        model = account_model_label(engine)
     else:
         model = current_model()
     parts = ['执行器：' + label, '模型：' + str(model)]
+    if current_effort(engine):
+        parts.append('思考：' + effort_label(engine))
     elapsed = None
     if started is not None:
         try:
@@ -2447,6 +2496,8 @@ def engine_command(engine, text, instructions, chat, environment):
                 command += ['--model', account_model(engine)]
         elif current_model():
             command += ['--model', current_model()]
+        if current_effort(engine):
+            command += ['-c', 'model_reasoning_effort="' + current_effort(engine) + '"']
         if session_id():
             # codex 的续接是子命令，不是参数。
             command += ['resume', session_id(), '-']
@@ -2461,6 +2512,12 @@ def engine_command(engine, text, instructions, chat, environment):
         command.extend(['--model', current_model()])
     if engine == 'codebuddy' and account and account_model(engine):
         command.extend(['--model', account_model(engine)])
+    # Claude 账号模式的模型原来从没传进去：网关模式靠 ANTHROPIC_MODEL 等环境变量钉模型，
+    # 账号模式又必须剔除这些变量，于是机主选的 opus 实际跑的是 CLI 默认模型。
+    if engine == 'claude' and account and account_model(engine):
+        command.extend(['--model', account_model(engine)])
+    if current_effort(engine):
+        command.extend(['--effort', current_effort(engine)])
     if session_id():
         command.extend(['--resume', session_id()])
     if environment.pop('_IMAGE_SERVER', None):
@@ -3640,6 +3697,7 @@ class TaskController:
             engine = current_engine()
             return {'model': current_model(), 'target': self.target, 'strategy': strategy_name(), 'engine': engine,
                     'auth_channel': auth_channel(engine), 'provider': active_provider_id(),
+                    'effort': current_effort(engine),
                     'session_key': key, 'session_id': stored_session(session, engine, session_channel(engine))}
 
     def enqueue(self, chat, text='', kind='agent', payload=None, update_id=None, snapshot=None):
@@ -4369,13 +4427,36 @@ class TaskController:
         if not models:
             raise MediaError(label + ' 账号模式暂无可选模型清单。')
         current = account_model(engine)
-        lines = [label + ' 账号模式模型\n当前：' + (current or '官方默认'),
+        lines = [label + ' 账号模式模型',
+                 '当前：' + account_model_label(engine) + ' · 思考强度：' + effort_label(engine),
                  '账号模式与接口密钥模式各用各的模型，互不影响。',
                  '官方对账号模式有可用范围限制，清单之外的模型会被直接拒绝。']
-        options = [('账号模型 默认', '账号模型 默认')]
+        options = [('官方默认' + (' ·当前' if not current else ''), '账号模型 默认')]
         options.extend((name + (' ·当前' if mid == current else ''), '账号模型 ' + mid)
                        for mid, name in models)
+        options.append(('调整思考强度', '思考强度'))
         send_options(chat, '\n'.join(lines), options)
+
+    @on_text('思考强度', '/effort')
+    def _cmd_思考强度(self, chat, text, update_id):
+        engine = current_engine()
+        levels = EFFORT_LEVELS.get(engine, ())
+        label = engine_spec(engine)['label']
+        if not levels:
+            raise MediaError(label + ' 不支持调整思考强度。')
+        current = current_effort(engine)
+        options = [('默认' + (' ·当前' if not current else ''), '思考强度 默认')]
+        options.extend((EFFORT_LABELS.get(level, level) + '（' + level + '）' + (' ·当前' if level == current else ''),
+                        '思考强度 ' + level) for level in levels)
+        send_options(chat, label + ' 思考强度\n当前：' + effort_label(engine)
+                     + '\n越高想得越深、越慢、越耗额度；默认由 CLI 按模型自行决定。新任务生效。', options)
+
+    @on_text(match=lambda text: text.startswith('思考强度 '))
+    def _cmd_设置思考强度(self, chat, text, update_id):
+        engine = current_engine()
+        choice = text.partition(' ')[2].strip()
+        set_effort(engine, '' if choice == '默认' else choice)
+        send(chat, engine_spec(engine)['label'] + ' 思考强度已设为：' + effort_label(engine) + '。新任务生效。')
 
     @on_text(match=lambda text: text.startswith('账号模型 '))
     def _cmd_设置账号模型(self, chat, text, update_id):
@@ -4385,12 +4466,13 @@ class TaskController:
         set_account_model(engine, model)
         if auth_channel(engine) != 'account':
             # 记下来但不生效最容易让人以为设错了，这里说清什么时候才用得上。
-            send(chat, engine_spec(engine)['label'] + ' 账号模式模型已记为：' + (model or '官方默认')
+            send(chat, engine_spec(engine)['label'] + ' 账号模式模型已记为：' + account_model_label(engine)
                  + '\n但当前走接口密钥渠道，这次选择要等切到账号模式才生效。')
             return
         label = engine_spec(engine)['label']
-        send(chat, label + ' 账号模式模型已设为：' + (model or '官方默认')
-             + '\n仅影响该执行器的新任务。')
+        send_options(chat, label + ' 账号模式模型已设为：' + account_model_label(engine)
+                     + '\n思考强度：' + effort_label(engine) + '。仅影响该执行器的新任务。',
+                     [('调整思考强度', '思考强度')])
 
     @on_text('授权GitHub')
     def _cmd_授权GitHub(self, chat, text, update_id):
