@@ -62,6 +62,15 @@ class ReplyButtonsTest(unittest.TestCase):
         self.assertEqual(bot.estimate_context('missing', home), 0)
         self.assertIn('（估算）', bot.context_bar(30000, 200000, True))
 
+    def test_usage_from_message_delta(self):
+        s = {'content': '', 'final': None, 'activity': '', 'failed': '', 'thinking': '', 'tool_name': ''}
+        bot.parse_claude_event({'type': 'stream_event', 'event': {'type': 'message_delta', 'usage': {
+            'input_tokens': 30700, 'output_tokens': 15}}}, s)
+        bot.parse_claude_event({'type': 'assistant', 'message': {'content': [], 'usage': {'input_tokens': 0}}}, s)
+        bot.parse_claude_event({'type': 'stream_event', 'parent_tool_use_id': 'x', 'event': {
+            'type': 'message_delta', 'usage': {'input_tokens': 5}}}, s)
+        self.assertEqual(s['context_used'], 30700)
+
     def test_prompt_mentions_format(self):
         self.assertIn('【建议】', bot.SUGGEST_PROMPT)
 
