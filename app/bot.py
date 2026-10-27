@@ -2801,6 +2801,7 @@ STREAM_CONTENT_CAP = 72000
 #     能带出两三字以上——肉眼就是「连续往外冒」，不是整块蹦。
 # 正文没变化时没必要这么勤，放宽到 600 毫秒，只在状态文字上打转。
 STREAM_EDIT_MIN = 0.25      # 正文有新增时的最短刷新间隔（秒）
+STREAM_STALL_LIMIT = 1800  # 连续这么久没有任何输出才判定卡死
 STREAM_EDIT_IDLE = 0.6      # 仅有状态变化时的最短刷新间隔（秒）
 # 长任务的持续节奏。线上事故（2026-10-26）：一个任务跑工具时正文不动，
 # 但「已运行N秒」每秒都变，于是每 0.6 秒编辑一次同一条消息，连续几分钟。
@@ -3333,16 +3334,21 @@ def run_stream(chat, text):
                 process.stdin.close()
             except (OSError, ValueError):
                 pass
+        last_output = time.monotonic()
         while True:
             check_cancelled()
-            if time.monotonic() - started > 1800:
-                raise subprocess.TimeoutExpired(command, 1800)
+            # 不限总时长：长任务只要还在输出就一直跑；只有连续 STREAM_STALL_LIMIT 秒
+            # 没有任何事件（进程卡死）才终止。
+            if time.monotonic() - last_output > STREAM_STALL_LIMIT:
+                raise subprocess.TimeoutExpired(command, STREAM_STALL_LIMIT)
             try:
                 line = events.get(timeout=0.4)
             except queue.Empty:
                 line = ''
             if line is None:
                 break
+            if line:
+                last_output = time.monotonic()
             if line:
                 try:
                     event = json.loads(line)
@@ -4270,7 +4276,7 @@ class TaskController:
                 self.notify(task['chat'], task['result'])
             except subprocess.TimeoutExpired:
                 status = 'failed'
-                task['result'] = '处理超时，所属执行进程已终止。已执行操作未自动回滚。'
+                task['result'] = '执行进程连续 30 分钟没有任何输出，判定为卡死已终止。已执行操作未自动回滚。'
                 self.notify(task['chat'], task['result'])
             except Exception as exc:
                 log_swallowed('执行任务', exc)
