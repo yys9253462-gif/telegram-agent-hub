@@ -179,14 +179,70 @@ class AntigravityAuthFlowTests(unittest.TestCase):
     def test_extracts_google_oauth_url_keeping_challenge(self):
         sample = (
             '\x1b[32mYour browser should open automatically. If not:\x1b[0m\n\n'
-            ' https://accounts.google.com/o/oauth2/auth?access_type=offline&client_id=107'
+            ' \x1b]8;;https://accounts.google.com/o/oauth2/auth?access_type=offline&client_id=107'
             '&code_challenge=XYZ123&code_challenge_method=S256'
-            '&redirect_uri=https%3A%2F%2Fantigravity.google%2Foauth-callback&response_type=code\n'
+            '&redirect_uri=https%3A%2F%2Fantigravity.google%2Foauth-callback&response_type=code\x1b\\'
+            'https://accounts.google.com/o/oauth2/auth?access_type=offline&client_id=107'
+            '&code_challenge=XYZ123&code_challenge_method=S256'
+            '&redirect_uri=https%3A%2F%2Fantigravity.google%2Foauth-callback&response_type=code'
+            '\x1b]8;;\x1b\\\n'
         )
         prompt = gh.antigravity_login_prompt(sample)
         self.assertIsNotNone(prompt)
         self.assertIn('code_challenge=XYZ123', prompt['url'])
         self.assertIn('redirect_uri=', prompt['url'])
+        self.assertNotIn(']8;;', prompt['url'])
+        self.assertNotIn('\x1b', prompt['url'])
+
+    def test_run_loop_success_hint_does_not_overwrite_with_cancelled(self):
+        """匹配到登录成功提示并置位停止标志时，绝不能在下一轮循环被覆盖成 cancelled。"""
+        import io, queue
+        manager = gh.LoginManager(timeout=10)
+        events = []
+        ready_gate = queue.Queue()
+
+        def capture(ev):
+            events.append(ev)
+            if ev.get('state') == 'ready':
+                ready_gate.put(True)
+
+        session = gh._LoginSession('antigravity', 77, capture)
+
+        class ChunkedStdout:
+            def __init__(self):
+                self.step = 0
+
+            def read(self, _n):
+                if self.step == 0:
+                    self.step = 1
+                    return (b'Select login method:\n'
+                            b'https://accounts.google.com/o/oauth2/auth?client_id=107&state=S1\n')
+                if self.step == 1:
+                    self.step = 2
+                    ready_gate.get(timeout=2)
+                    return b'OAuth: authenticated successfully\n'
+                return b''
+
+        class FakeProc:
+            def __init__(self):
+                self.stdin = io.BytesIO()
+                self.stdout = ChunkedStdout()
+
+            def poll(self):
+                return None
+
+            def wait(self, timeout=None):
+                return 0
+
+        with patch.object(manager, '_antigravity_authenticated', return_value=False), \
+             patch.object(manager, '_spawn', return_value=FakeProc()), \
+             patch.object(manager, '_terminate'):
+            manager._run(session, '/bin/agy', {'HOME': '/tmp'})
+
+        states = [e['state'] for e in events]
+        self.assertIn('ready', states)
+        self.assertEqual(states[-1], 'succeeded')
+        self.assertNotIn('cancelled', states)
 
     def test_status_detects_signed_in_and_signed_out(self):
         manager = gh.LoginManager()

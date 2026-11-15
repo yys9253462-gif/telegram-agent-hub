@@ -184,8 +184,9 @@ CODEX_AUTH = Path(os.environ.get('CODEX_AUTH_FILE')
 CODEBUDDY_AUTH_DIR = Path(os.environ.get('CODEBUDDY_AUTH_DIR')
                           or os.path.join(os.path.expanduser('~'), '.local', 'share',
                                           'CodeBuddyExtension', 'Data', 'Public', 'auth'))
-LOGIN_ANSI = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]')
-LOGIN_URL = re.compile(r'https://[^\s<>"\']+')
+# 同时清除终端颜色/光标转义（CSI）与超链接控制序列（OSC，如 ]8;;...）。
+LOGIN_ANSI = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)')
+LOGIN_URL = re.compile(r'https://[^\s<>"\'\x00-\x1f\x7f]+')
 LOGIN_DEVICE_CODE = re.compile(r'(?<![A-Za-z0-9_-])([A-Z0-9]{4,6}-[A-Z0-9]{4,6})(?![A-Za-z0-9_-])')
 LOGIN_CODEX_HOSTS = ('auth.openai.com', 'chatgpt.com')
 LOGIN_CODEBUDDY_HOST = 'copilot.tencent.com'
@@ -267,7 +268,7 @@ def antigravity_login_prompt(text):
     """从 Antigravity 官方界面提取谷歌授权链接（保留完整回调参数）。"""
     clean = LOGIN_ANSI.sub('', text)
     for match in LOGIN_URL.finditer(clean):
-        url = match.group(0).rstrip('.,);')
+        url = match.group(0).split('\x1b', 1)[0].split(']', 1)[0].rstrip('.,);\\\'"')
         parsed = urlsplit(url)
         if parsed.netloc == LOGIN_ANTIGRAVITY_HOST and parsed.path.startswith('/o/oauth2'):
             return {'url': login_sanitize_url(url, ANTIGRAVITY_KEEP_QUERY)}
@@ -786,6 +787,7 @@ class LoginManager:
                 if time.monotonic() >= deadline:
                     final_state = 'timeout'
                     break
+                is_ag = session.provider == 'antigravity'
                 try:
                     chunk = output.get(timeout=0.1)
                     if chunk is None:
@@ -799,14 +801,15 @@ class LoginManager:
                         text = LOGIN_ANSI.sub('', session.buffer)
                         if session.provider in ('codebuddy', 'antigravity'):
                             lowered = text.lower()
-                            is_ag = session.provider == 'antigravity'
                             # 成功提示必须排在动画判断之前，并排除未登录文本的反向干扰。
+                            # 这里必须立即 break，绝不能 continue 回循环顶部，
+                            # 否则下轮顶部的 session.stopped.is_set() 会把 succeeded 误改成 cancelled。
                             if (any(hint in lowered for hint in LOGIN_SUCCESS_HINTS)
                                     or (is_ag and 'signed in' in lowered
                                         and 'not signed in' not in lowered)):
                                 final_state = 'succeeded'
                                 session.stopped.set()
-                                continue
+                                break
                             if is_ag:
                                 step = self._advance_antigravity(session, text, step)
                                 if session.payload is None:
@@ -823,16 +826,6 @@ class LoginManager:
                                         session.payload = prompt
                                         ready = True
                                         self._emit(session, 'ready', **prompt)
-                            if ready and session.submitted.is_set() and not fast_probing:
-                                fast_probing = True
-                                next_probe = min(next_probe, time.monotonic() + 1)
-                            if ready and time.monotonic() >= next_probe:
-                                next_probe = time.monotonic() + (3 if fast_probing else 20)
-                                authed = (self._antigravity_authenticated(binary, env) if is_ag
-                                          else self._codebuddy_authenticated(binary, env))
-                                if authed:
-                                    final_state = 'succeeded'
-                                    session.stopped.set()
                         else:
                             if session.payload is None:
                                 prompt = codex_login_prompt(session.buffer)
@@ -842,6 +835,18 @@ class LoginManager:
                                     self._emit(session, 'ready', **prompt)
                 except queue.Empty:
                     pass
+                if session.provider in ('codebuddy', 'antigravity') and ready:
+                    if session.submitted.is_set() and not fast_probing:
+                        fast_probing = True
+                        next_probe = min(next_probe, time.monotonic() + 1)
+                    if time.monotonic() >= next_probe:
+                        next_probe = time.monotonic() + (3 if fast_probing else 20)
+                        authed = (self._antigravity_authenticated(binary, env) if is_ag
+                                  else self._codebuddy_authenticated(binary, env))
+                        if authed:
+                            final_state = 'succeeded'
+                            session.stopped.set()
+                            break
                 returncode = session.process.poll()
                 if returncode is not None and (eof or not reader.is_alive()) and output.empty():
                     if returncode == 0:
