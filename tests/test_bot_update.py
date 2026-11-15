@@ -226,7 +226,7 @@ class BotUpdateTests(unittest.TestCase):
         bot.send.assert_called_once_with(123, '机器人更新成功。\n当前版本：cccccccccccc')
 
     def test_menu_and_handle_text_do_not_enqueue(self):
-        self.assertEqual(bot.MENU_GROUPS['设置']['版本更新'], ['检查版本', '更新机器人'])
+        self.assertEqual(bot.MENU_GROUPS['设置']['版本更新'], ['检查版本', '更新机器人', '巡检配置'])
         control = bot.TaskController(self.root)
         with patch.object(bot, 'check_bot_version') as check, patch.object(control, 'enqueue') as enqueue:
             control.handle_text(123, '检查版本')

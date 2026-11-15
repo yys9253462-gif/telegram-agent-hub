@@ -188,11 +188,11 @@ class CommandTableTest(unittest.TestCase):
 class DuplicateTailTest(unittest.TestCase):
     """消息内联按钮不应覆盖首页键盘或追加导航尾部。"""
 
-    def test_no_placeholder_feature_in_menu(self):
-        """「巡检配置」在通用版里只是「尚未启用」的占位回复，不能放进菜单误导用户。"""
+    def test_exposed_features_are_reachable_in_menu(self):
+        """已实装的「巡检配置」与 4 个实用功能均须进入主设置树可达范围内。"""
         reachable = set(top_buttons()) | set(grouped_buttons())
-        self.assertNotIn('巡检配置', reachable,
-                         '占位功能不应出现在菜单里')
+        for name in ('巡检配置', '执行策略', '文件', '历史结果', '图片创作'):
+            self.assertIn(name, reachable, name + ' 应在设置菜单中可达')
 
     def test_send_options_keeps_home_keyboard_without_navigation_tail(self):
         import bot

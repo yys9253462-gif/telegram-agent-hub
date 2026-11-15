@@ -25,6 +25,8 @@ from pathlib import Path
 # 这样模块内引用 os.environ 时拿到的已经是本进程的环境。
 import cloudflare_auth
 import github_auth
+import menu_ui
+import ops_monitor
 from github_auth import LoginManager, UsageReporter, usage_footer, usage_line, usage_merge
 from credentials import PROVIDERS, CredentialStore, fingerprint, looks_like
 # 纯文本处理（排版、切片、脱敏、耗时格式）已拆到 textfmt.py。
@@ -80,12 +82,16 @@ WORK = Path(os.environ.get('CLAUDE_BOT_WORKDIR', str(AGENT_HOME / 'tasks')))
 STATE = WORK / 'telegram-offset'
 offset = 0
 TASK_LOCAL = threading.local()
+NAV_CONTEXT = threading.local()
+NAV_DEBOUNCE_SECONDS = 0.6
 CONTROL = None
 ACTION_UI = {}
 ACTION_UI_SEEN = {}
 ACTION_UI_LOCK = threading.Lock()
 ACTION_UI_LIMIT = 512
 ACTION_UI_TTL = 300
+MONITOR_CONFIG_STATE = WORK / 'monitor-config.json'
+MONITOR_RUN_STATE = WORK / 'monitor-state.json'
 
 def log_swallowed(where, exc):
     """被吞掉的异常至少留一行日志：类型 + 脱敏后的前 160 字。
@@ -156,10 +162,10 @@ KEYBOARD = {
 # 保留分组常量兼容旧入口，展示时直接平铺各组功能。
 MENU_GROUPS = {
     '设置': {
-        '任务与模型': ['模型', '账号模型', '思考强度', '规划执行', '模型供应商', '选择智能体'],
-        '会话与文件': ['新建会话', '会话列表', '压缩上下文'],
+        '任务与模型': ['模型', '账号模型', '思考强度', '规划执行', '执行策略', '模型供应商', '选择智能体', '图片创作'],
+        '会话与文件': ['新建会话', '会话列表', '压缩上下文', '文件', '历史结果'],
         '账号登录': ['登录Claude', '登录CodeBuddy', '登录Codex', '登录Antigravity', '退出账号', '账号状态', '渠道切换'],
-        '版本更新': ['检查版本', '更新机器人'],
+        '版本更新': ['检查版本', '更新机器人', '巡检配置'],
         '平台授权': ['授权GitHub', '授权Cloudflare', '授权状态', '撤销授权'],
     },
 }
@@ -187,11 +193,12 @@ CHECKS = {
     '节点状态': [['systemctl', 'status', '--no-pager', '--lines=3'] + monitored_services()],
     '服务检查': [['systemctl', '--failed', '--no-pager'], ['systemctl', 'is-active'] + monitored_services()],
     '系统负载': [['uptime'], ['vmstat', '1', '2']],
+    **ops_monitor.EXTENDED_CHECKS,
 }
 ALIASES = {'/start': '显示菜单', '/menu': '显示菜单', '/help': '任务说明', '/status': '服务器概况', '/memory': '内存使用', '/disk': '磁盘空间', '/node': '节点状态', '/services': '服务检查', '/load': '系统负载', '/model': '当前模型',
            # 下面这些是历史命令与老键盘的别名，统一收在这里，避免多处各写一张表。
            '更多设置': '设置', '任务助手': '新任务', '/tasks': '新任务',
-           '/stop': '停止', '/queue': '队列', '/sessions': '会话', '/files': '文件', '/login': '登录Claude',
+           '/stop': '停止', '/queue': '队列', '/sessions': '会话', '/files': '文件', '/history': '历史结果', '/draw': '图片创作', '/inspect': '巡检配置', '/login': '登录Claude',
            '/new': '新建会话', '/resume': '继续会话', '/mode': '执行策略', '/agent': '选择智能体', '/settings': '设置',
            # 外部平台授权的短命令别名，方便手机上手打。
            '/gh': '授权GitHub', '/cf': '授权Cloudflare', '/auth': '授权状态'}
@@ -202,16 +209,18 @@ MENU_LABELS = {
     '停止': '⏹ 停止任务', '服务器状态': '🖥 主机状态',
     '设置': '⚙️ 设置中心', '更多': '🔗 仓库与云授权',
     '目标': '执行目标', '队列': '任务队列',
-    '会话': '会话管理', '文件': '文件管理',
+    '会话': '会话管理', '文件': '📁 文件收发',
     '选择智能体': '🤖 切换智能体', '模型': '🧩 选网关模型',
     '账号模型': '👤 选账号模型', '思考强度': '💡 调思考深度',
-    '规划执行': '🤝 双模型协作', '模型供应商': '🌐 配中转网关',
+    '规划执行': '🤝 双模型协作', '执行策略': '🛡 调执行策略', '模型供应商': '🌐 配中转网关',
+    '图片创作': '🎨 AI 画图',
     '新建会话': '🆕 清空开新聊', '会话列表': '📜 历史旧对话', '压缩上下文': '🗜 压缩长对话',
+    '历史结果': '🗂 历史与工具日志',
     '渠道切换': '🔀 渠道切换', '账号状态': '📊 查账号与额度',
     '登录Claude': '🔑 登 Claude', '登录CodeBuddy': '🔑 登 CodeBuddy',
     '登录Codex': '🔑 登 Codex', '登录Antigravity': '🔑 登 Antigravity',
     '退出账号': '🚪 退出官网账号',
-    '检查版本': '🔎 仅检查新版', '更新机器人': '⬆️ 拉新版并重启',
+    '检查版本': '🔎 仅检查新版', '更新机器人': '⬆️ 拉新版并重启', '巡检配置': '🩺 定时巡检',
     '授权GitHub': '🐙 授权 GitHub', '授权Cloudflare': '☁️ 授权 Cloudflare',
     '授权状态': '🔍 查外部授权', '撤销授权': '🗑 撤外部授权',
     '云flare粘贴令牌': '手动填令牌',
@@ -236,8 +245,12 @@ BUTTON_DESCRIPTIONS = {
     '账号模型': '仅「官网账号」渠道生效：选账号直连使用的模型',
     '思考强度': '调高让模型想得更深更稳（更慢、更耗额度），新任务生效',
     '规划执行': '双模型协作：主模型负责计划与验收，挑一个快模型跑命令改文件',
+    '执行策略': '切工作风格：均衡执行（默认）/ 深入分析 / 只查不改（先出方案）',
     '模型供应商': '添加、切换第三方 API 中转站地址与密钥（接口密钥渠道用）',
+    '图片创作': '打开独立生图入口，切换生图模型、画幅并用 /draw 画图',
     '会话列表': '浏览近期聊过的历史对话，点击就能切回去继续聊',
+    '文件': '查看已上传/生成的本机文件，并按路径发回下载到聊天里',
+    '历史结果': '回顾最近 10 次任务摘要、完整结果及调用过的工具记录',
     '渠道切换': '在「官网账号直连」与「中转接口密钥」两条通道间切换',
     '账号状态': '查看 4 个智能体各自登录的身份、通道和剩余额度',
     '登录Claude': '通过授权链接与授权码登录 Claude 官网账号',
@@ -247,6 +260,7 @@ BUTTON_DESCRIPTIONS = {
     '退出账号': '注销并清理本机保存的官网账号登录态',
     '检查版本': '对比本地与 GitHub 最新提交，只查看不重启',
     '更新机器人': '若有新版且本地干净，拉取新版源码并重启生效',
+    '巡检配置': '配置后台定时静默巡检（仅异常或恢复时主动推送提醒）',
     '授权GitHub': '设备码授权机器人读写和管理 GitHub 仓库',
     '授权Cloudflare': '授权或填令牌托管 Cloudflare Workers / Pages',
     '授权状态': '查看当前绑定的 GitHub 与 Cloudflare 账号状态',
@@ -254,10 +268,10 @@ BUTTON_DESCRIPTIONS = {
 }
 
 GROUP_DESCRIPTIONS = {
-    '任务与模型': '切换执行大脑、挑选网关/账号模型、配双模型协作与中转网关。',
-    '会话与文件': '清空开新对话、切回历史旧对话，或把超长对话压缩成摘要腾出空间。',
+    '任务与模型': '切换执行大脑、挑选网关/账号模型、调思考深度与执行策略，或生图创作。',
+    '会话与文件': '管理多轮对话、压缩长上下文、取回保存的文件或回顾历史任务结果。',
     '账号登录': '选择走「官网账号」还是「接口密钥」，管理各智能体登录与查额度。',
-    '版本更新': '检查 GitHub 仓库最新版本并一键更新重启。',
+    '版本更新': '检查 GitHub 版本更新，并配置后台定时巡检与异常推送。',
     '平台授权': '授权机器人操作你的 GitHub 仓库与 Cloudflare 云资源。',
 }
 
@@ -270,10 +284,15 @@ BOT_COMMANDS = [
     {'command': 'provider', 'description': '管理第三方 API 中转网关地址与密钥'},
     {'command': 'collab', 'description': '配置双模型协作（主模型规划+快模型执行）'},
     {'command': 'effort', 'description': '调整模型思考深度'},
+    {'command': 'mode', 'description': '切换执行策略（均衡执行/深入分析/先出方案）'},
     {'command': 'new', 'description': '清空当前对话记忆并开新会话'},
     {'command': 'compact', 'description': '压缩长对话为摘要以节省上下文'},
     {'command': 'sessions', 'description': '浏览历史旧对话并点选切换'},
+    {'command': 'files', 'description': '查看近期保存/产出的文件并取回'},
+    {'command': 'history', 'description': '回顾最近 10 次任务结果与工具审计'},
+    {'command': 'draw', 'description': '用 /draw 或「生图 描述」直接生成图片'},
     {'command': 'status', 'description': '查看主机负载、内存、磁盘与服务状态'},
+    {'command': 'inspect', 'description': '管理后台定时静默巡检与异常告警'},
     {'command': 'stop', 'description': '立刻停止正在执行的任务'},
     {'command': 'auth', 'description': '查看 GitHub 与 Cloudflare 授权状态'},
     {'command': 'help', 'description': '查看机器人权限、并发与使用说明'},
@@ -294,20 +313,10 @@ def menu_keyboard():
 
 def home_menu_text():
     """首页信息集中展示：当前环境 + 底部快捷按钮对照说明。"""
-    legend = [
-        '• ' + HOME_LABELS.get(cmd, cmd) + '：' + BUTTON_DESCRIPTIONS[cmd]
-        for row in KEYBOARD['keyboard']
-        for cmd in row
-        if cmd in BUTTON_DESCRIPTIONS
-    ]
-    return ('🤖 智能体工作台\n'
-            '────────────────\n'
-            '当前大脑  ·  ' + model_label() + '\n'
-            '执行策略  ·  ' + strategy_name() + '\n'
-            '当前对话  ·  ' + ('继续当前会话' if session_id() else '准备开始新会话') + '\n'
-            '────────────────\n'
-            '直接发送文字、语音、图片或文件就能派发任务。\n\n'
-            '📌 底部快捷按钮说明：\n' + '\n'.join(legend))
+    return menu_ui.format_home_menu_text(
+        KEYBOARD, HOME_LABELS, BUTTON_DESCRIPTIONS,
+        model_label(), strategy_name(), bool(session_id()),
+    )
 
 
 MENU_STATE = WORK / 'menu-visible.json'
@@ -1449,11 +1458,13 @@ def usage_overview_text():
 
     只列真正启用、且当前走账号渠道的执行器：接口密钥渠道没有套餐窗口，
     列出来只会让人困惑「为什么没有数字」。
+    对于无上游实时配额接口的执行器，额外展示本机真实任务计数与耗时统计。
     """
     names = enabled_engines()
     if not names:
         return '套餐用量：没有启用的执行器。'
     lines = ['套餐用量（5小时与7天窗口）']
+    local_only_engines = []
     for name in names:
         label = engine_spec(name)['label']
         if auth_channel(name) != 'account':
@@ -1465,7 +1476,8 @@ def usage_overview_text():
             log_swallowed('读取套餐用量', exc)
             state = None
         if not state:
-            lines.append(label + '：暂不支持读取。')
+            lines.append(label + '：无上游配额窗口接口，按本机执行记录统计。')
+            local_only_engines.append(name)
             continue
         if not state.get('ok'):
             lines.append(label + '：' + (state.get('error') or '读取失败'))
@@ -1473,6 +1485,7 @@ def usage_overview_text():
         readings = usage_merge(state.get('windows'))
         if not readings:
             lines.append(label + '：暂无窗口数据。')
+            local_only_engines.append(name)
             continue
         parts = [usage_line(item) for item in readings]
         parts = [part for part in parts if part]
@@ -1485,6 +1498,17 @@ def usage_overview_text():
             lines.append('　刷新于 ' + time.strftime('%H:%M:%S', time.localtime(updated)))
     if len(lines) == 1:
         lines.append('暂无账号模式执行器。先「账号登录」再用「使用账号」。')
+    if CONTROL is not None and local_only_engines:
+        stats = CONTROL.engine_usage_stats(local_only_engines)
+        for name in local_only_engines:
+            item = stats.get(name)
+            if not item:
+                continue
+            label = engine_spec(name)['label']
+            duration_text = format_elapsed(item['elapsed_7d']) if item['elapsed_7d'] else '0秒'
+            model_note = ' · 最近模型 ' + item['last_model'] if item.get('last_model') else ''
+            lines.append('　📊 ' + label + ' 本机记录（非官方余额）：今日 ' + str(item['today'])
+                         + ' 次 / 近7天 ' + str(item['week']) + ' 次 · 累计 ' + duration_text + model_note)
     return '\n'.join(lines)
 
 
@@ -2067,10 +2091,22 @@ def media_prompt(chat, message):
         suffix = Path(document.get('file_name', 'attachment')).suffix[:16]
         if not re.fullmatch(r'\.[a-zA-Z0-9]{1,15}', suffix):
             suffix = '.bin'
-        if sensitive_path(Path(document.get('file_name', 'attachment'))):
+        blocked = sensitive_path(Path(document.get('file_name', 'attachment')))
+        if blocked:
             suffix = '.blocked'
         path = download_media(document, suffix)
-        send(chat, '文件已保存：' + str(path) + '\n未自动执行。请另行发送处理要求。')
+        if blocked:
+            send(chat, '敏感文件已隔离保存：' + str(path) + '\n出于凭据防护，敏感文件名禁止自动执行或读取。')
+            return ''
+        if caption:
+            return ('用户发送了文件：' + str(path)
+                    + '\n文件已保存到本地，请读取文件并按下面的要求处理：\n' + caption)
+        shortcuts = reply_buttons(chat, [
+            ('📄 总结这个文件', '请读取并总结这个文件的主要内容：' + str(path)),
+            ('🔍 分析文件内容与报错', '请检查这个文件，分析其中的代码结构、配置要点或报错原因：' + str(path)),
+            ('📁 查看文件列表', '文件列表'),
+        ], compact=False)
+        send_formatted(chat, '文件已保存：' + str(path) + '\n可点击下方快捷按钮直接分析，或另行发送处理要求：', markup=shortcuts)
         return ''
     return message.get('text', '').strip()
 
@@ -2311,7 +2347,9 @@ def reply_buttons(chat, suggestions, compact=True):
     return {'inline_keyboard': keyboard}
 
 
-def send_options(chat, title, labels):
+def send_options(chat, title, labels, reusable=False, edit_in_place=False):
+    reusable = reusable or getattr(NAV_CONTEXT, 'reusable', False)
+    edit_in_place = edit_in_place or getattr(NAV_CONTEXT, 'edit_in_place', False)
     labels = [label for label in labels if label not in ('返回主菜单', '返回首页', '收起菜单')]
     buttons = []
     now = time.monotonic()
@@ -2325,12 +2363,35 @@ def send_options(chat, title, labels):
             callback = 'ui:' + token
             if len(callback.encode('utf-8')) > 64:
                 raise ValueError('菜单回调超过长度限制')
-            ACTION_UI[token] = {'chat': chat, 'command': command, 'expires': now + ACTION_UI_TTL}
+            ACTION_UI[token] = {
+                'chat': chat,
+                'command': command,
+                'expires': now + ACTION_UI_TTL,
+                'reusable': bool(reusable),
+                'last_used': 0.0,
+            }
             buttons.append({'text': label, 'callback_data': callback})
         while len(ACTION_UI) > ACTION_UI_LIMIT:
             ACTION_UI.pop(next(iter(ACTION_UI)))
-    api('sendMessage', {'chat_id': chat, 'text': redact(title), 'reply_markup': {
-        'inline_keyboard': [buttons[index:index + 2] for index in range(0, len(buttons), 2)]}})
+    markup = {'inline_keyboard': [buttons[index:index + 2] for index in range(0, len(buttons), 2)]}
+    nav_message_id = getattr(NAV_CONTEXT, 'message_id', None) if edit_in_place else None
+    menu_ui.dispatch_inline_menu(
+        api, chat, title, markup, redact,
+        message_id=nav_message_id, swallow_fn=log_swallowed,
+    )
+
+
+def send_nav_options(chat, title, labels):
+    """以三参数兼容签名发送可复用、可原地刷新的纯导航菜单。"""
+    prev_reusable = getattr(NAV_CONTEXT, 'reusable', False)
+    prev_edit = getattr(NAV_CONTEXT, 'edit_in_place', False)
+    NAV_CONTEXT.reusable = True
+    NAV_CONTEXT.edit_in_place = True
+    try:
+        return send_options(chat, title, labels)
+    finally:
+        NAV_CONTEXT.reusable = prev_reusable
+        NAV_CONTEXT.edit_in_place = prev_edit
 
 GROUP_ICONS = {'任务与模型': '🧠 智能体与模型', '会话与文件': '💬 会话管理', '账号登录': '🔑 账号与中转渠道',
                '版本更新': '🔄 检查与更新', '平台授权': '🔗 仓库与云授权'}
@@ -2353,49 +2414,32 @@ def settings_summary():
 def send_group_menu(chat, title, groups):
     """入口下只有一组时直接列功能；多组时先列分组，点进去再看具体功能，避免一屏十几个按钮。"""
     if len(groups) == 1:
-        send_options(chat, title, [label for items in groups.values() for label in items])
+        send_nav_options(chat, title, [label for items in groups.values() for label in items])
         return
-    send_options(chat, title, [(GROUP_ICONS.get(name, name), name) for name in groups])
+    send_nav_options(chat, title, [(GROUP_ICONS.get(name, name), name) for name in groups])
 
 
 def group_title(owner, group):
     """分组展开时的标题文案。集中渲染当前状态与各分类职责说明。"""
-    if owner == '设置':
-        summary = settings_summary()
-        groups = MENU_GROUPS.get('设置', {})
-        legend = ['• ' + GROUP_ICONS.get(name, name) + '：' + GROUP_DESCRIPTIONS.get(name, '')
-                  for name in groups]
-        parts = [MENU_LABELS.get(group, group)]
-        if summary:
-            parts.append(summary)
-        parts.append('请选择设置类别（各按钮职责）：\n' + '\n'.join(legend))
-        return '\n\n'.join(parts)
-    intro = {'更多': '直接连接平台，查看或撤销授权。'}
-    return MENU_LABELS.get(group, group) + '\n' + intro.get(owner, '选择下面的功能。')
+    summary = settings_summary() if owner == '设置' else ''
+    return menu_ui.format_group_title(
+        MENU_GROUPS, MENU_LABELS, GROUP_ICONS, GROUP_DESCRIPTIONS, owner, group, summary=summary,
+    )
 
 
 def expand_group(chat, text):
     """若 text 是某个分组的名字，列出该组按钮与逐项功能说明并返回 True。
 
-    「设置」与「更多」在 quick_action 和 handle_text 里各有一份完全相同的展开逻辑，
-    加上这里的第三份，改文案时极易只改一处。现在统一走 expand_group：
-    两处调用点只负责判断「是不是我的话」，渲染一律交给这里。
+    统一委托给 menu_ui 拼接正文与带返回的按钮列表，并支持原地编辑刷新。
     """
-    for owner, groups in MENU_GROUPS.items():
-        items = groups.get(text)
-        if items:
-            # 标题带上级名字与每颗按钮的直白说明，避免点进设置像猜盲盒。
-            back = [('‹ 返回', owner)] if len(groups) > 1 else []
-            header = MENU_LABELS.get(owner, owner) + ' / ' + GROUP_ICONS.get(text, text)
-            desc = GROUP_DESCRIPTIONS.get(text, '选择下面的功能。')
-            details = '\n'.join(
-                '• ' + MENU_LABELS.get(item, item) + '：' + BUTTON_DESCRIPTIONS[item]
-                for item in items if item in BUTTON_DESCRIPTIONS
-            )
-            body = header + '\n' + desc + ('\n\n按钮功能说明：\n' + details if details else '')
-            send_options(chat, body, list(items) + back)
-            return True
-    return False
+    expanded = menu_ui.format_group_expand(
+        MENU_GROUPS, MENU_LABELS, GROUP_ICONS, GROUP_DESCRIPTIONS, BUTTON_DESCRIPTIONS, text,
+    )
+    if not expanded:
+        return False
+    body, options = expanded
+    send_nav_options(chat, body, options)
+    return True
 
 
 UPDATE_LOCK = threading.Lock()
@@ -2613,11 +2657,11 @@ def quick_action(chat, text):
             '开发与改代码': '告诉我项目路径、要实现的功能和验收条件。例如：修改某项目的登录页，并运行相关检查。',
             '排查与修复': '提供现象、报错和目标机器；说明只检查还是允许修复。例如：检查远程服务器某服务报错，先找原因不要改。',
             '部署与运维': '提供目标机器、项目或脚本地址、域名及预期效果。例如：在本机部署指定项目，验证可访问后汇报。',
-            '资料与总结': '发送文字、图片或语音，并说明要提取、比较、解释还是总结。当前未实现普通文档附件解析。',
+            '资料与总结': '发送文字、图片、语音或文档，并说明要提取、比较、解释还是总结。文档带文字说明会自动按要求执行，未带说明会给出快捷分析按钮。',
         }
         send(chat, guides[text])
     elif text in ('执行策略', '/mode'):
-        send_options(chat, '当前策略：' + strategy_name() + '\n均衡执行：边查边做并验收。\n深入分析：加强证据核验。\n先出方案：仅检查和规划。\n策略是模型行为指引，不是系统权限隔离。', list(STRATEGIES))
+        send_options(chat, '当前策略：' + strategy_name() + '\n均衡执行：边查边做并验收。\n深入分析：加强证据核验。\n先出方案：仅检查和规划。\n策略是模型行为指引，不是系统权限隔离。', list(STRATEGIES), reusable=True, edit_in_place=True)
     elif text in STRATEGIES:
         atomic_json(STRATEGY_STATE, {'strategy': text})
         send(chat, '执行策略已切换为：' + text + '\n下一条任务生效，重启后保留。')
@@ -2633,7 +2677,8 @@ def quick_action(chat, text):
         set_menu_visible(True)
         send(chat, home_menu_text())
     elif text in ('服务器状态', '/resources'):
-        send(chat, resource_status())
+        markup = reply_buttons(chat, ops_monitor.HOST_STATUS_QUICK_ACTIONS, compact=False)
+        send_formatted(chat, resource_status(), markup=markup)
     elif text in ('收起菜单', '/hide'):
         set_menu_visible(False)
         send(chat, '菜单已收起，可以直接输入任务。发送 /menu 重新展开。')
@@ -2671,7 +2716,8 @@ def quick_action(chat, text):
         parts = [text + '（服务器实时查询）']
         for command in CHECKS[text]:
             result = run_checked(command, 12, {**os.environ, 'LC_ALL': 'C', 'SYSTEMD_COLORS': '0'})
-            parts.append('查询命令：' + ' '.join(command) + '\n' + (result.stdout + result.stderr).strip())
+            output = ops_monitor.trim_command_output(command, (result.stdout + result.stderr).strip())
+            parts.append('查询命令：' + ' '.join(command) + '\n' + (output or '（无输出）'))
         send(chat, '\n\n'.join(parts))
     else:
         return False
@@ -3499,7 +3545,14 @@ def run_stream(chat, text):
         # 生图工具复用桥接程序的令牌与接口基址，密钥由安装器写入的配置文件提供。
         environment['_IMAGE_SERVER'] = '1'
         environment['_IMAGE_CONFIG'] = str(image_config)
-    command, stdin_text = engine_command(engine, text, instructions, chat, environment)
+    compacting = (text or '').strip() == '/compact'
+    state_kind = engine_spec(engine)['kind']
+    handoff_compact = compacting and state_kind in ('codex', 'antigravity')
+    cli_prompt = (
+        '请把我们到目前为止的对话目标、重要结论、已修改文件路径、未完成事项与关键上下文浓缩成一份精简清晰的交接摘要（仅输出摘要正文，不要修改文件或执行命令）。'
+        if handoff_compact else text
+    )
+    command, stdin_text = engine_command(engine, cli_prompt, instructions, chat, environment)
     # 只启动一个进程。命令与 stdin 内容都由 engine_command 一次给出：
     # claude 系把任务放在命令行参数里（stdin_text 为 None），codex 走 stdin。
     # 两者只能是同一条命令的两种投递方式，绝不能各起一个进程 ——
@@ -3617,6 +3670,14 @@ def run_stream(chat, text):
             state['context_used'] = meta.get('post_tokens') or state.get('context_used')
         # codex 用 turn.failed 表达失败，退出码未必非零；两种都要算进来。
         crashed = process.returncode != 0 or bool((final or {}).get('is_error')) or bool(state['failed'])
+        if handoff_compact and not crashed:
+            if CONTROL is not None and task:
+                CONTROL.apply_handoff_compact(task['snapshot']['session_key'], engine, answer)
+                task['_handoff_compacted'] = True
+            else:
+                clear_session()
+            answer = ('✅ **上下文已整理为交接摘要**（' + engine_spec(engine)['label']
+                      + ' 原生会话已重置，后续将携带摘要继续）\n\n' + answer)
         if crashed:
             if state['failed'] and answer in ('', '任务未返回内容，请检查模型接口。'):
                 # 整轮失败且没有正文时，把失败原因直接给出来，比一句「未返回内容」有用得多。
@@ -3660,7 +3721,7 @@ def run_stream(chat, text):
         # 这里必须等一次：不等的话，尾部的执行摘要可能在分片消息之后才到达，
         # 顺序就乱了（用户看到「结果 → 摘要 → 结果的后半段」）。
         stream.close()
-        can_compact = state_kind not in ('codex', 'antigravity') and not crashed
+        can_compact = not crashed
         markup = reply_buttons(chat, [] if crashed else suggestions, compact=can_compact)
         stream.deliver_final(head, markup if len(pieces) <= 1 else None)
         # 首片已通过编辑消息呈现，其余分片补发；按钮挂在最后一片。
@@ -4308,6 +4369,53 @@ class TaskController:
                 session.pop('session_id', None)
             self.persist()
 
+    def apply_handoff_compact(self, key, engine, summary):
+        """通用上下文压缩：清理该执行器原生会话编号，只留一条浓缩交接摘要供下轮继续。"""
+        with self.lock:
+            session = self.data['sessions'].get(key or self.data['active_session'])
+            if not isinstance(session, dict):
+                return
+            session.get('engine_sessions', {}).pop(engine, None)
+            session.get('engine_channels', {}).pop(engine, None)
+            if engine == 'claude':
+                session.pop('session_id', None)
+            session['handoff'] = [{
+                'engine': engine,
+                'request': '【上下文压缩摘要】',
+                'result': redact(str(summary or ''))[:2400],
+            }]
+            self.persist()
+
+    def engine_usage_stats(self, engine_names):
+        """基于本机任务历史统计指定执行器今日与近 7 天实际跑动情况。"""
+        now = time.time()
+        local_day = time.localtime(now)
+        today_start = time.mktime((local_day.tm_year, local_day.tm_mon, local_day.tm_mday, 0, 0, 0, 0, 0, -1))
+        week_start = now - 7 * 86400
+        wanted = set(engine_names or ())
+        stats = {name: {'today': 0, 'week': 0, 'elapsed_7d': 0.0, 'last_model': ''} for name in wanted}
+        with self.lock:
+            tasks = list(self.data.get('tasks', []))
+        for item in tasks:
+            if item.get('kind') != 'agent':
+                continue
+            snap = item.get('snapshot') or {}
+            engine = snap.get('engine')
+            if engine not in wanted:
+                continue
+            ts = float(item.get('finished') or item.get('started') or item.get('created') or 0.0)
+            if ts < week_start:
+                continue
+            entry = stats[engine]
+            entry['week'] += 1
+            if ts >= today_start:
+                entry['today'] += 1
+            if item.get('started') and item.get('finished'):
+                entry['elapsed_7d'] += max(0.0, float(item['finished']) - float(item['started']))
+            if snap.get('model'):
+                entry['last_model'] = str(snap['model'])
+        return stats
+
     def snapshot(self):
         with self.lock:
             key = self.data['active_session']
@@ -4499,7 +4607,7 @@ class TaskController:
                     task['status'] = 'awaiting_confirmation' if status == 'completed' and task.pop('draft_ready', False) else status
                     task['finished'] = time.time()
                     task['result'] = redact(task.get('result', ''))
-                    if task['kind'] == 'agent' and task['status'] in ('completed', 'failed'):
+                    if task['kind'] == 'agent' and task['status'] in ('completed', 'failed') and not task.pop('_handoff_compacted', False):
                         session = self.data['sessions'][task['snapshot']['session_key']]
                         history = session.setdefault('handoff', [])
                         history.append({'engine': task['snapshot'].get('engine', 'claude'), 'request': task.get('user_context', ''), 'result': task['result'][:2400]})
@@ -4612,13 +4720,29 @@ class TaskController:
     def _cmd_检查版本(self, chat, text, update_id):
         quick_action(chat, text)
 
-    @on_text('图片创作')
+    @on_text('图片创作', '/draw')
     def _cmd_图片创作(self, chat, text, update_id):
-        send(chat, '发送“生图 描述”生成一张图片，例如：生图 一只趴在窗边的橘猫，水彩插画。图片任务使用独立生图通道，与聊天执行器无关。当前：' + json.dumps(image_options(), ensure_ascii=False))
+        opts = image_options()
+        send_options(
+            chat,
+            '🎨 图片创作（独立生图通道，不影响当前聊天会话）\n'
+            '用法：发送「生图 描述」或「/draw 描述」，例如：\n'
+            '生图 一只趴在窗边的橘猫，水彩插画\n\n'
+            '当前配置：模型 ' + str(opts.get('model')) + ' · 画幅 ' + str(opts.get('size')),
+            [('⚙️ 调整生图模型与画幅', '生图设置')],
+            reusable=True,
+            edit_in_place=True,
+        )
 
     @on_text('生图设置')
     def _cmd_生图设置(self, chat, text, update_id):
-        send_options(chat, '选择生图模型或画幅。目录可见不代表全部模型已验证。', ['生图模型 ' + value for value in IMAGE_MODELS] + ['画幅 方形', '画幅 横图', '画幅 竖图'])
+        send_options(
+            chat,
+            '选择生图模型或画幅。目录可见不代表全部模型已验证。',
+            ['生图模型 ' + value for value in IMAGE_MODELS] + ['画幅 方形', '画幅 横图', '画幅 竖图'] + [('‹ 返回图片创作', '图片创作')],
+            reusable=True,
+            edit_in_place=True,
+        )
 
     @on_text(match=lambda text: text.startswith('生图模型 '))
     def _cmd_生图模型(self, chat, text, update_id):
@@ -4801,7 +4925,7 @@ class TaskController:
 
     @on_text('会话')
     def _cmd_会话(self, chat, text, update_id):
-        send_options(chat, '会话管理：发送“命名会话 名称”重命名当前会话；发送“切换会话 ID”切换。', ['会话列表', '新建会话', '继续会话', '会话信息'])
+        send_options(chat, '会话管理：发送“命名会话 名称”重命名当前会话；发送“切换会话 ID”切换。', ['会话列表', '新建会话', '继续会话', '会话信息'], reusable=True, edit_in_place=True)
 
     @on_text('新建会话', '/new')
     def _cmd_新建会话(self, chat, text, update_id):
@@ -4814,11 +4938,8 @@ class TaskController:
 
     @on_text('压缩上下文', '/compact')
     def _cmd_压缩上下文(self, chat, text, update_id):
-        spec = engine_spec(current_engine())
-        if spec['kind'] in ('codex', 'antigravity'):
-            send(chat, '当前执行器是 ' + spec['label'] + '，不支持压缩上下文。需要清空可以发送“新建会话”。')
-            return
-        if not session_id():
+        has_handoff = bool((self.active_session() or {}).get('handoff'))
+        if not session_id() and not has_handoff:
             send(chat, '当前会话还没有对话记录，不需要压缩。')
             return
         # 走任务队列：和正在跑的任务用同一个会话，必须排在它后面，不能并发改同一份记录。
@@ -4854,12 +4975,12 @@ class TaskController:
 
     @on_text('文件')
     def _cmd_文件(self, chat, text, update_id):
-        send_options(chat, '普通文件上传后只保存，不执行。发送“发送文件 /绝对路径”取回文件；敏感配置、私钥和凭证会被阻止。路径位于本机本机，远程服务器文件需另发任务取回。', ['文件列表', '工作目录'])
+        send_options(chat, '普通文件随附文字说明会自动执行；未带说明时保存并附快捷分析按钮。发送“发送文件 /绝对路径”取回本机文件；敏感配置、私钥和凭证会被阻止。远程服务器文件需另发任务取回。', ['文件列表', '工作目录'], reusable=True, edit_in_place=True)
 
     @on_text('文件列表')
     def _cmd_文件列表(self, chat, text, update_id):
         folder = WORK / 'uploads'
-        internal = {self.path, STATE, SESSION_STATE, MODEL_STATE, MODEL_CACHE, STRATEGY_STATE, MENU_STATE}
+        internal = {self.path, STATE, SESSION_STATE, MODEL_STATE, MODEL_CACHE, STRATEGY_STATE, MENU_STATE, MONITOR_CONFIG_STATE, MONITOR_RUN_STATE}
         candidates = list(WORK.iterdir()) + (list(folder.iterdir()) if folder.exists() else [])
         items = sorted((item for item in candidates if item.is_file() and item not in internal and not sensitive_path(item)),
                        key=lambda item: item.stat().st_mtime, reverse=True)[:30]
@@ -5388,15 +5509,120 @@ class TaskController:
         if task:
             send(chat, text + '查询已排队：' + task['id'])
 
-    @on_text('巡检配置', '巡检')
+    @on_text('巡检配置', '巡检', '/inspect')
     def _cmd_巡检配置(self, chat, text, update_id):
-        send(chat, '定时巡检尚未启用，未创建任何定时任务。可先说明目标机器、检查项目、频率和告警方式，再另行配置。手动查询请点“主机状态”。')
+        send_patrol_panel(chat)
+
+    @on_text('开启定时巡检', '关闭定时巡检', '立即巡检一次')
+    def _cmd_巡检动作(self, chat, text, update_id):
+        if text == '开启定时巡检':
+            ops_monitor.save_patrol_config(MONITOR_CONFIG_STATE, {'enabled': True}, atomic_writer=atomic_json)
+            send_patrol_panel(chat, notice='已开启后台定时巡检（正常时保持静默，仅在异常或恢复时主动提醒）。')
+        elif text == '关闭定时巡检':
+            ops_monitor.save_patrol_config(MONITOR_CONFIG_STATE, {'enabled': False}, atomic_writer=atomic_json)
+            send_patrol_panel(chat, notice='已关闭后台定时巡检。')
+        else:
+            report = run_patrol_once(notify_owner=False)
+            send_patrol_panel(chat, notice='本次即时体检结论：' + report)
+
+    @on_text(match=lambda text: text.startswith(('巡检周期 ', '磁盘告警阈值 ')))
+    def _cmd_巡检参数(self, chat, text, update_id):
+        if text.startswith('巡检周期 '):
+            digits = re.sub(r'\D', '', text)
+            if digits:
+                minutes = int(digits)
+                ops_monitor.save_patrol_config(MONITOR_CONFIG_STATE, {'interval_minutes': minutes}, atomic_writer=atomic_json)
+                send_patrol_panel(chat, notice='巡检周期已调整为每 ' + str(minutes) + ' 分钟。')
+                return
+        if text.startswith('磁盘告警阈值 '):
+            digits = re.sub(r'\D', '', text)
+            if digits:
+                pct = int(digits)
+                ops_monitor.save_patrol_config(MONITOR_CONFIG_STATE, {'disk_threshold': pct}, atomic_writer=atomic_json)
+                send_patrol_panel(chat, notice='磁盘告警阈值已设为 ' + str(pct) + '%。')
+                return
+        send_patrol_panel(chat, notice='未识别的巡检参数，请直接点击面板按钮设置。')
 
     @on_text(match=lambda text: text in CHECKS or text in ('服务器状态', '/resources'))
     def _cmd_主机检查(self, chat, text, update_id):
         task = self.enqueue(chat, text, 'quick', update_id=update_id)
         if task:
             send(chat, '只读状态查询已排队：' + task['id'])
+
+
+def send_patrol_panel(chat, notice=''):
+    """发送或原地刷新「巡检配置」管理面板。"""
+    config = ops_monitor.load_patrol_config(MONITOR_CONFIG_STATE)
+    state = ops_monitor.load_patrol_state(MONITOR_RUN_STATE)
+    body = ops_monitor.format_patrol_panel(config, state)
+    if notice:
+        body = '💬 ' + notice + '\n\n' + body
+    buttons = ops_monitor.patrol_panel_buttons(config) + [('‹ 返回版本更新', '版本更新')]
+    send_options(chat, body, buttons, reusable=True, edit_in_place=True)
+
+
+def patrol_credential_warnings():
+    """本地只读检查第三方平台凭据是否存在过期风险。"""
+    warnings = {}
+    store = credentials()
+    now = time.time()
+    for name, spec in PROVIDERS.items():
+        summary = store.summary(name)
+        if not summary.get('authorized'):
+            continue
+        expires_at = summary.get('expires_at')
+        if not expires_at:
+            continue
+        record = store.get(name) or {}
+        if record.get('refresh'):
+            continue
+        remain = int(expires_at) - int(now)
+        if remain <= 0:
+            warnings[name] = spec['label'] + ' 授权令牌已过期且无自动刷新凭据，请重新授权'
+        elif remain < 12 * 3600:
+            warnings[name] = spec['label'] + ' 授权令牌将在 ' + str(max(1, remain // 3600)) + ' 小时内到期'
+    return warnings
+
+
+def run_patrol_once(notify_owner=True):
+    """执行一轮本机健康巡检；仅在开启告警且异常状态变化时推送给机主。"""
+    config = ops_monitor.load_patrol_config(MONITOR_CONFIG_STATE)
+    state = ops_monitor.load_patrol_state(MONITOR_RUN_STATE)
+    try:
+        metrics = ops_monitor.sample_memory_and_disk()
+    except OSError as exc:
+        return '指标采样失败（' + type(exc).__name__ + '）'
+    services = ops_monitor.probe_services(monitored_services())
+    cred_warnings = patrol_credential_warnings()
+    alerts = ops_monitor.evaluate_patrol(config, metrics, service_statuses=services, credential_warnings=cred_warnings)
+    now_ts = time.time()
+    cooldown = config.get('cooldown_minutes', 120) * 60
+    notify_alerts, recovered, next_active = ops_monitor.diff_alerts(state, alerts, now_ts, cooldown)
+    summary = '正常（内存 ' + str(metrics['mem_pct']) + '%，磁盘 ' + str(metrics['disk_pct']) + '%）' if not alerts else ('发现 ' + str(len(alerts)) + ' 项异常：' + '；'.join(alerts.values()))
+    next_state = {'active': next_active, 'last_run': now_ts, 'last_status': summary}
+    ops_monitor.save_patrol_state(MONITOR_RUN_STATE, next_state, atomic_writer=atomic_json)
+    if notify_owner and OWNER and (notify_alerts or recovered):
+        alert_text = ops_monitor.format_patrol_alert(notify_alerts, recovered, metrics)
+        if alert_text:
+            markup = reply_buttons(OWNER, ops_monitor.HOST_STATUS_QUICK_ACTIONS, compact=False)
+            send_formatted(OWNER, alert_text, markup=markup)
+    return summary
+
+
+def ops_patrol_worker():
+    """后台静默巡检线程：未启用时休眠不打扰，启用后按配置周期运行。"""
+    while True:
+        try:
+            config = ops_monitor.load_patrol_config(MONITOR_CONFIG_STATE)
+            if config.get('enabled'):
+                run_patrol_once(notify_owner=True)
+                wait_seconds = max(300, int(config.get('interval_minutes', 30)) * 60)
+            else:
+                wait_seconds = 60
+        except Exception as exc:
+            log_swallowed('后台定时巡检', exc)
+            wait_seconds = 120
+        time.sleep(wait_seconds)
 
 
 def show_model_items(chat, models, page=0, key=None):
@@ -5493,6 +5719,7 @@ def handle_update(update):
         fields = data.split(':')
         if fields[0] == 'ui' and len(fields) == 2:
             now = time.monotonic()
+            debounced = False
             with ACTION_UI_LOCK:
                 for seen_id, expires in list(ACTION_UI_SEEN.items()):
                     if expires <= now:
@@ -5504,18 +5731,32 @@ def handle_update(update):
                     ACTION_UI_SEEN.pop(next(iter(ACTION_UI_SEEN)))
                 action = ACTION_UI.get(fields[1])
                 if action is not None and action['chat'] == chat:
-                    # 一次性令牌：无论后面判定为过期还是可用，都立刻摘掉。
-                    # 留着一个已经过期的条目，下一次点它还是会走到「已失效」，
-                    # 但它同时还会占着 ACTION_UI 的名额，把真正可用的挤出去。
-                    action = ACTION_UI.pop(fields[1])
+                    if action.get('reusable'):
+                        if action['expires'] <= now:
+                            ACTION_UI.pop(fields[1], None)
+                        elif now - action.get('last_used', 0.0) < NAV_DEBOUNCE_SECONDS:
+                            debounced = True
+                        else:
+                            action['last_used'] = now
+                    else:
+                        # 一次性令牌：无论后面判定为过期还是可用，都立刻摘掉。
+                        # 留着一个已经过期的条目，下一次点它还是会走到「已失效」，
+                        # 但它同时还会占着 ACTION_UI 的名额，把真正可用的挤出去。
+                        action = ACTION_UI.pop(fields[1])
                 else:
                     action = None
+            if debounced:
+                CONTROL.note_seen(update_id)
+                return
+            nav_message_id = message.get('message_id')
             try:
                 if action is None or action['expires'] <= now:
                     send(chat, '操作按钮已失效或已使用，请重新打开菜单。')
                 else:
+                    NAV_CONTEXT.message_id = nav_message_id
                     CONTROL.handle_text(chat, action['command'], update_id)
             finally:
+                NAV_CONTEXT.message_id = None
                 CONTROL.note_seen(update_id)
             return
         elif fields[0] == 'choose' and len(fields) == 2:
@@ -5543,7 +5784,7 @@ def handle_update(update):
         payload = {key: message[key] for key in ('photo', 'document', 'voice', 'audio', 'caption') if key in message}
         task = CONTROL.enqueue(chat, kind='media', payload=payload, update_id=update_id)
         if task:
-            send(chat, '附件接收任务已排队：' + task['id'] + '。语音转写完成后需确认执行；普通文件只保存。')
+            send(chat, '附件接收任务已排队：' + task['id'] + '。语音转写后需确认；带文字说明的图片/文档将自动执行，未带说明的文件会保存并提供快捷分析按钮。')
     else:
         raw = message.get('text')
         # 正文必须是字符串。Telegram 正常只会给字符串，但网关替身、协议升级
@@ -5581,6 +5822,9 @@ def main():
     # 凭据续期：Cloudflare 的访问令牌一天左右过期，到期前自动换新。
     threading.Thread(target=credential_renew_worker, daemon=True,
                      name='credential-renew').start()
+    # 后台定时静默巡检：默认关闭，开启后仅在主机指标或服务出现异常/恢复时通知机主。
+    threading.Thread(target=ops_patrol_worker, daemon=True,
+                     name='ops-patrol').start()
     CONTROL.start_workers()
     try:
         CONTROL.announce_interrupted()
