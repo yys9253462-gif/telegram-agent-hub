@@ -19,7 +19,7 @@ import bot
 
 # 这些指令的回复由后台线程发出（版本检查要访问网络、登录要拉起官方 CLI），
 # 断言时要等线程跑完，不能按同步返回去数。
-BACKGROUND = {'检查版本', '更新机器人', '登录Claude', '登录CodeBuddy', '登录Codex',
+BACKGROUND = {'检查版本', '更新机器人', '登录Claude', '登录CodeBuddy', '登录Codex', '登录Antigravity',
               '授权GitHub', '授权Cloudflare'}
 # 这些按钮在当前环境下必须被**明确拒绝**（账号没登录、走的是接口密钥渠道），
 # 拒绝可以，但不能一声不吭——用户按了按钮却什么都没有，才是真缺陷。

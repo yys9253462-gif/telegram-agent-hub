@@ -175,7 +175,7 @@ import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
-LOGIN_PROVIDERS = ('codex', 'codebuddy')
+LOGIN_PROVIDERS = ('codex', 'codebuddy', 'antigravity')
 
 # 退出登录要动的两处路径。都跟随 HOME，测试里改 HOME 即可重定向。
 CODEX_AUTH = Path(os.environ.get('CODEX_AUTH_FILE')
@@ -189,17 +189,19 @@ LOGIN_URL = re.compile(r'https://[^\s<>"\']+')
 LOGIN_DEVICE_CODE = re.compile(r'(?<![A-Za-z0-9_-])([A-Z0-9]{4,6}-[A-Z0-9]{4,6})(?![A-Za-z0-9_-])')
 LOGIN_CODEX_HOSTS = ('auth.openai.com', 'chatgpt.com')
 LOGIN_CODEBUDDY_HOST = 'copilot.tencent.com'
+LOGIN_ANTIGRAVITY_HOST = 'accounts.google.com'
 LOGIN_SECRET_QUERY = re.compile(r'(^|[?&])(state|code|token|access_token)=([^&\s]*)', re.IGNORECASE)
-# CodeBuddy 的登录链接必须整条给用户，`state` 是 CLI 生成的会话标识（UUID），
-# 用来把浏览器里的登录结果对回本机等待的那个进程，本身不是凭证也不是权限。
-# 抹掉它等于把链接废掉：用户点进去登不回来（2026-10-26 真实反馈）。
-# 所以这里只过滤真正像秘密的参数，`state` 保留。
+# CodeBuddy / Antigravity 的登录链接必须保留回调关联参数（如 state、code_challenge、
+# redirect_uri 等），否则浏览器完成授权后无法把结果对回本机等待进程。
+# 只遮盖真正像凭证的参数，避免泄露。
 CODEBUDDY_KEEP_QUERY = re.compile(r'(^|[?&])(code|token|access_token)=([^&\s]*)', re.IGNORECASE)
-LOGIN_GATEWAY_PREFIX = ('OPENAI_', 'ANTHROPIC_', 'CODEBUDDY_')
+ANTIGRAVITY_KEEP_QUERY = CODEBUDDY_KEEP_QUERY
+LOGIN_GATEWAY_PREFIX = ('OPENAI_', 'ANTHROPIC_', 'CODEBUDDY_', 'GEMINI_', 'GOOGLE_API_')
 LOGIN_TRUST_PROMPT = 'Do you trust the files in this folder?'
 LOGIN_METHOD_PROMPT = 'Select login method:'
 LOGIN_SUCCESS_HINTS = ('logged in', 'login success', 'successfully', 'success',
                        '登录成功', '授权成功', '欢迎回来')
+LOGIN_ANTIGRAVITY_UNAUTH_HINTS = ('please sign in', 'not signed in', 'select login method')
 # 官方界面的旋转动画帧字符。这些行只有动画与耗时，写进缓冲只会挤掉真正的信息。
 LOGIN_SPINNER_CHARS = ('✷', '✶', '✸', '✹', '✺', '✻', '✳', '·',
                        '⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏')
@@ -261,6 +263,17 @@ def codebuddy_login_prompt(text):
     return None
 
 
+def antigravity_login_prompt(text):
+    """从 Antigravity 官方界面提取谷歌授权链接（保留完整回调参数）。"""
+    clean = LOGIN_ANSI.sub('', text)
+    for match in LOGIN_URL.finditer(clean):
+        url = match.group(0).rstrip('.,);')
+        parsed = urlsplit(url)
+        if parsed.netloc == LOGIN_ANTIGRAVITY_HOST and parsed.path.startswith('/o/oauth2'):
+            return {'url': login_sanitize_url(url, ANTIGRAVITY_KEEP_QUERY)}
+    return None
+
+
 def login_relevant(text):
     """只保留与登录进展有关的行，丢掉动画刷屏。
 
@@ -319,6 +332,7 @@ class _LoginSession:
         # 官方界面在等待授权时会持续刷新动画，几 KB 的尾部缓冲会被新动画挤满，
         # 光靠 buffer 里再搜一次会搜不到，所以一旦找到就单独记住，不再依赖缓冲区。
         self.payload = None
+        self.submitted = threading.Event()
 
 
 class LoginManager:
@@ -338,9 +352,10 @@ class LoginManager:
     def start(self, provider, chat, binary, env, notify):
         if provider not in LOGIN_PROVIDERS:
             return {'ok': False, 'state': 'unsupported'}
-        if provider == 'codebuddy' and os.name != 'posix':
+        if provider in ('codebuddy', 'antigravity') and os.name != 'posix':
+            label = 'CodeBuddy' if provider == 'codebuddy' else 'Antigravity'
             return {'ok': False, 'state': 'unsupported',
-                    'message': 'CodeBuddy 登录依赖伪终端，仅支持 Linux 服务器。'}
+                    'message': label + ' 登录依赖伪终端，仅支持 Linux 服务器。'}
         with self._lock:
             if provider in self._sessions:
                 return {'ok': False, 'state': 'already_running'}
@@ -351,6 +366,14 @@ class LoginManager:
                 daemon=True, name='cli-login-' + provider)
             session.thread.start()
         return {'ok': True, 'state': 'starting'}
+
+    def has_session(self, provider, chat=None):
+        """检查指定执行器是否正在进行登录（可选校验会话归属）。"""
+        with self._lock:
+            session = self._sessions.get(provider)
+            if session is None or session.stopped.is_set():
+                return False
+            return chat is None or session.chat == chat
 
     def cancel(self, provider, chat):
         with self._lock:
@@ -364,9 +387,26 @@ class LoginManager:
         return {'ok': True, 'state': 'cancelled'}
 
     def submit(self, provider, chat, code):
-        """官方没有授权码回填入口，明确拒绝而不是假装支持。"""
-        return {'ok': False, 'state': 'unsupported',
-                'message': '官方登录流程不提供授权码回填，请在浏览器完成授权。'}
+        """仅支持需要在交互界面回填授权码的执行器（如 Antigravity）。"""
+        if provider != 'antigravity':
+            return {'ok': False, 'state': 'unsupported',
+                    'message': '官方登录流程不提供授权码回填，请在浏览器完成授权。'}
+        with self._lock:
+            session = self._sessions.get(provider)
+        if session is None or session.stopped.is_set():
+            return {'ok': False, 'state': 'not_running',
+                    'message': '当前没有进行中的 Antigravity 登录。'}
+        if chat is not None and session.chat != chat:
+            return {'ok': False, 'state': 'other_chat',
+                    'message': '当前登录是由其他对话发起的。'}
+        token = (code or '').strip()
+        if not token:
+            return {'ok': False, 'state': 'invalid', 'message': '请提供有效的授权码。'}
+        if session.master is None:
+            return {'ok': False, 'state': 'failed', 'message': '登录终端通道尚未就绪。'}
+        self._write(session, token.encode('utf-8') + b'\r')
+        session.submitted.set()
+        return {'ok': True, 'state': 'submitted'}
 
     def logout(self, provider, binary, env):
         """退出某个执行器的账号登录。
@@ -393,7 +433,7 @@ class LoginManager:
         # 只有 codex 与 codebuddy。Claude 的登录由 bot.py 自己起进程（它要拿到
         # 授权链接让机主回填），但**退出**走的是官方 `claude auth logout`，
         # 完全可以在这里统一收口。用错表会让 Claude 的退出永远进不来。
-        if provider not in ('claude', 'codex', 'codebuddy'):
+        if provider not in ('claude', 'codex', 'codebuddy', 'antigravity'):
             return {'ok': False, 'state': 'unsupported',
                     'message': '这个执行器没有账号登录。'}
         with self._lock:
@@ -406,6 +446,8 @@ class LoginManager:
             return self._claude_logout(binary, env)
         if provider == 'codex':
             return self._codex_logout()
+        if provider == 'antigravity':
+            return self._antigravity_logout(binary, env)
         return self._codebuddy_logout()
 
     def logout_target_present(self, provider):
@@ -497,6 +539,52 @@ class LoginManager:
         return {'ok': True, 'state': 'logged_out',
                 'removed': '已清空 ' + '、'.join(cleared)}
 
+    def _antigravity_logout(self, binary, env):
+        """在伪终端中向官方交互界面发送退出指令，完成后复核登录状态。"""
+        current = self._antigravity_status(binary, env)
+        if current.get('ok') and not current.get('authenticated'):
+            return {'ok': True, 'state': 'not_logged_in', 'removed': ''}
+        if os.name != 'posix':
+            return {'ok': False, 'state': 'failed',
+                    'message': 'Antigravity 退出依赖伪终端，仅支持 Linux 服务器。'}
+        clean_env = login_clean_env(dict(env))
+        clean_env['TERM'] = 'xterm-256color'
+        clean_env['COLUMNS'] = '1000'
+        session = _LoginSession('antigravity', None, lambda _event: None)
+        try:
+            session.process = self._spawn(session, [binary], clean_env)
+        except OSError as exc:
+            return {'ok': False, 'state': 'failed',
+                    'message': '无法启动官方命令行工具：' + type(exc).__name__}
+        try:
+            import select
+            sent = False
+            buf = ''
+            deadline = time.monotonic() + min(15.0, float(self.status_timeout))
+            while time.monotonic() < deadline:
+                readable, _, _ = select.select([session.master], [], [], 0.2)
+                if readable:
+                    try:
+                        chunk = os.read(session.master, 8192)
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    buf = (buf + LOGIN_ANSI.sub('', chunk.decode('utf-8', 'replace')))[-8192:]
+                    lowered = buf.lower()
+                    if any(hint in lowered for hint in LOGIN_ANTIGRAVITY_UNAUTH_HINTS):
+                        break
+                if not sent and session.process.poll() is None:
+                    self._write(session, b'/logout\r')
+                    sent = True
+        finally:
+            self._terminate(session)
+        after = self._antigravity_status(binary, env)
+        if after.get('ok') and not after.get('authenticated'):
+            return {'ok': True, 'state': 'logged_out', 'removed': '官方 /logout 命令'}
+        return {'ok': False, 'state': 'failed',
+                'message': '已执行官方 /logout，但尚未确认登录态已清除。'}
+
     def _backup(self, path):
         """退出前留一份备份。删掉的东西里可能混着网关密钥，得能拿回来。"""
         stamp = time.strftime('%Y%m%d-%H%M%S')
@@ -516,6 +604,8 @@ class LoginManager:
             return self._codex_status(binary, env)
         if provider == 'codebuddy':
             return self._codebuddy_status(binary, env)
+        if provider == 'antigravity':
+            return self._antigravity_status(binary, env)
         return {'ok': False, 'state': 'unsupported', 'authenticated': False}
 
     def _codex_status(self, binary, env):
@@ -550,6 +640,28 @@ class LoginManager:
             return {'ok': True, 'state': 'unauthenticated', 'authenticated': False}
         return {'ok': True, 'state': 'authenticated', 'authenticated': True}
 
+    def _antigravity_authenticated(self, binary, env):
+        """官方模型目录指令在未登录时明确要求先登录。"""
+        result = self.status('antigravity', binary, env)
+        return bool(result.get('authenticated'))
+
+    def _antigravity_status(self, binary, env):
+        """通过执行模型目录命令判断官方账号登录状态。"""
+        try:
+            result = subprocess.run(
+                [binary, 'models'],
+                capture_output=True, text=True, timeout=self.status_timeout,
+                env=login_clean_env(dict(env)))
+        except (OSError, subprocess.SubprocessError):
+            return {'ok': False, 'state': 'failed', 'authenticated': False}
+        output = ((result.stdout or '') + (result.stderr or '')).strip()
+        lowered = output.lower()
+        if any(hint in lowered for hint in LOGIN_ANTIGRAVITY_UNAUTH_HINTS):
+            return {'ok': True, 'state': 'unauthenticated', 'authenticated': False}
+        account = result.returncode == 0 and bool(output)
+        return {'ok': True, 'state': 'authenticated' if account else 'unauthenticated',
+                'authenticated': account}
+
     def _emit(self, session, state, **fields):
         session.state = state
         event = {'provider': session.provider, 'chat': session.chat, 'state': state, **fields}
@@ -566,7 +678,7 @@ class LoginManager:
             options['creationflags'] = subprocess.CREATE_NEW_PROCESS_GROUP
         else:
             options['start_new_session'] = True
-        if session.provider == 'codebuddy':
+        if session.provider in ('codebuddy', 'antigravity'):
             import fcntl
             import pty
             import struct
@@ -576,7 +688,9 @@ class LoginManager:
             options['stdin'] = slave
             options['stdout'] = slave
             options['stderr'] = slave
-            fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 50, 220, 0, 0))
+            # Antigravity 打印的谷歌授权链接很长，设宽窗口避免折行切断网址。
+            cols = 1000 if session.provider == 'antigravity' else 220
+            fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 50, cols, 0, 0))
             process = subprocess.Popen(command, **options)
             os.close(slave)
             return process
@@ -634,12 +748,14 @@ class LoginManager:
                 if session.stopped.is_set():
                     final_state = 'cancelled'
                     return
-                if session.provider == 'codebuddy':
+                if session.provider in ('codebuddy', 'antigravity'):
                     # 官方交互界面只在伪终端下正常显示。
                     env = dict(env)
                     env['TERM'] = 'xterm-256color'
-                    env['COLUMNS'] = '220'
-                    session.process = self._spawn(session, [binary, '/login'], env)
+                    cols = '1000' if session.provider == 'antigravity' else '220'
+                    env['COLUMNS'] = cols
+                    args = [binary, '/login'] if session.provider == 'codebuddy' else [binary]
+                    session.process = self._spawn(session, args, env)
                 else:
                     session.process = self._spawn(
                         session, [binary, 'login', '--device-auth'], env)
@@ -651,11 +767,16 @@ class LoginManager:
             eof = False
             step = 0
             next_probe = time.monotonic() + 20
+            fast_probing = False
             # 先问一次官方命令：已经登录好的机器上，界面不会给登录链接，
             # 而是直接进「Syncing…」动画。这时若还傻等链接，就只能等到超时，
             # 最后把「已登录」说成超时或失败（2026-10-26 真实反馈）。
-            already = (session.provider == 'codebuddy'
-                       and self._codebuddy_authenticated(binary, env))
+            if session.provider == 'codebuddy':
+                already = self._codebuddy_authenticated(binary, env)
+            elif session.provider == 'antigravity':
+                already = self._antigravity_authenticated(binary, env)
+            else:
+                already = False
             if already:
                 final_state = 'succeeded'
             while not already:
@@ -676,24 +797,40 @@ class LoginManager:
                         # 真正的链接会被挤出窗口（2026-10-26 实测：9 秒即达 16KB 上限）。
                         session.buffer = (session.buffer + login_relevant(chunk))[-self.buffer_limit:]
                         text = LOGIN_ANSI.sub('', session.buffer)
-                        if session.provider == 'codebuddy':
-                            # 成功提示必须排在动画判断之前：官方界面自报登录成功时，
-                            # 紧跟其后的就是「Syncing…」动画，先读它才不会把结果误判成失败。
-                            if any(hint in text.lower() for hint in LOGIN_SUCCESS_HINTS):
+                        if session.provider in ('codebuddy', 'antigravity'):
+                            lowered = text.lower()
+                            is_ag = session.provider == 'antigravity'
+                            # 成功提示必须排在动画判断之前，并排除未登录文本的反向干扰。
+                            if (any(hint in lowered for hint in LOGIN_SUCCESS_HINTS)
+                                    or (is_ag and 'signed in' in lowered
+                                        and 'not signed in' not in lowered)):
                                 final_state = 'succeeded'
                                 session.stopped.set()
                                 continue
-                            step = self._advance_codebuddy(session, text, step)
-                            if session.payload is None:
-                                prompt = codebuddy_login_prompt(session.buffer)
-                                if prompt:
-                                    session.payload = prompt
-                                    ready = True
-                                    self._emit(session, 'ready', **prompt)
+                            if is_ag:
+                                step = self._advance_antigravity(session, text, step)
+                                if session.payload is None:
+                                    prompt = antigravity_login_prompt(text)
+                                    if prompt:
+                                        session.payload = prompt
+                                        ready = True
+                                        self._emit(session, 'ready', **prompt)
+                            else:
+                                step = self._advance_codebuddy(session, text, step)
+                                if session.payload is None:
+                                    prompt = codebuddy_login_prompt(session.buffer)
+                                    if prompt:
+                                        session.payload = prompt
+                                        ready = True
+                                        self._emit(session, 'ready', **prompt)
+                            if ready and session.submitted.is_set() and not fast_probing:
+                                fast_probing = True
+                                next_probe = min(next_probe, time.monotonic() + 1)
                             if ready and time.monotonic() >= next_probe:
-                                # 官方界面不一定退出，用官方命令的真实行为核实登录是否生效。
-                                next_probe = time.monotonic() + 20
-                                if self._codebuddy_authenticated(binary, env):
+                                next_probe = time.monotonic() + (3 if fast_probing else 20)
+                                authed = (self._antigravity_authenticated(binary, env) if is_ag
+                                          else self._codebuddy_authenticated(binary, env))
+                                if authed:
                                     final_state = 'succeeded'
                                     session.stopped.set()
                         else:
@@ -716,6 +853,9 @@ class LoginManager:
                         # 就是真的失败，套用同一个探测逻辑会把失败说成成功
                         # （服务器上装了 codebuddy 且已登录时实测复现）。
                         final_state = ('succeeded' if self._codebuddy_authenticated(binary, env)
+                                       else 'failed')
+                    elif session.provider == 'antigravity':
+                        final_state = ('succeeded' if self._antigravity_authenticated(binary, env)
                                        else 'failed')
                     else:
                         final_state = 'failed'
@@ -760,6 +900,13 @@ class LoginManager:
             break
         return step
 
+    def _advance_antigravity(self, session, text, step):
+        """官方登录方式选择界面按一次回车确认默认谷歌授权。"""
+        if step == 0 and LOGIN_METHOD_PROMPT in text:
+            self._write(session, b'\r')
+            return 1
+        return step
+
     def _write(self, session, data):
         if session.master is None:
             return
@@ -774,7 +921,7 @@ class LoginManager:
             if process is None:
                 return
             if process.poll() is None:
-                if session.provider == 'codebuddy' and session.master is not None:
+                if session.provider in ('codebuddy', 'antigravity') and session.master is not None:
                     # 官方界面支持 ESC 取消，优先用它收尾。
                     self._write(session, b'\x1b')
                 try:
@@ -852,8 +999,29 @@ CODEX_ACCOUNT_MODELS = (
     ('gpt-5.6-terra', 'GPT-5.6 Terra'),
     ('gpt-5.6-luna', 'GPT-5.6 Luna'),
 )
+# Antigravity CLI（agy）实测可列出的官方账号模型目录。
+ANTIGRAVITY_ACCOUNT_MODELS = (
+    ('gemini-4-argon-low', 'Gemini 4 Argon · 低思考'),
+    ('gemini-4-argon-medium', 'Gemini 4 Argon · 中思考'),
+    ('gemini-4-argon-high', 'Gemini 4 Argon · 高思考'),
+    ('gemini-4-hydrogen-low', 'Gemini 4 Hydrogen · 低思考'),
+    ('gemini-4-hydrogen-medium', 'Gemini 4 Hydrogen · 中思考'),
+    ('gemini-4-hydrogen-high', 'Gemini 4 Hydrogen · 高思考'),
+    ('gemini-4-hydrogen-xhigh', 'Gemini 4 Hydrogen · 极高思考'),
+    ('gemini-3.8-flash-low', 'Gemini 3.8 Flash · 低思考'),
+    ('gemini-3.8-flash-medium', 'Gemini 3.8 Flash · 中思考'),
+    ('gemini-3.8-flash-high', 'Gemini 3.8 Flash · 高思考'),
+    ('claude-opus-5-5-low', 'Claude Opus 5.5 · 低思考'),
+    ('claude-opus-5-5-medium', 'Claude Opus 5.5 · 中思考'),
+    ('claude-opus-5-5-high', 'Claude Opus 5.5 · 高思考'),
+    ('claude-sonnet-5-5-low', 'Claude Sonnet 5.5 · 低思考'),
+    ('claude-sonnet-5-5-medium', 'Claude Sonnet 5.5 · 中思考'),
+    ('claude-sonnet-5-5-high', 'Claude Sonnet 5.5 · 高思考'),
+    ('gpt-oss-120b-medium', 'GPT-OSS 120B · 中思考'),
+)
 CLAUDE_ACCOUNT_MODEL_IDS = {item[0] for item in CLAUDE_ACCOUNT_MODELS}
 CODEX_ACCOUNT_MODEL_IDS = {item[0] for item in CODEX_ACCOUNT_MODELS}
+ANTIGRAVITY_ACCOUNT_MODEL_IDS = {item[0] for item in ANTIGRAVITY_ACCOUNT_MODELS}
 
 
 def codex_jwt_claims(token):
@@ -978,6 +1146,8 @@ def account_models(provider):
         return CLAUDE_ACCOUNT_MODELS
     if provider == 'codex':
         return CODEX_ACCOUNT_MODELS
+    if provider == 'antigravity':
+        return ANTIGRAVITY_ACCOUNT_MODELS
     # CodeBuddy 账号模式的模型以它自己的目录为准（models.json），
     # 这里不硬编码，交给调用方走 catalog()，避免写死一份会过期的清单。
     return ()

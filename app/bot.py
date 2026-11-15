@@ -158,7 +158,7 @@ MENU_GROUPS = {
     '设置': {
         '任务与模型': ['模型', '账号模型', '思考强度', '规划执行', '模型供应商', '选择智能体'],
         '会话与文件': ['新建会话', '会话列表', '压缩上下文'],
-        '账号登录': ['登录Claude', '登录CodeBuddy', '登录Codex', '退出账号', '账号状态', '渠道切换'],
+        '账号登录': ['登录Claude', '登录CodeBuddy', '登录Codex', '登录Antigravity', '退出账号', '账号状态', '渠道切换'],
         '版本更新': ['检查版本', '更新机器人'],
         '平台授权': ['授权GitHub', '授权Cloudflare', '授权状态', '撤销授权'],
     },
@@ -204,6 +204,7 @@ MENU_LABELS = {
     '目标': '执行目标', '模型': '模型设置', '队列': '任务队列',
     '会话': '会话管理', '文件': '文件管理',
     '登录Claude': '登录Claude账号', '登录CodeBuddy': '登录CodeBuddy账号', '登录Codex': '登录Codex账号',
+    '登录Antigravity': '登录Antigravity账号',
     '授权GitHub': '仓库授权',
     '授权Cloudflare': '云端授权', '云flare粘贴令牌': '手动填令牌',
     '返回主菜单': '返回首页',
@@ -309,6 +310,12 @@ ENGINES = {
         'kind': 'codex',             # codex exec，输出 JSONL，无系统提示词参数
         'binary': 'codex',
         'button': '使用Codex',
+    },
+    'antigravity': {
+        'label': 'Antigravity',
+        'kind': 'antigravity',       # agy -p --output-format stream-json，用 --conversation 续接
+        'binary': 'agy',
+        'button': '使用Antigravity',
     },
 }
 
@@ -613,6 +620,8 @@ def cli_login_notification(event):
         message = label + ' 登录授权\n' + event.get('url', '')
         if engine == 'codex':
             message += '\n设备码：' + event.get('code', '') + '\n在官方网页输入设备码，完成后会自动检查。'
+        elif engine == 'antigravity':
+            message += '\n请在浏览器打开上方链接完成谷歌授权，然后将页面显示的授权码直接发送给我（或发送“提交Antigravity授权码 你的授权码”）。'
         else:
             message += '\n完成浏览器授权后，服务器会自动等待并检测登录结果，不需要回填授权码。'
         send_options(chat, message, [('取消' + label + '登录', '取消登录 ' + engine)])
@@ -659,6 +668,7 @@ MODEL_PIN_VARS = ('ANTHROPIC_MODEL', 'ANTHROPIC_DEFAULT_HAIKU_MODEL',
 GATEWAY_VARS = ('ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL')
 OPENAI_GATEWAY_VARS = ('OPENAI_API_KEY', 'OPENAI_BASE_URL', 'OPENAI_MODEL', 'CODEX_API_KEY')
 CODEBUDDY_GATEWAY_VARS = ('CODEBUDDY_API_KEY', 'CODEBUDDY_BASE_URL', 'CODEBUDDY_MODEL')
+GEMINI_GATEWAY_VARS = ('GEMINI_API_KEY', 'GOOGLE_API_KEY')
 
 
 def account_environment(environment, engine):
@@ -667,6 +677,8 @@ def account_environment(environment, engine):
         names += OPENAI_GATEWAY_VARS
     elif engine == 'codebuddy':
         names += CODEBUDDY_GATEWAY_VARS
+    elif engine == 'antigravity':
+        names += GEMINI_GATEWAY_VARS
     return {name: value for name, value in environment.items() if name not in names}
 
 
@@ -901,6 +913,9 @@ def subscription_identity(engine):
             return identity
         ok, _ = account_authorized('codebuddy')
         return {'email': '', 'name': '', 'plan': '', 'plan_label': '已登录'} if ok else None
+    if engine == 'antigravity':
+        ok, _ = account_authorized('antigravity')
+        return {'email': '', 'name': '', 'plan': '', 'plan_label': '已登录'} if ok else None
     return None
 
 
@@ -949,6 +964,7 @@ EFFORT_LEVELS = {
     'claude': ('low', 'medium', 'high', 'xhigh', 'max'),
     'codebuddy': ('minimal', 'low', 'medium', 'high', 'xhigh', 'max'),
     'codex': ('minimal', 'low', 'medium', 'high'),
+    'antigravity': ('low', 'medium', 'high', 'xhigh', 'max'),
 }
 EFFORT_LABELS = {'minimal': '最低', 'low': '低', 'medium': '中', 'high': '高', 'xhigh': '很高', 'max': '最高'}
 
@@ -2727,6 +2743,21 @@ def engine_command(engine, text, instructions, chat, environment):
         environment.clear()
         environment.update(clean_environment)
     command = [binary]
+    if spec['kind'] == 'antigravity':
+        # agy 没有 --append-system-prompt / --max-turns / --mcp-config，指令需与任务合并。
+        environment.pop('_IMAGE_SERVER', None)
+        environment.pop('_IMAGE_CONFIG', None)
+        prompt = (instructions + '\n\n' + text) if instructions else text
+        command.extend(['-p', prompt, '--output-format', 'stream-json', '--dangerously-skip-permissions'])
+        if account and account_model(engine):
+            command.extend(['--model', account_model(engine)])
+        elif not account and current_model() in github_auth.ANTIGRAVITY_ACCOUNT_MODEL_IDS:
+            command.extend(['--model', current_model()])
+        if current_effort(engine):
+            command.extend(['--effort', current_effort(engine)])
+        if session_id():
+            command.extend(['--conversation', session_id()])
+        return command, None
     if spec['kind'] == 'codex':
         # codex exec 没有 --append-system-prompt，也没有轮次上限参数，
         # 系统指令只能拼进 prompt 本体，并且要显式声明工作目录与跳过 Git 检查。
@@ -3098,6 +3129,108 @@ def parse_codex_event(event, state):
             state['activity'] = '正在推理'
 
 
+ANTIGRAVITY_TOOL_MAP = {
+    'run_command': 'Bash',
+    'read_file': 'Read',
+    'write_file': 'Write',
+    'edit_file': 'Edit',
+    'grep_search': 'Grep',
+    'find_by_name': 'Glob',
+    'list_dir': 'Glob',
+    'read_url_content': 'WebFetch',
+    'search_web': 'WebSearch',
+}
+
+
+def _normalize_antigravity_params(params):
+    """把 Antigravity 工具参数键名对齐到公共步骤描述约定。"""
+    if not isinstance(params, dict):
+        return {}
+    normalized = dict(params)
+    for src, dst in (('CommandLine', 'command'), ('Path', 'file_path'),
+                     ('DirectoryPath', 'file_path'), ('TargetFile', 'file_path'),
+                     ('Pattern', 'pattern'), ('Url', 'url'), ('Query', 'query'),
+                     ('Description', 'description'), ('toolSummary', 'description')):
+        if params.get(src) and not normalized.get(dst):
+            normalized[dst] = params[src]
+    return normalized
+
+
+def parse_antigravity_event(event, state):
+    """解析 Antigravity 命令行工具（agy）输出的 stream-json 事件。"""
+    kind = event.get('event')
+    if kind == 'init':
+        if event.get('conversation_id'):
+            save_session(event['conversation_id'])
+        return
+    if kind == 'step_update':
+        step = event.get('step_update') or {}
+        step_type = step.get('step_type')
+        step_state = step.get('state')
+        step_index = step.get('step_index')
+        if step_type == 'agent_response':
+            thought = step.get('thinking_delta') or step.get('thinking')
+            if thought:
+                state['thinking'] = (state.get('thinking', '') + str(thought))[-600:]
+                state['activity'] = '正在思考'
+            delta = step.get('text_delta')
+            delta_steps = state.setdefault('ag_delta_steps', set())
+            if delta:
+                if step_index not in delta_steps:
+                    append_content(state, start_text_block(state['content']))
+                    delta_steps.add(step_index)
+                append_content(state, str(delta))
+                state['activity'] = '正在生成回复'
+            elif step_state == 'DONE' and step.get('text') and step_index not in delta_steps:
+                append_content(state, start_text_block(state['content']) + str(step['text']))
+                delta_steps.add(step_index)
+                state['activity'] = '正在生成回复'
+            usage = step.get('usage') or {}
+            used = sum(int(usage.get(k) or 0) for k in
+                       ('input_tokens', 'cache_read_tokens', 'cache_read_input_tokens'))
+            if used:
+                state['context_used'] = used
+        elif step_type == 'tool':
+            raw_name = str(step.get('tool_name') or '工具')
+            canonical = ANTIGRAVITY_TOOL_MAP.get(raw_name, raw_name)
+            info = step.get('tool_info') or {}
+            tool_steps = state.setdefault('ag_tool_steps', {})
+            if step_index not in tool_steps:
+                record_tool(canonical)
+                add_step(state, describe_tool(canonical, _normalize_antigravity_params(info.get('parameters'))))
+                tool_steps[step_index] = len(state['steps']) - 1
+            failed = (str(step.get('status') or '').upper() in ('ERROR', 'FAILED')
+                      or bool(info.get('is_error')) or bool(step.get('error')))
+            if step_state == 'DONE' and failed and state.get('steps'):
+                idx = tool_steps[step_index]
+                if not state['steps'][idx].endswith(' ✗'):
+                    state['steps'][idx] += ' ✗'
+            state['activity'] = ('已执行工具：' if step_state == 'DONE' else '正在执行工具：') + canonical
+        elif step_type in ('planner_response', 'thinking'):
+            thought = step.get('thinking_delta') or step.get('thinking')
+            if thought:
+                state['thinking'] = (state.get('thinking', '') + str(thought))[-600:]
+            state['activity'] = '正在思考'
+        return
+    if kind == 'result':
+        result = event.get('result') if isinstance(event.get('result'), dict) else event
+        if result.get('conversation_id'):
+            save_session(result['conversation_id'])
+        status = str(result.get('status') or '')
+        is_error = bool(result.get('is_error')) or (bool(status) and status.upper() != 'SUCCESS')
+        response = result.get('response') if result.get('response') is not None else result.get('result')
+        if is_error and not state['failed']:
+            state['failed'] = str(result.get('error') or response or ('执行状态：' + status))
+        state['final'] = {'result': response, 'session_id': result.get('conversation_id'), 'is_error': is_error}
+        return
+    if kind == 'error':
+        message = str(event.get('error') or event.get('message') or '').strip()
+        if message:
+            state['failed'] = message
+            if session_error_is_recoverable(message):
+                state['session_invalid'] = True
+
+
 def stream_interval(elapsed, grew):
     """距上次刷新至少要隔多久（秒）。
 
@@ -3357,6 +3490,8 @@ def run_stream(chat, text):
                     continue
                 if state_kind == 'codex':
                     parse_codex_event(event, state)
+                elif state_kind == 'antigravity':
+                    parse_antigravity_event(event, state)
                 else:
                     parse_claude_event(event, state)
                 # 一段正文收尾时要立刻结算一次：否则最后几个字可能因为
@@ -3433,7 +3568,7 @@ def run_stream(chat, text):
         # started_wall 兜底，两者不能互相顶替。
         footer = reply_footer(engine, started, started_wall=started_wall)
         used = state.get('context_used')
-        estimated = not used and state_kind != 'codex'
+        estimated = not used and state_kind not in ('codex', 'antigravity')
         if estimated:
             used = estimate_context((final or {}).get('session_id'))
         window = state.get('context_window') or (200000 if used else 0)
@@ -3449,7 +3584,7 @@ def run_stream(chat, text):
         # 这里必须等一次：不等的话，尾部的执行摘要可能在分片消息之后才到达，
         # 顺序就乱了（用户看到「结果 → 摘要 → 结果的后半段」）。
         stream.close()
-        can_compact = state_kind != 'codex' and not crashed
+        can_compact = state_kind not in ('codex', 'antigravity') and not crashed
         markup = reply_buttons(chat, [] if crashed else suggestions, compact=can_compact)
         stream.deliver_final(head, markup if len(pieces) <= 1 else None)
         # 首片已通过编辑消息呈现，其余分片补发；按钮挂在最后一片。
@@ -4384,6 +4519,13 @@ class TaskController:
             ok, detail = submit_login_code(text)
             send(chat, 'Claude 账号登录成功。\n' + detail + '\n\n要改用它，请到“模型与会话 → 渠道切换 → 使用Claude账号”。'
                       if ok else '授权码未通过校验：' + detail + '\n可以重新发送“登录Claude”获取新链接。')
+        elif CLI_LOGINS.has_session('antigravity', chat) and looks_like_login_code(text):
+            # 仅当前对话有 Antigravity 登录会话等待授权码时拦截，防止把授权码发进任务流。
+            result = CLI_LOGINS.submit('antigravity', chat, text)
+            if result.get('ok'):
+                send(chat, '已提交 Antigravity 授权码，正在等待官方命令行工具完成校验……')
+            else:
+                send(chat, '授权码提交失败：' + (result.get('message') or '请重试或取消登录后重新获取链接。'))
         else:
             # 入队不再单独发一条「已加入队列 + 摘要」：那条消息与随后
             # 「已接收，正在生成…」重复，且一整块信息对用户没什么用。
@@ -4454,7 +4596,7 @@ class TaskController:
     @on_text('当前智能体')
     def _cmd_当前智能体(self, chat, text, update_id):
         # 旧版留给老键盘和习惯输入，功能并入「选择智能体」。
-        send(chat, '当前执行器：' + current_engine() + '\n共享记忆和技能；原生会话独立，最近六项任务摘要交接。CodeBuddy保留自身高风险确认规则，不伪装成隔离沙箱绕过。\n注意 Codex 走 codex exec，无系统提示词参数，指令与任务会拼在同一条 prompt 里。')
+        send(chat, '当前执行器：' + current_engine() + '\n共享记忆和技能；原生会话独立，最近六项任务摘要交接。CodeBuddy保留自身高风险确认规则，不伪装成隔离沙箱绕过。\n注意 Codex 与 Antigravity 均无独立系统提示词参数，指令与任务会拼在同一条任务提示里。')
 
     @on_text('新任务')
     def _cmd_新任务(self, chat, text, update_id):
@@ -4596,8 +4738,9 @@ class TaskController:
 
     @on_text('压缩上下文', '/compact')
     def _cmd_压缩上下文(self, chat, text, update_id):
-        if engine_spec(current_engine())['kind'] == 'codex':
-            send(chat, '当前执行器是 Codex，不支持压缩上下文。需要清空可以发送“新建会话”。')
+        spec = engine_spec(current_engine())
+        if spec['kind'] in ('codex', 'antigravity'):
+            send(chat, '当前执行器是 ' + spec['label'] + '，不支持压缩上下文。需要清空可以发送“新建会话”。')
             return
         if not session_id():
             send(chat, '当前会话还没有对话记录，不需要压缩。')
@@ -4682,9 +4825,10 @@ class TaskController:
                    + url + '\n\n授权后网页会给出一段授权码，把它直接发给我即可。\n'
                    '链接十分钟内有效；期间不要重复发起登录。')
 
-    @on_text('登录CodeBuddy', '登录Codex')
+    @on_text('登录CodeBuddy', '登录Codex', '登录Antigravity')
     def _cmd_登录CodeBuddy(self, chat, text, update_id):
-        engine = 'codebuddy' if text == '登录CodeBuddy' else 'codex'
+        engine_map = {'登录CodeBuddy': 'codebuddy', '登录Codex': 'codex', '登录Antigravity': 'antigravity'}
+        engine = engine_map[text]
         result = CLI_LOGINS.start(engine, chat, engine_binary(engine),
                                   account_environment(os.environ, engine), cli_login_notification)
         if not result.get('ok'):
@@ -4694,10 +4838,20 @@ class TaskController:
         send_options(chat, '正在启动' + engine_spec(engine)['label'] + '官方登录，授权信息稍后发送。',
                      [('取消登录', '取消登录 ' + engine)])
 
+    @on_text(match=lambda text: text.startswith('提交Antigravity授权码 '))
+    def _cmd_提交Antigravity授权码(self, chat, text, update_id):
+        code = text.partition(' ')[2].strip()
+        if not code:
+            raise MediaError('请在命令后附上授权码。')
+        result = CLI_LOGINS.submit('antigravity', chat, code)
+        if not result.get('ok'):
+            raise MediaError(result.get('message') or '无法提交授权码，请先发起登录。')
+        send(chat, '已提交 Antigravity 授权码，正在等待官方命令行工具完成校验……')
+
     @on_text(match=lambda text: text.startswith('取消登录 '))
     def _cmd_取消登录(self, chat, text, update_id):
         engine = text.partition(' ')[2]
-        if engine not in ('codebuddy', 'codex'):
+        if engine not in ('codebuddy', 'codex', 'antigravity'):
             raise MediaError('未知登录执行器。')
         result = CLI_LOGINS.cancel(engine, chat)
         send(chat, '已请求取消' + engine_spec(engine)['label'] + '登录。' if result.get('ok') else '当前没有进行中的该执行器登录。')
@@ -4796,7 +4950,7 @@ class TaskController:
                          + '、'.join(ENGINES[name]['label'] for name in others))
         send_options(chat, '\n'.join(lines), options)
 
-    @on_text(match=lambda text: text in ('使用接口密钥', '使用Claude账号', '使用CodeBuddy账号', '使用Codex账号') or text.startswith(('使用接口密钥 ', '使用账号 ')))
+    @on_text(match=lambda text: text in ('使用接口密钥', '使用Claude账号', '使用CodeBuddy账号', '使用Codex账号', '使用Antigravity账号') or text.startswith(('使用接口密钥 ', '使用账号 ')))
     def _cmd_切换渠道(self, chat, text, update_id):
         # 跨执行器切换时，文本里带引擎名；直接点「使用Claude账号」这类旧按钮时按标签反查。
         # 两者都认不出来就明确报错，不要在这里抛 StopIteration 糊掉。

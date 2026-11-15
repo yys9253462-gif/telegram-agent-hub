@@ -29,7 +29,7 @@ CODEX_VERSION = '0.164.0'
 APT_DEPENDENCIES = ['python3', 'python3-venv', 'python3-pip', 'ca-certificates', 'curl', 'git',
                     'openssh-client', 'sudo', 'ffmpeg', 'util-linux']
 # 执行器顺序即机器人菜单里的顺序，也是 ENABLED_AGENTS 的排列依据；首个启用项成为默认执行器。
-ENGINES_ORDER = ('claude', 'codebuddy', 'codex')
+ENGINES_ORDER = ('claude', 'codebuddy', 'codex', 'antigravity')
 # 官方脚本变动时拒绝执行，由维护者重新审阅并更新哈希。
 INSTALLER_SHA256 = {
     'claude': '3a68d3406cf674e17bed1733a4dcf37805e2e47d87417700007d7e1aa766a944',
@@ -141,6 +141,7 @@ def collect_config(old, yes=False):
         c['enable_claude'] = boolean('启用 Claude Code', c.get('enable_claude', True))
         c['enable_codebuddy'] = boolean('启用 CodeBuddy Code', c.get('enable_codebuddy', True))
         c['enable_codex'] = boolean('启用 Codex CLI（走 npm，需要能访问 npm registry）', c.get('enable_codex', False))
+        c['enable_antigravity'] = boolean('启用 Antigravity（agy 命令行工具，需已预装）', c.get('enable_antigravity', False))
         c['voice_enabled'] = boolean('启用语音转写（下载 faster-whisper tiny 模型）', c.get('voice_enabled', True))
         c['image_enabled'] = boolean('配置图片生成', c.get('image_enabled', False))
         if c['image_enabled']:
@@ -161,9 +162,9 @@ def collect_config(old, yes=False):
         c['memory_bundle'] = ask('可选私有记忆技能包路径（不迁移则留空）', c.get('memory_bundle', ''))
     for key in ('enable_claude', 'enable_codebuddy', 'voice_enabled'):
         c.setdefault(key, True)
-    for key in ('image_enabled', 'remote_enabled', 'sudo_nopasswd', 'enable_codex'):
-        # 前三个是「高风险默认关」，enable_codex 是「新增组件默认关」：Codex 走 npm 装系统级包，
-        # 老用户升级时不该因为多了一个字段就被动多装一个执行器。两种理由不同，结论一致。
+    for key in ('image_enabled', 'remote_enabled', 'sudo_nopasswd', 'enable_codex', 'enable_antigravity'):
+        # 前三个是「高风险默认关」，后两个是「新增执行器默认关」：
+        # 老用户升级时不该因为多了一个字段就被动多启用一个额外执行器。
         c.setdefault(key, False)
     c.setdefault('default_model', 'auto')
     c.setdefault('local_label', '本机')
@@ -180,7 +181,9 @@ def validate_config(c):
         raise InstallError('Telegram bot token 格式无效')
     if not re.fullmatch(r'[1-9][0-9]*', str(c['telegram_owner_id'])):
         raise InstallError('owner ID 必须是正整数')
-    for key in ('enable_claude', 'enable_codebuddy', 'enable_codex', 'voice_enabled', 'image_enabled', 'remote_enabled', 'sudo_nopasswd'):
+    # 老配置可能尚未包含新增的执行器开关字段，缺省视为关闭以保持向后兼容。
+    c.setdefault('enable_antigravity', False)
+    for key in ('enable_claude', 'enable_codebuddy', 'enable_codex', 'enable_antigravity', 'voice_enabled', 'image_enabled', 'remote_enabled', 'sudo_nopasswd'):
         if not isinstance(c.get(key), bool):
             raise InstallError('配置字段必须是布尔值：' + key)
     engines = [name for name in ENGINES_ORDER if c.get('enable_' + name)]
@@ -241,7 +244,7 @@ def json_text(value):
 
 
 def runtime_environment(c, home):
-    engines = [name for name in ENGINES_ORDER if c['enable_' + name]]
+    engines = [name for name in ENGINES_ORDER if c.get('enable_' + name)]
     values = {
         'HOME': str(home), 'AGENT_HOME': str(home), 'APP_DIR': str(APP), 'CONFIG_DIR': str(CONFIG),
         'PATH': str(home / '.local/bin') + ':' + str(APP / '.venv/bin') + ':/usr/local/bin:/usr/bin:/bin',
@@ -411,6 +414,13 @@ def install_codex_cli():
         raise InstallError('Codex 版本不符，期望 ' + CODEX_VERSION + '，实际 ' + (actual or '无输出'))
 
 
+def install_antigravity_cli(home):
+    """检查 Antigravity（agy）命令行工具是否就绪，并校验可执行性。"""
+    candidate = home / '.local/bin/agy'
+    if not candidate.exists() and not shutil.which('agy'):
+        raise InstallError('未找到 agy 命令，请先为运行用户安装 Antigravity CLI 到 ~/.local/bin/agy')
+
+
 def codex_config_text(base_url, model):
     """生成 Codex 的 provider 配置。
 
@@ -543,7 +553,7 @@ def shared_memory(source, home, uid, gid):
     skills = memory / 'skills'
     skills.mkdir(exist_ok=True)
     os.chown(skills, uid, gid)
-    for agent in ('.claude', '.codebuddy', '.codex'):
+    for agent in ('.claude', '.codebuddy', '.codex', '.gemini'):
         folder = home / agent
         folder.mkdir(mode=0o700, exist_ok=True)
         os.chown(folder, uid, gid)
@@ -553,9 +563,9 @@ def shared_memory(source, home, uid, gid):
     instructions = memory / 'AGENTS.md'
     if not instructions.exists():
         atomic_write(instructions, '所有任务在授权范围内执行；共享记忆位于 ' + str(memory) + '。\n', 0o600, uid, gid)
-    # Codex 读的是 AGENTS.md，Claude/CodeBuddy 读各自命名的文件，三个都指向同一份共享记忆。
+    # Codex 读 AGENTS.md，Antigravity 读 GEMINI.md，Claude/CodeBuddy 读各自命名文件，全部指向同一份共享记忆。
     for directory in (home, home / 'tasks'):
-        for name in ('CLAUDE.md', 'CODEBUDDY.md', 'AGENTS.md'):
+        for name in ('CLAUDE.md', 'CODEBUDDY.md', 'AGENTS.md', 'GEMINI.md'):
             link = directory / name
             if not link.exists() and not link.is_symlink():
                 link.symlink_to(instructions)
@@ -640,11 +650,13 @@ def install(args, c):
     try:
         models = gateway_models(c) if c['enable_codebuddy'] else None
         for name in ENGINES_ORDER:
-            if not c['enable_' + name]:
+            if not c.get('enable_' + name):
                 continue
-            # Codex 没有官方安装脚本，走 npm；另两个走带哈希校验的官方脚本。
+            # Codex 走 npm 安装，Antigravity 校验预装命令行工具，其余两个走带哈希校验的官方脚本。
             if name == 'codex':
                 install_codex_cli()
+            elif name == 'antigravity':
+                install_antigravity_cli(home)
             else:
                 install_cli(name, user, home)
         if was_active:
@@ -791,7 +803,7 @@ def main(argv=None):
         print('隔离测试模式：Telegram 请求发送至本机假 API，禁止用于正式部署。')
     if args.dry_run:
         print(json_text({'app_dir': str(APP), 'config_dir': str(CONFIG), 'user': args.user, 'service': args.service_name,
-                         'agents': [n for n in ENGINES_ORDER if c['enable_' + n]],
+                         'agents': [n for n in ENGINES_ORDER if c.get('enable_' + n)],
                          'voice_enabled': c['voice_enabled'], 'remote_enabled': c['remote_enabled'],
                          'sudo_nopasswd': c['sudo_nopasswd'], 'apt_dependencies': not args.no_deps}))
         return 0

@@ -49,7 +49,7 @@ class EngineAccountsTests(unittest.TestCase):
                          {'channels': {'claude': 'account', 'codex': 'account'}})
 
     def test_concurrent_engine_writes_preserve_other_channels(self):
-        barrier = threading.Barrier(3)
+        barrier = threading.Barrier(len(bot.ENGINES))
         def switch(engine):
             barrier.wait()
             bot.set_auth_channel('account', engine)
