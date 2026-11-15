@@ -202,13 +202,54 @@ class DuplicateTailTest(unittest.TestCase):
             markup = api.call_args.args[1]['reply_markup']
             self.assertEqual(set(markup), {'inline_keyboard'})
             buttons = [button for row in markup['inline_keyboard'] for button in row]
-            self.assertEqual([button['text'] for button in buttons], ['模型设置'])
+            self.assertEqual([button['text'] for button in buttons], ['🧩 选网关模型'])
 
     def test_no_group_lists_the_same_button_twice(self):
         for owner, groups in MENU_GROUPS.items():
             for name, items in groups.items():
                 dupes = [x for x in set(items) if items.count(x) > 1]
                 self.assertFalse(dupes, owner + ' › ' + name + ' 有重复按钮：' + '、'.join(dupes))
+
+
+class MenuClarityTest(unittest.TestCase):
+    """每一个可见按钮和斜杠命令都必须有直白人话说明，杜绝黑盒盲按。"""
+
+    def test_every_visible_button_has_description(self):
+        import bot
+        for cmd in top_buttons() + grouped_buttons():
+            desc = bot.BUTTON_DESCRIPTIONS.get(cmd, '').strip()
+            self.assertTrue(desc, '按钮「' + cmd + '」缺少一句话人话说明')
+
+    def test_home_and_group_render_button_explanations(self):
+        import bot
+        from unittest.mock import patch
+        with patch.object(bot, 'OWNER', 123), patch.object(bot, 'send_options') as mock_send:
+            title = bot.group_title('设置', '设置')
+            for group_name in MENU_GROUPS['设置']:
+                self.assertIn(bot.GROUP_ICONS[group_name], title)
+                self.assertIn(bot.GROUP_DESCRIPTIONS[group_name], title)
+            for group_name, items in MENU_GROUPS['设置'].items():
+                mock_send.reset_mock()
+                bot.expand_group(123, group_name)
+                rendered_text = mock_send.call_args.args[1]
+                for cmd in items:
+                    self.assertIn(bot.MENU_LABELS.get(cmd, cmd), rendered_text)
+                    self.assertIn(bot.BUTTON_DESCRIPTIONS[cmd], rendered_text)
+        home = bot.home_menu_text()
+        for cmd in top_buttons():
+            self.assertIn(bot.HOME_LABELS.get(cmd, cmd), home)
+            self.assertIn(bot.BUTTON_DESCRIPTIONS[cmd], home)
+
+    def test_bot_commands_all_route_to_handlers(self):
+        import bot
+        labels = handled_labels() | set(bot.CHECKS)
+        for item in bot.BOT_COMMANDS:
+            slash = '/' + item['command']
+            mapped = bot.ALIASES.get(slash, slash)
+            self.assertTrue(slash in labels or mapped in labels,
+                            '斜杠命令 ' + slash + ' 没有对应处理器')
+            self.assertTrue(item['description'].strip(),
+                            '斜杠命令 ' + slash + ' 缺少中文说明')
 
 
 if __name__ == '__main__':

@@ -49,7 +49,7 @@ class InlineMenuTests(unittest.TestCase):
         markup = bot.api.call_args.args[1]['reply_markup']
         self.assertEqual(set(markup), {'inline_keyboard'})
         buttons = self.buttons()
-        self.assertEqual([item['text'] for item in buttons], ['模型设置', '新建会话'])
+        self.assertEqual([item['text'] for item in buttons], ['🧩 选网关模型', '🆕 清空开新聊'])
         for button, command in zip(buttons, ['模型', '新建会话']):
             self.assertLessEqual(len(button['callback_data'].encode()), 64)
             self.assertEqual(bot.ACTION_UI[button['callback_data'][3:]]['command'], command)

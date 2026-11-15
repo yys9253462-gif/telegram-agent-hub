@@ -32,7 +32,7 @@ class AntigravityRegistryTests(unittest.TestCase):
         self.assertEqual(spec['binary'], 'agy')
         self.assertEqual(spec['button'], '使用Antigravity')
         self.assertIn('登录Antigravity', bot.MENU_GROUPS['设置']['账号登录'])
-        self.assertEqual(bot.MENU_LABELS['登录Antigravity'], '登录Antigravity账号')
+        self.assertEqual(bot.MENU_LABELS['登录Antigravity'], '🔑 登 Antigravity')
         self.assertEqual(bot.EFFORT_LEVELS['antigravity'], ('low', 'medium', 'high', 'xhigh', 'max'))
 
     def test_account_models_catalog_valid(self):

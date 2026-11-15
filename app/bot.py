@@ -198,34 +198,91 @@ ALIASES = {'/start': '显示菜单', '/menu': '显示菜单', '/help': '任务�
 
 # 展示文案与内部命令分离，旧键盘、短命令和历史消息继续兼容。
 MENU_LABELS = {
-    '新任务': '开始任务', '当前任务': '查看进度',
-    '停止': '停止任务', '服务器状态': '主机状态',
-    '设置': '模型与会话', '更多': '授权管理',
-    '目标': '执行目标', '模型': '模型设置', '队列': '任务队列',
+    '新任务': '开始任务', '当前任务': '📋 任务进度',
+    '停止': '⏹ 停止任务', '服务器状态': '🖥 主机状态',
+    '设置': '⚙️ 设置中心', '更多': '🔗 仓库与云授权',
+    '目标': '执行目标', '队列': '任务队列',
     '会话': '会话管理', '文件': '文件管理',
-    '登录Claude': '登录Claude账号', '登录CodeBuddy': '登录CodeBuddy账号', '登录Codex': '登录Codex账号',
-    '登录Antigravity': '登录Antigravity账号',
-    '授权GitHub': '仓库授权',
-    '授权Cloudflare': '云端授权', '云flare粘贴令牌': '手动填令牌',
+    '选择智能体': '🤖 切换智能体', '模型': '🧩 选网关模型',
+    '账号模型': '👤 选账号模型', '思考强度': '💡 调思考深度',
+    '规划执行': '🤝 双模型协作', '模型供应商': '🌐 配中转网关',
+    '新建会话': '🆕 清空开新聊', '会话列表': '📜 历史旧对话', '压缩上下文': '🗜 压缩长对话',
+    '渠道切换': '🔀 渠道切换', '账号状态': '📊 查账号与额度',
+    '登录Claude': '🔑 登 Claude', '登录CodeBuddy': '🔑 登 CodeBuddy',
+    '登录Codex': '🔑 登 Codex', '登录Antigravity': '🔑 登 Antigravity',
+    '退出账号': '🚪 退出官网账号',
+    '检查版本': '🔎 仅检查新版', '更新机器人': '⬆️ 拉新版并重启',
+    '授权GitHub': '🐙 授权 GitHub', '授权Cloudflare': '☁️ 授权 Cloudflare',
+    '授权状态': '🔍 查外部授权', '撤销授权': '🗑 撤外部授权',
+    '云flare粘贴令牌': '手动填令牌',
     '返回主菜单': '返回首页',
 }
 ALIASES.update({label: command for command, label in MENU_LABELS.items()})
-# 底部常驻键盘的文案单独一张表：带图标更好认，又不影响内联菜单标题里的「模型与会话」等叫法。
-HOME_LABELS = {'当前任务': '📋 任务进度', '停止': '⏹ 停止任务', '新建会话': '💬 新会话',
-               '压缩上下文': '🗜 压缩上下文', '服务器状态': '🖥 主机状态', '设置': '⚙️ 设置'}
+# 底部常驻键盘的文案单独一张表：动作直白、精简好按，不影响内联菜单标题里的「⚙️ 设置中心」等叫法。
+HOME_LABELS = {'当前任务': '📋 任务进度', '停止': '⏹ 停止任务', '新建会话': '💬 清空开新聊',
+               '压缩上下文': '🗜 压缩长对话', '服务器状态': '🖥 查主机状态', '设置': '⚙️ 设置与功能'}
 ALIASES.update({label: command for command, label in HOME_LABELS.items()})
 
-GROUP_DESCRIPTIONS = {
-    '任务与模型': '选择执行目标、模型和智能体，管理待办任务。',
-    '会话与文件': '开新会话、切换旧会话，或把当前会话压缩成摘要腾出上下文。',
-    '账号登录': '登录或退出各执行器的官方账号，选择走账号还是接口密钥。',
-    '版本更新': '检查机器人是否有新版本并一键更新。',
-    '生图与文档': '描述你的创意，选择生图模型和画幅。',
-    '账号与渠道': '管理账号登录，切换模型调用渠道。',
-    '平台授权': '连接代码仓库与云平台，让智能体调用你的授权。',
-    '执行与查询': '调整执行方式，查看记忆、技能和工具记录。',
-    '系统与帮助': '查看权限与目录，了解使用方法。',
+# 每个按钮的一句话人话职责说明，直接渲染进工作台与二级分组正文，避免点进设置像猜盲盒。
+BUTTON_DESCRIPTIONS = {
+    '当前任务': '看正在跑/排队中的任务进度与账号剩余额度',
+    '停止': '立刻中止当前正在运行的任务',
+    '新建会话': '清掉当前对话记忆重新开始（原历史记录保留）',
+    '压缩上下文': '把超长历史浓缩成摘要继续聊，防止上下文爆窗',
+    '服务器状态': '实时查看本机负载、内存、磁盘与服务运行状态',
+    '设置': '打开设置中心：切智能体、换模型、登账号、授权与更新',
+    '选择智能体': '在 Claude / CodeBuddy / Codex / Antigravity 间切换执行大脑',
+    '模型': '仅「接口密钥」渠道生效：从当前中转网关挑模型',
+    '账号模型': '仅「官网账号」渠道生效：选账号直连使用的模型',
+    '思考强度': '调高让模型想得更深更稳（更慢、更耗额度），新任务生效',
+    '规划执行': '双模型协作：主模型负责计划与验收，挑一个快模型跑命令改文件',
+    '模型供应商': '添加、切换第三方 API 中转站地址与密钥（接口密钥渠道用）',
+    '会话列表': '浏览近期聊过的历史对话，点击就能切回去继续聊',
+    '渠道切换': '在「官网账号直连」与「中转接口密钥」两条通道间切换',
+    '账号状态': '查看 4 个智能体各自登录的身份、通道和剩余额度',
+    '登录Claude': '通过授权链接与授权码登录 Claude 官网账号',
+    '登录CodeBuddy': '通过链接扫码登录 CodeBuddy（腾讯云代码助手）账号',
+    '登录Codex': '通过设备码网页授权登录 Codex / ChatGPT 账号',
+    '登录Antigravity': '通过谷歌 OAuth 网页授权登录 Antigravity 账号',
+    '退出账号': '注销并清理本机保存的官网账号登录态',
+    '检查版本': '对比本地与 GitHub 最新提交，只查看不重启',
+    '更新机器人': '若有新版且本地干净，拉取新版源码并重启生效',
+    '授权GitHub': '设备码授权机器人读写和管理 GitHub 仓库',
+    '授权Cloudflare': '授权或填令牌托管 Cloudflare Workers / Pages',
+    '授权状态': '查看当前绑定的 GitHub 与 Cloudflare 账号状态',
+    '撤销授权': '移除本机保存的 GitHub / Cloudflare 授权令牌',
 }
+
+GROUP_DESCRIPTIONS = {
+    '任务与模型': '切换执行大脑、挑选网关/账号模型、配双模型协作与中转网关。',
+    '会话与文件': '清空开新对话、切回历史旧对话，或把超长对话压缩成摘要腾出空间。',
+    '账号登录': '选择走「官网账号」还是「接口密钥」，管理各智能体登录与查额度。',
+    '版本更新': '检查 GitHub 仓库最新版本并一键更新重启。',
+    '平台授权': '授权机器人操作你的 GitHub 仓库与 Cloudflare 云资源。',
+}
+
+# 同步到 Telegram 左下角「菜单」按钮的斜杠命令列表。
+BOT_COMMANDS = [
+    {'command': 'menu', 'description': '打开智能体工作台与底部按钮说明'},
+    {'command': 'settings', 'description': '打开设置中心（智能体/模型/账号/授权/更新）'},
+    {'command': 'agent', 'description': '切换执行大脑（Claude/CodeBuddy/Codex/Antigravity）'},
+    {'command': 'model', 'description': '查看或切换当前渠道的模型'},
+    {'command': 'provider', 'description': '管理第三方 API 中转网关地址与密钥'},
+    {'command': 'collab', 'description': '配置双模型协作（主模型规划+快模型执行）'},
+    {'command': 'effort', 'description': '调整模型思考深度'},
+    {'command': 'new', 'description': '清空当前对话记忆并开新会话'},
+    {'command': 'compact', 'description': '压缩长对话为摘要以节省上下文'},
+    {'command': 'sessions', 'description': '浏览历史旧对话并点选切换'},
+    {'command': 'status', 'description': '查看主机负载、内存、磁盘与服务状态'},
+    {'command': 'stop', 'description': '立刻停止正在执行的任务'},
+    {'command': 'auth', 'description': '查看 GitHub 与 Cloudflare 授权状态'},
+    {'command': 'help', 'description': '查看机器人权限、并发与使用说明'},
+]
+
+
+def sync_bot_commands():
+    """向 Telegram 注册左下角斜杠指令清单，让常用命令与解释一目了然。"""
+    api('setMyCommands', {'commands': BOT_COMMANDS})
 
 
 def menu_keyboard():
@@ -236,15 +293,21 @@ def menu_keyboard():
 
 
 def home_menu_text():
-    """首页信息集中展示，避免返回首页与显示菜单的文案漂移。"""
-    return ('智能体工作台\n'
+    """首页信息集中展示：当前环境 + 底部快捷按钮对照说明。"""
+    legend = [
+        '• ' + HOME_LABELS.get(cmd, cmd) + '：' + BUTTON_DESCRIPTIONS[cmd]
+        for row in KEYBOARD['keyboard']
+        for cmd in row
+        if cmd in BUTTON_DESCRIPTIONS
+    ]
+    return ('🤖 智能体工作台\n'
             '────────────────\n'
-            '执行器    ·  ' + model_label() + '\n'
-            '执行方式  ·  ' + strategy_name() + '\n'
-            '会话状态  ·  ' + ('继续当前会话' if session_id() else '准备开始') + '\n'
+            '当前大脑  ·  ' + model_label() + '\n'
+            '执行策略  ·  ' + strategy_name() + '\n'
+            '当前对话  ·  ' + ('继续当前会话' if session_id() else '准备开始新会话') + '\n'
             '────────────────\n'
-            '直接发送文字、语音或图片开始任务。\n'
-            '任务进度看执行情况，设置里调整模型、会话、账号和授权。')
+            '直接发送文字、语音、图片或文件就能派发任务。\n\n'
+            '📌 底部快捷按钮说明：\n' + '\n'.join(legend))
 
 
 MENU_STATE = WORK / 'menu-visible.json'
@@ -1939,7 +2002,7 @@ def catalog(refresh=False):
         return read_model_cache()
     record = provider_record() or {}
     if not record.get('base_url') or not record.get('api_key'):
-        raise MediaError('当前供应商缺少地址或密钥：到「模型与会话 → 模型供应商」补上。')
+        raise MediaError('当前供应商缺少地址或密钥：到「⚙️ 设置中心 → 🧠 智能体与模型 → 🌐 配中转网关」补上。')
     models = fetch_provider_models(record['base_url'], record['api_key'])
     atomic_json(model_cache_path(), models)
     return models
@@ -2269,18 +2332,18 @@ def send_options(chat, title, labels):
     api('sendMessage', {'chat_id': chat, 'text': redact(title), 'reply_markup': {
         'inline_keyboard': [buttons[index:index + 2] for index in range(0, len(buttons), 2)]}})
 
-GROUP_ICONS = {'任务与模型': '🧠 模型与执行', '会话与文件': '💬 会话', '账号登录': '🔑 账号与渠道',
-               '版本更新': '🔄 版本更新', '平台授权': '🔗 平台授权'}
+GROUP_ICONS = {'任务与模型': '🧠 智能体与模型', '会话与文件': '💬 会话管理', '账号登录': '🔑 账号与中转渠道',
+               '版本更新': '🔄 检查与更新', '平台授权': '🔗 仓库与云授权'}
 
 
 def settings_summary():
-    """「模型与会话」顶部的当前状态，一眼看清现在在用什么，不用逐个点进去查。"""
+    """「⚙️ 设置中心」顶部的当前状态，一眼看清现在在用什么，不用逐个点进去查。"""
     try:
         engine = current_engine()
         worker = collab_worker(engine)
-        lines = ['当前：' + model_label(engine),
-                 '思考强度：' + (current_effort(engine) or '默认')
-                 + ' · 规划执行：' + ('开（执行模型 ' + worker + '）' if worker else '关')]
+        lines = ['当前大脑：' + model_label(engine),
+                 '思考深度：' + (current_effort(engine) or '默认')
+                 + ' · 双模型协作：' + ('开（执行模型 ' + worker + '）' if worker else '关')]
         return '\n'.join(lines)
     except Exception as exc:
         log_swallowed('设置摘要', exc)
@@ -2296,16 +2359,23 @@ def send_group_menu(chat, title, groups):
 
 
 def group_title(owner, group):
-    """分组展开时的标题文案。集中在这里，避免两处实现各写一句、逐渐漂移。"""
+    """分组展开时的标题文案。集中渲染当前状态与各分类职责说明。"""
     if owner == '设置':
         summary = settings_summary()
-        return MENU_LABELS.get(group, group) + ('\n' + summary if summary else '') + '\n\n选择要调整的类别：'
+        groups = MENU_GROUPS.get('设置', {})
+        legend = ['• ' + GROUP_ICONS.get(name, name) + '：' + GROUP_DESCRIPTIONS.get(name, '')
+                  for name in groups]
+        parts = [MENU_LABELS.get(group, group)]
+        if summary:
+            parts.append(summary)
+        parts.append('请选择设置类别（各按钮职责）：\n' + '\n'.join(legend))
+        return '\n\n'.join(parts)
     intro = {'更多': '直接连接平台，查看或撤销授权。'}
     return MENU_LABELS.get(group, group) + '\n' + intro.get(owner, '选择下面的功能。')
 
 
 def expand_group(chat, text):
-    """若 text 是某个分组的名字，列出该组按钮并返回 True。
+    """若 text 是某个分组的名字，列出该组按钮与逐项功能说明并返回 True。
 
     「设置」与「更多」在 quick_action 和 handle_text 里各有一份完全相同的展开逻辑，
     加上这里的第三份，改文案时极易只改一处。现在统一走 expand_group：
@@ -2314,10 +2384,16 @@ def expand_group(chat, text):
     for owner, groups in MENU_GROUPS.items():
         items = groups.get(text)
         if items:
-            # 标题带上级名字，避免两个菜单重名时看不出自己在哪一层。
+            # 标题带上级名字与每颗按钮的直白说明，避免点进设置像猜盲盒。
             back = [('‹ 返回', owner)] if len(groups) > 1 else []
-            send_options(chat, MENU_LABELS.get(owner, owner) + ' / ' + GROUP_ICONS.get(text, text)
-                         + '\n' + GROUP_DESCRIPTIONS.get(text, '选择下面的功能。'), list(items) + back)
+            header = MENU_LABELS.get(owner, owner) + ' / ' + GROUP_ICONS.get(text, text)
+            desc = GROUP_DESCRIPTIONS.get(text, '选择下面的功能。')
+            details = '\n'.join(
+                '• ' + MENU_LABELS.get(item, item) + '：' + BUTTON_DESCRIPTIONS[item]
+                for item in items if item in BUTTON_DESCRIPTIONS
+            )
+            body = header + '\n' + desc + ('\n\n按钮功能说明：\n' + details if details else '')
+            send_options(chat, body, list(items) + back)
             return True
     return False
 
@@ -2685,13 +2761,13 @@ def failure_hint(message):
     if session_history_incompatible(text) or session_error_is_recoverable(text):
         return '会话记录与当前渠道不兼容，已自动换新会话，直接重发即可。'
     if any(word in text for word in ('429', 'rate limit', 'rate_limit', 'usage limit', 'quota', '额度', 'limit reached')):
-        return '额度或频率到上限了：可在「查看进度」看用量刷新时间，或切换渠道/模型后重试。'
+        return '额度或频率到上限了：可在「📋 任务进度」看用量刷新时间，或切换渠道/模型后重试。'
     if any(word in text for word in ('401', '403', 'unauthorized', 'authentication', 'invalid api key', 'oauth token', '未登录')):
-        return '登录或密钥失效：到「模型与会话」重新登录账号，或检查接口密钥。'
+        return '登录或密钥失效：到「⚙️ 设置中心 → 🔑 账号与中转渠道」重新登录账号，或检查接口密钥。'
     if any(word in text for word in ('timeout', 'timed out', 'overloaded', '529', '502', '503')):
         return '模型服务暂时不稳定，稍等片刻重发即可。'
     if any(word in text for word in ('model', 'unavailable', '不支持')):
-        return '当前模型可能不可用：到「模型与会话」换一个模型后重试。'
+        return '当前模型可能不可用：到「⚙️ 设置中心 → 🧠 智能体与模型」换一个模型后重试。'
     return '可检查当前模型的套餐权限、额度和工具兼容性；也可以切换模型后重试。'
 
 
@@ -4517,7 +4593,7 @@ class TaskController:
         elif LOGIN_PENDING.exists() and looks_like_login_code(text):
             # 只在确有登录进程在等时才会走到这里，避免把普通文本误当授权码吞掉。
             ok, detail = submit_login_code(text)
-            send(chat, 'Claude 账号登录成功。\n' + detail + '\n\n要改用它，请到“模型与会话 → 渠道切换 → 使用Claude账号”。'
+            send(chat, 'Claude 账号登录成功。\n' + detail + '\n\n要改用它，请到“⚙️ 设置中心 → 🔑 账号与中转渠道 → 🔀 渠道切换 → 使用Claude账号”。'
                       if ok else '授权码未通过校验：' + detail + '\n可以重新发送“登录Claude”获取新链接。')
         elif CLI_LOGINS.has_session('antigravity', chat) and looks_like_login_code(text):
             # 仅当前对话有 Antigravity 登录会话等待授权码时拦截，防止把授权码发进任务流。
@@ -4975,7 +5051,7 @@ class TaskController:
             extra = ('\n账号模式模型：' + (account_model(engine) or '官方默认')
                      + '\n可发送“账号模型”选择具体模型。')
         else:
-            extra = '\n已回到接口密钥渠道，模型沿用“模型设置”里的网关模型。'
+            extra = '\n已回到接口密钥渠道，模型沿用「🧩 选网关模型」里的当前设置。'
         # 不自动改当前执行器：切渠道只改「用哪个身份」，
         # 顺手把执行器也换掉，等于替用户做了另一件事。
         switching = engine != current_engine()
@@ -4994,7 +5070,7 @@ class TaskController:
         if auth_channel(engine) != 'account':
             # 换渠道的操作就在这里，不必让机主先退出去找「渠道切换」再回来。
             raise MediaError('当前走接口密钥渠道，没有账号模型可选。'
-                             '到「模型与会话 → 渠道切换」切到账号后，这里才会列出账号可用的模型。')
+                             '到「⚙️ 设置中心 → 🔑 账号与中转渠道 → 🔀 渠道切换」切到账号后，这里才会列出账号可用的模型。')
         models = account_model_options(engine)
         if not models:
             raise MediaError(label + ' 账号模式暂无可选模型清单。')
@@ -5224,14 +5300,14 @@ class TaskController:
     def _cmd_使用供应商(self, chat, text, update_id):
         item = provider_by_name(text.partition(' ')[2])
         if item is None:
-            raise MediaError('没有这个供应商，请重新打开「模型供应商」。')
+            raise MediaError('没有这个供应商，请重新打开「🌐 配中转网关」。')
         if item['id'] == active_provider_id():
             send(chat, '已经在用「' + item['name'] + '」。')
             return
         model = switch_provider(item['id'])
         if auth_channel() == 'account':
             send(chat, '已切到「' + item['name'] + '」。注意：' + engine_spec(current_engine())['label']
-                 + ' 当前走账号渠道，要用供应商请到「渠道切换」改回接口密钥。')
+                 + ' 当前走账号渠道，要用中转网关请到「🔀 渠道切换」改回接口密钥。')
         elif model:
             send(chat, '已切到「' + item['name'] + '」，模型：' + model + '。新任务生效，会自动开新会话。')
         else:
@@ -5247,7 +5323,7 @@ class TaskController:
     def _cmd_更换指定密钥(self, chat, text, update_id):
         item = provider_by_name(text.partition(' ')[2])
         if item is None:
-            raise MediaError('没有这个供应商，请重新打开「模型供应商」。')
+            raise MediaError('没有这个供应商，请重新打开「🌐 配中转网关」。')
         if not item.get('base_url'):
             raise MediaError('这一家还没有地址，请用「添加供应商」重新添加。')
         start_provider_input(chat, 'key', provider_id=item['id'])
@@ -5497,6 +5573,10 @@ def main():
     last_state_flush = offset
     last_state_time = time.monotonic()
     CONTROL = TaskController(WORK)
+    try:
+        sync_bot_commands()
+    except Exception as exc:
+        log_swallowed('同步斜杠菜单', exc)
     startup_update_watch()
     # 凭据续期：Cloudflare 的访问令牌一天左右过期，到期前自动换新。
     threading.Thread(target=credential_renew_worker, daemon=True,
@@ -5542,7 +5622,7 @@ def main():
                     message = update.get('message') or update.get('callback_query', {}).get('message', {})
                     if message.get('chat', {}).get('id') == OWNER:
                         CONTROL.notify(OWNER, str(exc) if isinstance(exc, MediaError)
-                                       else '这条消息没处理成功（' + reason + '），请再发一次。任务结果可在「查看进度」里核对。')
+                                       else '这条消息没处理成功（' + reason + '），请再发一次。任务结果可在「📋 任务进度」里核对。')
                     if not isinstance(exc, MediaError):
                         # 非预期异常：先推进 offset 再退出本轮。
                         # 原来的 break 发生在 offset 赋值之前，这条更新会被重新投递，

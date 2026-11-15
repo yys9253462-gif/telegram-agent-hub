@@ -235,6 +235,9 @@ class QuickCommandTest(InteractionBase):
                 command = bot.ALIASES.get(alias, alias)
                 if command in BACKGROUND:
                     self.press_and_wait(command)
+                elif command in EXPECTED_REFUSALS:
+                    with self.assertRaises(bot.MediaError):
+                        self.controller.handle_text(123, command)
                 else:
                     self.press(command)
 
